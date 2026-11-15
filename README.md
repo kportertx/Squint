@@ -1,8 +1,24 @@
 # squint
 
-squint dims the bright parts of your screen as they appear, so a white page does not flash at full brightness. It runs inside picom as a plugin, works for every application without per-app setup, and changes nothing in the applications themselves.
+squint is an automatic dimmer for the bright parts of your screen. When a white page, a spreadsheet, or a light-mode application appears, squint lowers the brightness of the bright pixels toward a level you choose and leaves dark content alone. It runs inside the picom compositor on X11, works for every application without per-application setup, and changes nothing in the applications themselves.
 
-It was built for i3 on X11 with picom 12.5 and an NVIDIA GPU. It has not been tried anywhere else (see [Known limitations](#known-limitations)).
+## Why use squint
+
+squint is for people who find bright screens uncomfortable: glare that causes headaches or eye strain, sensitivity to bright light, or a dark room with a bright monitor. The usual fixes each leave a gap:
+
+- **Monitor brightness and night-light tools** lower everything by the same amount. Dark text and dark themes get harder to read, and a white page is still the brightest thing on the screen. squint dims only what is bright, so dark content stays as it is.
+- **Dark mode** depends on each application. Many web pages, spreadsheets, PDF viewers, and documents have none, and browser extensions only cover the browser. squint works on the finished picture, so it covers every application.
+- **picom's own `max-brightness` option** caps the average brightness of a whole window with one global value, and it requires picom's damage tracking to be off, so picom repaints the full screen on every frame. squint works per pixel and per region, and it leaves damage tracking on.
+
+What squint adds beyond dimming:
+
+- A new bright window is dimmed in the first frame it is drawn, so it never appears at full brightness.
+- A large bright area can have a lower target than a small one. The size measure counts a bright patch as large at a smaller size than a dim one.
+- The dimming fades out over a few pixels around a bright region, so the edge is a gradient, not a hard line.
+- After a scene change, such as switching from a dark window to a white page, the new content can start at the brightness you were just looking at and rise to its target over a time you set. Scrolling does not trigger this.
+- Per-channel color multipliers and a whole-screen tint, so you can reduce blue light in bright areas or tint the screen.
+- Shortcut keys and a tuning tool. Settings take effect as you change them.
+- An optional [VSS](https://visualsnowsyndrome.com) relief overlay, off by default. It is the `static` setting: moving noise over the screen.
 
 ## How it works
 
@@ -214,7 +230,9 @@ The shortcuts group lets a key flip each toggle from anywhere, whichever window 
 | `key_dim_tint` | `dim_tint` |
 | `key_static` | `static` |
 
-Write a key as a chord: modifiers, then one key name, joined by `+`. For example `Ctrl+Alt+s`, `Super+Shift+F5`, or `Super+space`. Modifier names are `Shift`, `Ctrl` (or `Control`), `Alt` (or `Mod1`), `Super` (or `Mod4`), and `Mod3` and `Mod5`, in any case. Key names are X keysym names, the ones `xev` prints. Set one in the tuning screen with Enter, or from the shell:
+In the tuning screen, select a key setting and press Enter, then press the keys you want, for example Super+F1. squint records the chord itself, so it also gets chords a terminal cannot see, such as anything with Super. While it waits, squint holds the keyboard for up to 20 seconds. Escape alone cancels. Press `e` instead to type the chord as text.
+
+A chord is modifiers and one key name, joined by `+`. For example `Ctrl+Alt+s`, `Super+Shift+F5`, or `Super+space`. Modifier names are `Shift`, `Ctrl` (or `Control`), `Alt` (or `Mod1`), `Super` (or `Mod4`), and `Mod3` and `Mod5`. Key names are X keysym names, the ones `xev` prints. Names and modifiers match without regard to case, so `super+f1` works. From the shell:
 
 ```
 squintctl set key_static Ctrl+Alt+s
@@ -222,7 +240,7 @@ squintctl toggle shortcuts         # the shortcut keys only work while this is o
 squintctl set key_static ""        # remove the key
 ```
 
-`squintctl` checks that the keyboard has the key before it saves the chord. The plugin grabs the chord on the X root window, so another program that already uses the same chord, such as an i3 binding, blocks it. squint then logs `another program already uses` that chord and leaves it unbound. Num Lock and Caps Lock do not change what a chord matches. A held key triggers once, not on every repeat. The shortcuts keep working while `enabled` is false, so `key_enabled` can turn squint back on.
+`squintctl` checks that the keyboard has the key before it saves the chord. Recording needs a running X display. If another program already holds the keyboard, the tuning screen says so, and typing the chord with `e` still works. The plugin grabs the chord on the X root window, so another program that already uses the same chord, such as an i3 binding, blocks it. squint then logs `another program already uses` that chord and leaves it unbound. Num Lock and Caps Lock do not change what a chord matches. A held key triggers once, not on every repeat. The shortcuts keep working while `enabled` is false, so `key_enabled` can turn squint back on.
 
 A shortcut writes the new value to the config file the same way `squintctl` does, so the tuning screen and the file always agree.
 
@@ -242,7 +260,7 @@ squint writes a log to `/tmp/squint.log`, or to the file named by `SQUINT_LOG`. 
 - all eight combinations of the three toggles;
 - the shortcut chord parser and the text settings that hold chords.
 
-`make test` also runs `test/hotkey_test.c`, which grabs a chord on the running X server and sends key presses with the XTest extension. It checks that a chord fires once, that a repeat inside 0.3 s is ignored, that the wrong modifiers do not fire, that a chord another connection already holds is refused, and that released keys are free to grab again. The chord is Ctrl+Alt plus a spare key (F24, or one of the XF86Launch keys), which the test grabs before sending it. If the keyboard has none of them, or the server has no XTest extension, the test says so and passes.
+`make test` also runs `test/hotkey_test.c`, which grabs a chord on the running X server and sends key presses with the XTest extension. It checks that a chord fires once, that a repeat inside 0.3 s is ignored, that the wrong modifiers do not fire, that a chord another connection already holds is refused, and that released keys are free to grab again. The chord is Ctrl+Alt plus a spare key (F24, or one of the XF86Launch keys), which the test grabs before sending it. It also checks that key names match without regard to case, and that recording a chord from real key presses gets Super+F1, modifiers in a fixed order, and Ctrl+Escape right, ignores modifiers pressed alone, cancels on Escape, and times out. If the keyboard has none of them, or the server has no XTest extension, the test says so and passes.
 
 The pipeline test needs a display and a GPU driver with OpenGL 3.3. The CPU model of the falloff is brute force and slow on large images, so the large tests use falloff 0.
 
@@ -250,6 +268,7 @@ The pipeline test needs a display and a GPU driver with OpenGL 3.3. The CPU mode
 
 - **One configuration tested.** squint has run on picom 12.5, i3, an NVIDIA RTX A1000 with the 550 driver, and three monitors. Other drivers, picom versions, and window managers are untested.
 - **GLX only.** The plugin registers for picom's `glx` backend. It does not support `egl`.
+- **Screenshots and screen shares.** A capture of the whole screen reads the same pixels the monitor shows, so it includes squint's dimming, tint, and static. A capture of a single window reads the application's own picture and is unaffected. This was checked with a test window: a whole-screen screenshot read (157, 141, 116) for a white window, and a window capture read (255, 255, 255).
 - **Fullscreen windows that picom unredirects** (with `--unredir-if-possible`) bypass the compositor, so squint cannot dim them.
 - **Monitor changes.** squint reads the monitor layout when picom starts and when the root window changes size. If you rearrange monitors without changing the total size, restart picom.
 - **Bright shades flatten.** Pixels above `target` all land near the same level, so white and light grays end up close together. `knee` only rounds the corner. A lower `target_large` makes this stronger.
@@ -269,6 +288,8 @@ The pipeline test needs a display and a GPU driver with OpenGL 3.3. The CPU mode
 | `src/squint.c` | The picom plugin: hooks, the libev timer, config watching, and logging. |
 | `src/config.h` | Setting names, ranges, defaults, the file format, and the chord parser, shared by the plugin and the tool. |
 | `src/hotkey.h` | Shortcut key grabs on the X root window. |
+| `src/keys.h` | Key name lookup that ignores case. |
+| `src/capture.h` | Recording a chord from key presses, for `squintctl`. |
 | `src/squintctl.c` | The settings tool. |
 | `test/pipeline_test.c` | The GL pipeline test and its CPU model. |
 | `test/hotkey_test.c` | The live shortcut key test. |

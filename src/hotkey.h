@@ -18,6 +18,7 @@
 #include <xcb/xcb.h>
 
 #include "config.h"
+#include "keys.h"
 
 #define HK_MAX 8
 #define HK_DEBOUNCE 0.3
@@ -88,7 +89,7 @@ static inline bool hk_grab(struct hk *h, Display *dpy, const char *chord, int ac
 		snprintf(why, whylen, "too many shortcut keys");
 		return false;
 	}
-	KeySym ks = XStringToKeysym(key);
+	KeySym ks = sq_keysym(dpy, key);
 	xcb_keycode_t code = ks == NoSymbol ? 0 : (xcb_keycode_t)XKeysymToKeycode(dpy, ks);
 	if (!code) {
 		snprintf(why, whylen, "no key named '%s' on this keyboard", key);

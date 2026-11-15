@@ -16,7 +16,9 @@
 #include <string.h>
 #include <termios.h>
 
+#include "capture.h"
 #include "config.h"
+#include "keys.h"
 
 static struct termios saved_tio;
 static bool raw_on;
@@ -65,7 +67,7 @@ static bool chord_ok(const char *chord, char *why, size_t whylen) {
 	if (!d) {
 		return true;
 	}
-	KeySym ks = XStringToKeysym(key);
+	KeySym ks = sq_keysym(d, key);
 	bool ok = ks != NoSymbol && XKeysymToKeycode(d, ks) != 0;
 	XCloseDisplay(d);
 	if (!ok) {
@@ -111,7 +113,7 @@ static void draw(const struct sq_cfg *c, int sel, const char *path, const char *
 	}
 	printf("\r\n %s\r\n\r\n", sq_params[sel].help);
 	printf(" up/down select   left/right adjust   PgUp/PgDn adjust x10   space toggle\r\n");
-	printf(" Enter edit a shortcut key   r reset selected   R reset all   q quit\r\n\r\n %s\r\n", status);
+	printf(" Enter record a shortcut by pressing it   e type it   r reset selected   R reset all   q quit\r\n\r\n %s\r\n", status);
 	fflush(stdout);
 }
 
@@ -127,6 +129,30 @@ static void adjust(struct sq_cfg *c, int i, int steps) {
 	// Round to the step grid so repeated presses do not accumulate float error.
 	double x = (c->v[i] + steps * p->step) / p->step;
 	c->v[i] = sq_clamp(i, floor(x + 0.5) * p->step);
+}
+
+// Records the keys the user presses for text setting i. Returns true when the setting changed.
+static bool record_chord(struct sq_cfg *c, int i, const char *path, char *msg, size_t msglen) {
+	char prompt[160];
+	snprintf(prompt, sizeof prompt, "Press the keys for %s now, for example Super+F1. Esc cancels. (20 s)", sq_params[i].key);
+	draw(c, i, path, prompt);
+	char chord[SQ_STRLEN], why[160];
+	if (!sq_capture_chord(chord, sizeof chord, why, sizeof why, 20000, -1)) {
+		snprintf(msg, msglen, "%s. Press e to type the chord instead", why);
+		return false;
+	}
+	tcflush(STDIN_FILENO, TCIFLUSH);  // the terminal saw some of those keys too
+	if (!chord_ok(chord, why, sizeof why)) {
+		snprintf(msg, msglen, "%s", why);
+		return false;
+	}
+	if (!strcmp(chord, c->s[i])) {
+		snprintf(msg, msglen, "unchanged (%s)", chord);
+		return false;
+	}
+	snprintf(c->s[i], SQ_STRLEN, "%s", chord);
+	snprintf(msg, msglen, "recorded %s", chord);
+	return true;
 }
 
 // Reads a line for text setting i at the bottom of the screen. Enter keeps it, Esc cancels,
@@ -205,6 +231,12 @@ static int interactive(const char *path) {
 				changed = true;
 			}
 		} else if (ch == '\r' || ch == '\n') {
+			if (sq_params[sel].type == SQ_STR) {
+				msg[0] = '\0';
+				changed = record_chord(&c, sel, path, msg, sizeof msg);
+				status = msg;
+			}
+		} else if (ch == 'e') {
 			if (sq_params[sel].type == SQ_STR) {
 				msg[0] = '\0';
 				changed = edit_string(&c, sel, path, msg, sizeof msg);

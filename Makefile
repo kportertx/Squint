@@ -15,20 +15,20 @@ all: squint.so squintctl
 
 # Written to a temporary name and renamed, so a picom that has the old squint.so mapped
 # keeps its inode and does not crash while this rebuilds.
-squint.so: src/squint.c src/pipeline.h src/config.h src/hotkey.h
+squint.so: src/squint.c src/pipeline.h src/config.h src/hotkey.h src/keys.h
 	$(CC) $(CFLAGS) -shared -o $@.tmp $< $(LDLIBS) -lm && mv -f $@.tmp $@
 
 pipeline_test: test/pipeline_test.c src/pipeline.h src/config.h
 	$(CC) $(CFLAGS) -o $@ $< -lGL -lX11 -lm
 
-hotkey_test: test/hotkey_test.c src/hotkey.h src/config.h
+hotkey_test: test/hotkey_test.c src/hotkey.h src/config.h src/keys.h src/capture.h
 	$(CC) $(CFLAGS) -o $@ $< -lX11 -lxcb -lXtst -lm
 
 test: pipeline_test hotkey_test
 	./pipeline_test
 	./hotkey_test
 
-squintctl: src/squintctl.c src/config.h
+squintctl: src/squintctl.c src/config.h src/keys.h src/capture.h
 	$(CC) $(CFLAGS) -o $@ $< -lX11 -lm
 
 clean:
