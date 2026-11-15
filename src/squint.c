@@ -59,6 +59,8 @@ struct state {
 	double last_present, last_stats;
 
 	struct span copy_span, dim_span;
+	double cpu_sum_us;  // CPU time spent inside run_pipeline, to judge whether a thread would help
+	long cpu_n;
 	int n_entry;
 	struct pl_rect *rects;
 	int rects_cap;
@@ -139,12 +141,15 @@ static void span_end(struct span *s) {
 
 static void log_cfg(const char *why) {
 	say("%s: enabled=%g target=%g target_large=%g size_px=%g size_bias=%g min_gain=%g knee=%g "
-	    "darkening_ms=%g brightening_ms=%g falloff_px=%g gamma=%g dim_rgb=%g,%g,%g tint_rgb=%g,%g,%g",
+	    "darkening_ms=%g brightening_ms=%g scene_pct=%g falloff_px=%g gamma=%g dim_rgb=%g,%g,%g tint_rgb=%g,%g,%g "
+	    "groups: brightness=%g dim_tint=%g static=%g",
 	    why, st.cfg.v[SQ_ENABLED], st.cfg.v[SQ_TARGET], st.cfg.v[SQ_TARGET_LARGE],
 	    st.cfg.v[SQ_SIZE_PX], st.cfg.v[SQ_SIZE_BIAS], st.cfg.v[SQ_MIN_GAIN], st.cfg.v[SQ_KNEE],
-	    st.cfg.v[SQ_DARKENING_MS], st.cfg.v[SQ_BRIGHTENING_MS], st.cfg.v[SQ_FALLOFF_PX], st.cfg.v[SQ_GAMMA],
+	    st.cfg.v[SQ_DARKENING_MS], st.cfg.v[SQ_BRIGHTENING_MS], st.cfg.v[SQ_SCENE_PCT],
+	    st.cfg.v[SQ_FALLOFF_PX], st.cfg.v[SQ_GAMMA],
 	    st.cfg.v[SQ_DIM_RED], st.cfg.v[SQ_DIM_GREEN], st.cfg.v[SQ_DIM_BLUE], st.cfg.v[SQ_TINT_RED],
-	    st.cfg.v[SQ_TINT_GREEN], st.cfg.v[SQ_TINT_BLUE]);
+	    st.cfg.v[SQ_TINT_GREEN], st.cfg.v[SQ_TINT_BLUE], st.cfg.v[SQ_BRIGHTNESS], st.cfg.v[SQ_DIM_TINT],
+	    st.cfg.v[SQ_STATIC]);
 }
 
 static void log_stats(const char *why) {
@@ -152,13 +157,13 @@ static void log_stats(const char *why) {
 	double secs = st.last_stats > 0 ? t - st.last_stats : 0;
 	st.last_stats = t;
 	say("%s: entry=%d cqz=%ld (empty %ld) present=%ld timer_calls=%ld timer_present=%ld skipped_busy=%ld "
-	    "gl_errors=%ld copy_us=%.1f (n=%ld) pipeline_us=%.1f (n=%ld) active=%d "
+	    "gl_errors=%ld copy_us=%.1f (n=%ld) pipeline_us=%.1f (n=%ld) cpu_us=%.1f active=%d "
 	    "(%.1f s since last stats)",
 	    why, st.n_entry, st.n_cqz, st.n_cqz_empty, st.n_present, st.n_timer_calls, st.n_timer_present,
 	    st.n_skipped_busy, st.n_gl_errors,
 	    st.copy_span.n ? st.copy_span.sum_us / (double)st.copy_span.n : 0.0, st.copy_span.n,
 	    st.dim_span.n ? st.dim_span.sum_us / (double)st.dim_span.n : 0.0, st.dim_span.n,
-	    pl_active(&st.pl, &st.cfg, t), secs);
+	    st.cpu_n ? st.cpu_sum_us / (double)st.cpu_n : 0.0, pl_active(&st.pl, &st.cfg, t), secs);
 }
 
 // Root size and monitor rectangles come from the plugin's own X connection. RandR
@@ -282,6 +287,7 @@ static bool w_cqz(struct backend_base *b, ivec2 origin, image_handle target,
 
 // Runs the pipeline with the host's GL state saved and restored around it.
 static void run_pipeline(void) {
+	double cpu0 = now_s();
 	struct pl_glsave g;
 	pl_gl_save(&g);
 	while (glGetError() != GL_NO_ERROR) {
@@ -295,6 +301,8 @@ static void run_pipeline(void) {
 		check_gl("render");
 	}
 	pl_gl_restore(&g);
+	st.cpu_sum_us += (now_s() - cpu0) * 1e6;
+	st.cpu_n++;
 }
 
 static bool w_present(struct backend_base *b) {
@@ -367,7 +375,9 @@ static void timer_cb(struct ev_loop *loop, ev_timer *w, int revents) {
 		pl_touch(&st.pl, now);
 		st.cfg_dirty = false;
 	}
-	if (!pl_active(&st.pl, &st.cfg, now) || now - st.last_present < 0.015) {
+	bool stat = st.cfg.v[SQ_ENABLED] != 0 && st.cfg.v[SQ_STATIC] != 0 && st.cfg.v[SQ_STATIC_AMOUNT] > 0;
+	double min_gap = stat ? 1.0 / st.cfg.v[SQ_STATIC_HZ] : 0.015;
+	if (!pl_active(&st.pl, &st.cfg, now) || now - st.last_present < min_gap) {
 		return;
 	}
 	if (st.b->busy) {

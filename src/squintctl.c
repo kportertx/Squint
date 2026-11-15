@@ -2,7 +2,7 @@
 // takes effect on screen immediately.
 //
 //   squintctl                 interactive tuning screen
-//   squintctl show            print the current settings
+//   squintctl show            print the config file location and the current settings (--show works too)
 //   squintctl set KEY VALUE   change one setting (value is clamped to its range)
 
 #include <signal.h>
@@ -50,12 +50,19 @@ static void draw(const struct sq_cfg *c, int sel, const char *path, const char *
 		sq_format_value(i, c->v[i], v, sizeof v);
 		sq_format_value(i, sq_params[i].min, lo, sizeof lo);
 		sq_format_value(i, sq_params[i].max, hi, sizeof hi);
+		int g = sq_group(i);
+		bool inactive = g >= 0 && c->v[g] == 0;  // its toggle is off
+		char label[40];
+		snprintf(label, sizeof label, "%s%s", g >= 0 ? "  " : "", sq_params[i].key);
+		if (inactive) {
+			printf("\x1b[2m");
+		}
 		if (i == sel) {
 			printf("\x1b[7m");
 		}
-		printf(" %c %-13s %-8s %6s to %-6s", i == sel ? '>' : ' ', sq_params[i].key, v,
+		printf(" %c %-19s %-8s %6s to %-6s", i == sel ? '>' : ' ', label, v,
 		       sq_params[i].type == SQ_BOOL ? "" : lo, sq_params[i].type == SQ_BOOL ? "" : hi);
-		if (i == sel) {
+		if (i == sel || inactive) {
 			printf("\x1b[0m");
 		}
 		printf("\r\n");
@@ -153,11 +160,12 @@ int main(int argc, char **argv) {
 	}
 	struct sq_cfg c;
 	sq_load(path, &c);
-	if (argc == 2 && !strcmp(argv[1], "show")) {
+	if (argc == 2 && (!strcmp(argv[1], "show") || !strcmp(argv[1], "--show"))) {
+		printf("# config file: %s%s\n", path, access(path, F_OK) == 0 ? "" : " (not created yet, showing defaults)");
 		for (int i = 0; i < SQ_N; i++) {
 			char v[32];
 			sq_format_value(i, c.v[i], v, sizeof v);
-			printf("%s = %s\n", sq_params[i].key, v);
+			printf("%s%s = %s\n", sq_group(i) >= 0 ? "  " : "", sq_params[i].key, v);
 		}
 		return 0;
 	}

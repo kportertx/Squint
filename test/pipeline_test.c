@@ -413,12 +413,70 @@ static double *cpu_means(const double *D, const struct sq_cfg *c) {
 	return src;
 }
 
+// The static noise, as in pl_fs_final: smooth value noise from a PCG hash.
+static uint32_t pcg(uint32_t v) {
+	uint32_t st = v * 747796405u + 2891336453u;
+	uint32_t w = ((st >> ((st >> 28u) + 4u)) ^ st) * 277803737u;
+	return (w >> 22u) ^ w;
+}
+
+static float hash2(int px, int py, uint32_t seed) {
+	return (float)pcg((uint32_t)px + pcg((uint32_t)py + pcg(seed))) * (1.0f / 4294967296.0f);
+}
+
+static float vnoise(float qx, float qy, uint32_t seed) {
+	float ix = floorf(qx), iy = floorf(qy);
+	float fx = qx - ix, fy = qy - iy;
+	float sx = fx * fx * (3.0f - 2.0f * fx), sy = fy * fy * (3.0f - 2.0f * fy);
+	int x = (int)ix, y = (int)iy;
+	float a = hash2(x, y, seed), b = hash2(x + 1, y, seed), c2 = hash2(x, y + 1, seed), d = hash2(x + 1, y + 1, seed);
+	float top = a + (b - a) * sx, bot = c2 + (d - c2) * sx;
+	return (top + (bot - top) * sy - 0.5f) / 0.2154f;
+}
+
+static float cpu_field(const struct sq_cfg *c, float px, float py, uint32_t seed) {
+	float grain = (float)c->v[SQ_STATIC_GRAIN_PX], smear = (float)c->v[SQ_STATIC_SMEAR];
+	float cl = (float)c->v[SQ_STATIC_CLUSTERS];
+	float a = vnoise(px / (grain * smear), py / grain, seed);
+	float b = vnoise(px / (grain * smear * 3.0f), py / (grain * 3.0f), seed + 7919u);
+	return (a + cl * b) / sqrtf(1.0f + cl * cl);
+}
+
+static void cpu_static(const struct sq_cfg *c, double fcx, double fcy, uint32_t frame, float out[3]) {
+	float scol = (float)c->v[SQ_STATIC_COLOR];
+	int row = (int)fcy;
+	uint32_t s0 = frame * 2654435769u;
+	float jit = (float)c->v[SQ_STATIC_JITTER_PX] * (hash2(row, 0, s0 + 99u) * 2.0f - 1.0f);
+	float px = (float)fcx + jit, py = (float)fcy;
+	float common = cpu_field(c, px, py, s0 + 1u);
+	float z[3] = {common, common, common};
+	if (scol > 0.0f) {
+		for (int ch = 0; ch < 3; ch++) {
+			z[ch] = sqrtf(1.0f - scol) * common + sqrtf(scol) * cpu_field(c, px, py, s0 + 2u + (uint32_t)ch);
+		}
+	}
+	for (int ch = 0; ch < 3; ch++) {
+		float v = (float)c->v[SQ_STATIC_LEVEL] + (float)c->v[SQ_STATIC_CONTRAST] * z[ch];
+		v = v < 0 ? 0 : (v > 1 ? 1 : v);
+		out[ch] = v * (1.0f - (float)c->v[SQ_STATIC_SCANLINES] * (float)(row & 1));
+	}
+}
+
 static void model_step(const struct sq_cfg *c, double now) {
 	int f = 4, lw = (W + f - 1) / f, lh = (H + f - 1) / f;
 	free(exp_img);
 	exp_img = malloc((size_t)W * H * 4);
 	memcpy(exp_img, img, (size_t)W * H * 4);
-	bool enabled = c->v[SQ_ENABLED] != 0, ramp = c->v[SQ_BRIGHTENING_MS] > 0, smoothing = c->v[SQ_DARKENING_MS] > 0;
+	bool enabled = c->v[SQ_ENABLED] != 0;
+	bool bright = enabled && c->v[SQ_BRIGHTNESS] != 0;  // the brightness group is on
+	bool dimtint = c->v[SQ_DIM_TINT] != 0;
+	bool ramp = bright && c->v[SQ_BRIGHTENING_MS] > 0, smoothing = bright && c->v[SQ_DARKENING_MS] > 0;
+	float tv[3];
+	double dgv[3];
+	for (int ch = 0; ch < 3; ch++) {
+		tv[ch] = dimtint ? g_tint[ch] : 1.0f;
+		dgv[ch] = dimtint ? c->v[SQ_DIM_RED + ch] : 1.0;
+	}
 	if (!M.have_t0) {
 		M.t0 = now;
 		M.have_t0 = true;
@@ -429,10 +487,15 @@ static void model_step(const struct sq_cfg *c, double now) {
 		M.was_enabled = false;
 		return;
 	}
-	if (!M.was_enabled) {
+	if (!bright) {
 		M.ds_valid = M.rs_valid = M.prev_valid = false;
+		M.was_enabled = false;
+	} else {
+		if (!M.was_enabled) {
+			M.ds_valid = M.rs_valid = M.prev_valid = false;
+		}
+		M.was_enabled = true;
 	}
-	M.was_enabled = true;
 	double used[7] = {c->v[SQ_TARGET], c->v[SQ_MIN_GAIN], c->v[SQ_KNEE], c->v[SQ_FALLOFF_PX],
 	                  c->v[SQ_TARGET_LARGE], c->v[SQ_SIZE_PX], c->v[SQ_SIZE_BIAS]};
 	if (M.have_used && memcmp(used, M.used, sizeof used) != 0) {
@@ -441,7 +504,7 @@ static void model_step(const struct sq_cfg *c, double now) {
 	memcpy(M.used, used, sizeof used);
 	M.have_used = true;
 
-	double *D = cpu_D(c);
+	double *D = bright ? cpu_D(c) : calloc((size_t)W * H, sizeof *D);
 	double mg = c->v[SQ_MIN_GAIN];
 	double *RM = NULL, *RS = NULL;
 	if (ramp || smoothing) {
@@ -459,7 +522,7 @@ static void model_step(const struct sq_cfg *c, double now) {
 						double n = RM[(qy * lw + qx) * 2], pv = M.prev[(qy * lw + qx) * 2];
 						if (fabs(n - pv) > fmax(0.03, 0.25 * fmax(n, pv))) changed++;
 					}
-				if (changed / 1024.0 > 0.33) {
+				if (changed / 1024.0 > c->v[SQ_SCENE_PCT] / 100.0) {
 					if (dd > 0) M.until[m][0] = t_rel + dd;
 					if (db > 0) M.until[m][1] = t_rel + db;
 				}
@@ -533,11 +596,11 @@ static void model_step(const struct sq_cfg *c, double now) {
 		for (int y = mons[m].y; y < mons[m].y + mons[m].h; y++)
 			for (int x = mons[m].x; x < mons[m].x + mons[m].w; x++) {
 				double d = M.ds[(size_t)y * W + x];
-				bool tinted = g_tint[0] != 1.0f || g_tint[1] != 1.0f || g_tint[2] != 1.0f;
+				bool tinted = tv[0] != 1.0f || tv[1] != 1.0f || tv[2] != 1.0f;
 				if (d < 0.002) {
 					for (int ch = 0; ch < 3 && tinted; ch++) {
 						double v = img[((size_t)y * W + x) * 4 + ch] / 255.0;
-						exp_img[((size_t)y * W + x) * 4 + ch] = (uint8_t)lround(255 * enc(dec(v) * g_tint[ch]));
+						exp_img[((size_t)y * W + x) * 4 + ch] = (uint8_t)lround(255 * enc(dec(v) * tv[ch]));
 					}
 					continue;
 				}
@@ -555,11 +618,27 @@ static void model_step(const struct sq_cfg *c, double now) {
 				}
 				for (int ch = 0; ch < 3; ch++) {
 					double e = pow(img[((size_t)y * W + x) * 4 + ch] / 255.0, 1 + (c->v[SQ_GAMMA] - 1) * a);
-					double dg = c->v[SQ_DIM_RED + ch];
-					double lin = dec(e) * g * (1 + (dg - 1) * strength) * g_tint[ch];
+					double dg = dgv[ch];
+					double lin = dec(e) * g * (1 + (dg - 1) * strength) * tv[ch];
 					exp_img[((size_t)y * W + x) * 4 + ch] = (uint8_t)lround(255 * enc(lin));
 				}
 			}
+	}
+	if (c->v[SQ_STATIC] != 0 && c->v[SQ_STATIC_AMOUNT] > 0) {
+		double hz = c->v[SQ_STATIC_HZ];
+		uint32_t frame = (uint32_t)(unsigned long long)floor(t_rel * hz);
+		float amt = (float)(c->v[SQ_STATIC_AMOUNT] / 100.0);
+		for (int m = 0; m < nmons; m++)
+			for (int y = mons[m].y; y < mons[m].y + mons[m].h; y++)
+				for (int x = mons[m].x; x < mons[m].x + mons[m].w; x++) {
+					float n[3];
+					cpu_static(c, x + 0.5, H - y - 0.5, frame, n);
+					for (int ch = 0; ch < 3; ch++) {
+						uint8_t *px = &exp_img[((size_t)y * W + x) * 4 + ch];
+						float v = *px / 255.0f;
+						*px = (uint8_t)lroundf(255.0f * (v + (n[ch] - v) * amt));
+					}
+				}
 	}
 	free(RM);
 	free(RS);
@@ -1173,6 +1252,386 @@ static void test_gate(void) {
 	compare_all("a moderate block", &c3, 0);
 	expect_px("a moderate block shows at once", 40, 35, settled, 3);
 	teardown();
+
+	// The same block counts as a scene change when the percentage is lowered, and not when it
+	// is raised or set to 100.
+	struct sq_cfg c4 = c3;
+	c4.v[SQ_SCENE_PCT] = 5;
+	setup(128, 96, m, 1);
+	fill_dark();
+	capture_full(0);
+	render(&c4, 0);
+	put(mid, 255, 255, 255);
+	capture(mid, 0.01);
+	render(&c4, 0.01);
+	compare_all("the same block with scene_pct 5", &c4, 0);
+	CHECK(at(40, 35)[0] < settled / 3, "the block ramps up from dark with scene_pct 5: %d vs %d",
+	      at(40, 35)[0], settled);
+	render(&c4, 3.0);
+	expect_px("and then settles", 40, 35, settled, 3);
+	teardown();
+	for (int pct = 60; pct <= 100; pct += 40) {
+		struct sq_cfg c5 = c3;
+		c5.v[SQ_SCENE_PCT] = pct;
+		setup(128, 96, m, 1);
+		put((struct pl_rect){0, 0, 128, 96}, 40, 40, 40);
+		capture_full(0);
+		render(&c5, 0);
+		put((struct pl_rect){2, 2, 126, 94}, 255, 255, 255);  // nearly the whole monitor
+		capture((struct pl_rect){2, 2, 126, 94}, 0.01);
+		render(&c5, 0.01);
+		char name[48];
+		snprintf(name, sizeof name, "nearly the whole monitor, scene_pct %d", pct);
+		compare_all(name, &c5, 0);
+		if (pct == 100) {
+			expect_px("scene_pct 100 never arms", 64, 48, settled, 3);
+		} else {
+			CHECK(at(64, 48)[0] < settled / 3, "scene_pct %d still arms for a full-screen change: %d", pct,
+			      at(64, 48)[0]);
+		}
+		teardown();
+	}
+}
+
+// Static noise: exact against the CPU model, and statistics that follow the description of
+// the video: gray, fresh independent frames, 1 to 3 pixel speckles with some clusters, a mean
+// near middle gray, fine scan lines, and a slight sideways wobble.
+static double corr3(const uint8_t *a, const uint8_t *b, int ch) {
+	double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+	int n = W * H;
+	for (int i = 0; i < n; i++) {
+		double x = a[i * 4 + ch], y = b[i * 4 + ch];
+		sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y;
+	}
+	double cov = sab / n - (sa / n) * (sb / n);
+	return cov / sqrt((saa / n - (sa / n) * (sa / n)) * (sbb / n - (sb / n) * (sb / n)));
+}
+
+// Correlation of channel ch with itself shifted by (dx, dy) inside the image.
+static double shift_corr(const uint8_t *a, int ch, int dx, int dy) {
+	double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, n = 0;
+	for (int y = 0; y + dy < H; y++)
+		for (int x = 0; x + dx < W; x++) {
+			double u = a[((size_t)y * W + x) * 4 + ch], v = a[((size_t)(y + dy) * W + x + dx) * 4 + ch];
+			sa += u; sb += v; saa += u * u; sbb += v * v; sab += u * v; n += 1;
+		}
+	return (sab / n - sa / n * sb / n) / sqrt((saa / n - pow(sa / n, 2)) * (sbb / n - pow(sb / n, 2)));
+}
+
+static double plane_mean(const uint8_t *a, int ch, int parity) {  // parity: -1 all, 0 even rows, 1 odd rows
+	double sum = 0, n = 0;
+	for (int y = 0; y < H; y++) {
+		if (parity >= 0 && (H - 1 - y) % 2 != parity) continue;  // GL row parity
+		for (int x = 0; x < W; x++) {
+			sum += a[((size_t)y * W + x) * 4 + ch];
+			n += 1;
+		}
+	}
+	return sum / n / 255.0;
+}
+
+static void render_black_static(const struct sq_cfg *c, double t) {
+	put((struct pl_rect){0, 0, W, H}, 0, 0, 0);
+	capture_full(t);
+	render(c, t);
+}
+
+static void test_static(void) {
+	printf("static noise\n");
+	struct sq_cfg c = base_cfg();
+	c.v[SQ_FALLOFF_PX] = 4;
+	c.v[SQ_STATIC] = 1;
+	c.v[SQ_STATIC_AMOUNT] = 100;
+	struct pl_mon m[] = {{0, 0, 96, 64}};
+	setup(96, 64, m, 1);
+	fill_dark();
+	put((struct pl_rect){20, 10, 50, 40}, 255, 255, 255);
+	capture_full(0);
+
+	// Off: bit exact with the plain pipeline.
+	struct sq_cfg off = c;
+	off.v[SQ_STATIC] = 0;
+	render(&off, 0);
+	compare_all("static off", &off, 0);
+	expect_px("static off leaves far dark bit exact", 90, 60, 40, 0);
+	struct sq_cfg zero = c;
+	zero.v[SQ_STATIC_AMOUNT] = 0;
+	render(&zero, 0.01);
+	expect_px("amount 0 leaves far dark bit exact", 90, 60, 40, 0);
+
+	// Every pixel against the model, for several looks and several frames.
+	struct { double grain, col, smear, clusters, scan, jitter, level, contrast; } look[] = {
+	    {1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.22},
+	    {2.0, 0.0, 1.3, 0.3, 0.15, 0.5, 0.5, 0.22},
+	    {3.5, 0.55, 2.0, 0.6, 0.3, 1.5, 0.4, 0.3},
+	    {2.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.27, 0.15},
+	    {8.5, 0.0, 3.0, 0.0, 0.5, 3.0, 0.6, 0.1},
+	};
+	for (int li = 0; li < 5; li++)
+		for (int f = 0; f < 3; f++) {
+			c.v[SQ_STATIC_GRAIN_PX] = look[li].grain;
+			c.v[SQ_STATIC_COLOR] = look[li].col;
+			c.v[SQ_STATIC_SMEAR] = look[li].smear;
+			c.v[SQ_STATIC_CLUSTERS] = look[li].clusters;
+			c.v[SQ_STATIC_SCANLINES] = look[li].scan;
+			c.v[SQ_STATIC_JITTER_PX] = look[li].jitter;
+			c.v[SQ_STATIC_LEVEL] = look[li].level;
+			c.v[SQ_STATIC_CONTRAST] = look[li].contrast;
+			render(&c, 0.02 + 0.017 * f);
+			char name[64];
+			snprintf(name, sizeof name, "static look %d, frame %d", li, f);
+			compare_all(name, &c, 0);
+		}
+	// A mix of content and noise, with a tint on.
+	c = base_cfg();
+	c.v[SQ_FALLOFF_PX] = 4;
+	c.v[SQ_STATIC] = 1;
+	c.v[SQ_STATIC_AMOUNT] = 25;
+	set_tint(1.0f, 0.85f, 0.7f);
+	render(&c, 0.3);
+	compare_all("static 25% over content and a tint", &c, 0);
+	set_tint(1.0f, 1.0f, 1.0f);
+
+	// Disabled switches static off too, and static keeps the timer running while it is on.
+	c.v[SQ_ENABLED] = 0;
+	render(&c, 0.4);
+	compare_all("disabled switches static off", &c, 0);
+	expect_px("disabled copies the far dark pixel", 90, 60, 40, 0);
+	c.v[SQ_ENABLED] = 1;
+	CHECK(pl_active(&pl, &c, 1e6), "static keeps the timer running");
+	c.v[SQ_STATIC] = 0;
+	CHECK(!pl_active(&pl, &c, 1e6), "and only while it is on");
+	teardown();
+
+	// Statistics on a black screen with 100% static, as the description says.
+	struct sq_cfg sc = base_cfg();
+	sc.v[SQ_STATIC] = 1;
+	sc.v[SQ_STATIC_AMOUNT] = 100;
+	sc.v[SQ_FALLOFF_PX] = 0;  // black content needs no dimming, and falloff 0 skips the slow model
+	sc.v[SQ_STATIC_SCANLINES] = 0;
+	sc.v[SQ_STATIC_JITTER_PX] = 0;
+	sc.v[SQ_STATIC_SMEAR] = 1;
+	sc.v[SQ_STATIC_CLUSTERS] = 0;
+	sc.v[SQ_STATIC_GRAIN_PX] = 2;
+	struct pl_mon big[] = {{0, 0, 320, 240}};
+	setup(320, 240, big, 1);
+	render_black_static(&sc, 0);
+	double mean = plane_mean(out, 1, -1), sd = 0;
+	for (int i = 0; i < W * H; i++) sd += pow(out[i * 4 + 1] / 255.0 - mean, 2);
+	sd = sqrt(sd / (W * H));
+	CHECK(fabs(mean - 0.5) < 0.02 && fabs(sd - 0.22) < 0.025, "mean %.3f (want 0.5), std %.3f (want 0.22)", mean, sd);
+	int gray = 1;
+	for (int i = 0; i < W * H && gray; i++) gray = out[i * 4] == out[i * 4 + 1] && out[i * 4 + 1] == out[i * 4 + 2];
+	CHECK(gray, "static_color 0 gives strictly gray static");
+	double l1 = shift_corr(out, 1, 1, 0), l3 = shift_corr(out, 1, 3, 0), l6 = shift_corr(out, 1, 6, 0);
+	CHECK(l1 > 0.4 && l1 > l3 + 0.2 && l3 > l6 - 0.05 && l6 < 0.15,
+	      "speckles are 1 to 3 pixels wide: correlation %.2f at 1, %.2f at 3, %.2f at 6", l1, l3, l6);
+
+	// Colored static, for when static_color is raised.
+	struct sq_cfg col = sc;
+	col.v[SQ_STATIC_COLOR] = 0.55;
+	render_black_static(&col, 0.5);
+	CHECK(corr3(out, out, 0) > 0.99, "sanity");
+	double rg = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+	for (int i = 0; i < W * H; i++) {
+		double a = out[i * 4], b = out[i * 4 + 1];
+		sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b;
+	}
+	int n = W * H;
+	rg = (sab / n - sa / n * sb / n) / sqrt((saa / n - pow(sa / n, 2)) * (sbb / n - pow(sb / n, 2)));
+	CHECK(fabs(rg - 0.45) < 0.07, "color 0.55 correlates red and green at %.2f (want 0.45)", rg);
+
+	// Smear stretches speckles sideways; clusters add coarse structure; scan lines darken odd
+	// rows; jitter breaks the vertical coherence.
+	struct sq_cfg sm = sc;
+	sm.v[SQ_STATIC_SMEAR] = 3;
+	render_black_static(&sm, 1.0);
+	CHECK(shift_corr(out, 1, 2, 0) > shift_corr(out, 1, 0, 2) + 0.15, "smear: horizontal correlation %.2f vs vertical %.2f",
+	      shift_corr(out, 1, 2, 0), shift_corr(out, 1, 0, 2));
+	struct sq_cfg cl = sc;
+	cl.v[SQ_STATIC_CLUSTERS] = 1;
+	render_black_static(&sc, 1.5);
+	double far0 = shift_corr(out, 1, 3, 0);
+	render_black_static(&cl, 1.5);
+	CHECK(shift_corr(out, 1, 3, 0) > far0 + 0.1, "clusters: correlation at 3 px rises from %.2f to %.2f", far0,
+	      shift_corr(out, 1, 3, 0));
+	struct sq_cfg sl = sc;
+	sl.v[SQ_STATIC_SCANLINES] = 0.3;
+	render_black_static(&sl, 2.0);
+	double ratio = plane_mean(out, 1, 1) / plane_mean(out, 1, 0);
+	CHECK(fabs(ratio - 0.7) < 0.03, "odd rows are %.2f of even rows (want 0.70)", ratio);
+	struct sq_cfg jt = sc;
+	jt.v[SQ_STATIC_GRAIN_PX] = 4;
+	render_black_static(&jt, 2.5);
+	double v0 = shift_corr(out, 1, 0, 1);
+	jt.v[SQ_STATIC_JITTER_PX] = 3;
+	render_black_static(&jt, 2.5);
+	CHECK(shift_corr(out, 1, 0, 1) < v0 - 0.05, "jitter: vertical correlation falls from %.2f to %.2f", v0,
+	      shift_corr(out, 1, 0, 1));
+	teardown();
+
+	// Time: a fresh independent pattern at every static_hz step, none in between, the same
+	// brightness throughout, and no repeat of a pattern.
+	struct sq_cfg mv = sc;
+	mv.v[SQ_STATIC_HZ] = 10;
+	setup(320, 240, (struct pl_mon[]){{0, 0, 320, 240}}, 1);
+	uint8_t *f0 = malloc((size_t)W * H * 4), *f1 = malloc((size_t)W * H * 4);
+	render_black_static(&mv, 0);
+	memcpy(f0, out, (size_t)W * H * 4);
+	render(&mv, 0.05);
+	CHECK(memcmp(f0, out, (size_t)W * H * 4) == 0, "no change within one static_hz step");
+	render(&mv, 0.1);
+	memcpy(f1, out, (size_t)W * H * 4);
+	CHECK(memcmp(f0, f1, (size_t)W * H * 4) != 0, "a new pattern at the next step");
+	CHECK(fabs(corr3(f0, f1, 1)) < 0.05, "consecutive patterns are independent: correlation %.3f", corr3(f0, f1, 1));
+	double lo = 1, hi = 0;
+	for (int k = 0; k < 20; k++) {
+		render(&mv, 0.1 * k);
+		double mu = plane_mean(out, 1, -1);
+		lo = fmin(lo, mu);
+		hi = fmax(hi, mu);
+	}
+	// The mean of 76,800 speckles still wobbles a little from frame to frame by chance.
+	CHECK(hi - lo < 0.015, "average brightness is steady across updates: %.4f to %.4f", lo, hi);
+	render(&mv, 0);
+	CHECK(memcmp(f0, out, (size_t)W * H * 4) == 0, "the same step gives the same pattern");
+	free(f0);
+	free(f1);
+	teardown();
+}
+
+// The toggles. Each of brightness, dim_tint, and static switches its group on and off, and
+// they are independent of each other. Off means the group's settings have no effect.
+static void test_toggles(void) {
+	printf("toggles: brightness, dim_tint, static\n");
+	struct sq_cfg c = base_cfg();
+	c.v[SQ_FALLOFF_PX] = 4;
+	c.v[SQ_DIM_BLUE] = 0.7;
+	c.v[SQ_STATIC_AMOUNT] = 20;
+	struct pl_mon m[] = {{0, 0, 96, 64}};
+	setup(96, 64, m, 1);
+	fill_dark();
+	put((struct pl_rect){10, 8, 46, 40}, 255, 255, 255);
+	put((struct pl_rect){56, 30, 86, 58}, 200, 200, 200);
+	capture_full(0);
+	set_tint(0.9f, 0.8f, 0.5f);
+	double t = 0;
+	for (int mask = 0; mask < 8; mask++) {
+		c.v[SQ_BRIGHTNESS] = (mask & 1) ? 1 : 0;
+		c.v[SQ_DIM_TINT] = (mask & 2) ? 1 : 0;
+		c.v[SQ_STATIC] = (mask & 4) ? 1 : 0;
+		t += 0.1;
+		render(&c, t);
+		char name[64];
+		snprintf(name, sizeof name, "brightness %d, dim_tint %d, static %d", mask & 1, (mask >> 1) & 1, mask >> 2);
+		compare_all(name, &c, 0);
+		if (mask == 0) {
+			CHECK(memcmp(out, img, (size_t)W * H * 4) == 0, "all three groups off: the screen is copied bit for bit");
+		}
+		if (mask == 1) {  // brightness only
+			CHECK(at(25, 20)[0] < 255 && at(25, 20)[0] == at(25, 20)[1] && at(25, 20)[1] == at(25, 20)[2],
+			      "brightness only: white is dimmed and stays neutral: %d,%d,%d", at(25, 20)[0], at(25, 20)[1],
+			      at(25, 20)[2]);
+			expect_px("brightness only: far dark untouched", 90, 5, 40, 0);
+		}
+		if (mask == 2) {  // dim_tint only
+			CHECK(at(25, 20)[0] < 255 && at(25, 20)[0] > 230 && at(25, 20)[1] < at(25, 20)[0] && at(25, 20)[2] < at(25, 20)[1],
+			      "dim_tint only: white is tinted but not dimmed: %d,%d,%d", at(25, 20)[0], at(25, 20)[1],
+			      at(25, 20)[2]);
+			CHECK(at(90, 5)[2] < 40, "dim_tint only: the tint reaches dark pixels too: %d", at(90, 5)[2]);
+		}
+		if (mask == 3) {  // brightness and dim_tint
+			CHECK(at(25, 20)[0] > at(25, 20)[1] && at(25, 20)[1] > at(25, 20)[2], "both: dimmed and tinted: %d,%d,%d",
+			      at(25, 20)[0], at(25, 20)[1], at(25, 20)[2]);
+		}
+	}
+	// Switching the master off, then the groups back on.
+	c.v[SQ_BRIGHTNESS] = c.v[SQ_DIM_TINT] = c.v[SQ_STATIC] = 1;
+	c.v[SQ_ENABLED] = 0;
+	render(&c, 1.0);
+	CHECK(memcmp(out, img, (size_t)W * H * 4) == 0, "enabled off overrides every group");
+	c.v[SQ_ENABLED] = 1;
+	render(&c, 1.1);
+	compare_all("everything back on", &c, 0);
+	teardown();
+
+	// Turning brightness off and on again must not leave a stale ramp or smoothing behind.
+	struct sq_cfg r = base_cfg();
+	r.v[SQ_BRIGHTENING_MS] = 400;
+	r.v[SQ_DARKENING_MS] = 400;
+	r.v[SQ_MIN_GAIN] = 0.05;
+	r.v[SQ_SIZE_PX] = 24;
+	r.v[SQ_FALLOFF_PX] = 0;
+	setup(128, 96, (struct pl_mon[]){{0, 0, 128, 96}}, 1);
+	fill_dark();
+	capture_full(0);
+	render(&r, 0);
+	put((struct pl_rect){6, 6, 122, 90}, 255, 255, 255);  // a scene change: the ramp starts
+	capture((struct pl_rect){6, 6, 122, 90}, 0.01);
+	render(&r, 0.01);
+	compare_all("a ramp in progress", &r, 0);
+	r.v[SQ_BRIGHTNESS] = 0;
+	render(&r, 0.05);
+	compare_all("brightness off in the middle of a ramp", &r, 0);
+	expect_px("the screen is plain while it is off", 64, 48, 255, 0);
+	r.v[SQ_BRIGHTNESS] = 1;
+	render(&r, 0.1);
+	compare_all("brightness back on", &r, 0);
+	expect_px("it comes back dimmed at once, with no stale ramp", 64, 48, apply(255, need_for(1.0, &r, r.v[SQ_TARGET]), &r), 3);
+	teardown();
+}
+
+// The config file: groups with toggles, settings indented under their toggle.
+static void test_groups(void) {
+	printf("config groups and indentation\n");
+	for (int i = 0; i < SQ_N; i++) {
+		int g = sq_group(i);
+		CHECK(g < 0 || (sq_is_toggle(g) && g < i && sq_params[g].type == SQ_BOOL), "setting %s belongs to a toggle before it",
+		      sq_params[i].key);
+		CHECK(!(sq_is_toggle(i) && g >= 0), "toggle %s is not nested", sq_params[i].key);
+	}
+	CHECK(sq_group(SQ_TARGET) == SQ_BRIGHTNESS && sq_group(SQ_GAMMA) == SQ_BRIGHTNESS, "brightness group spans target to gamma");
+	CHECK(sq_group(SQ_DIM_RED) == SQ_DIM_TINT && sq_group(SQ_TINT_BLUE) == SQ_DIM_TINT, "dim_tint group spans the dim and tint channels");
+	CHECK(sq_group(SQ_STATIC_JITTER_PX) == SQ_STATIC && sq_group(SQ_ENABLED) < 0, "static group and the top level");
+	struct sq_cfg c;
+	sq_defaults(&c);
+	c.v[SQ_DIM_TINT] = 0;
+	c.v[SQ_TARGET] = 0.33;
+	const char *path = "/tmp/squint-group-test.conf";
+	CHECK(sq_save(path, &c) == 0, "save");
+	FILE *f = fopen(path, "r");
+	char line[200];
+	int bad = 0, members = 0, toggles = 0;
+	while (fgets(line, sizeof line, f)) {
+		if (line[0] == '#' || line[0] == '\n') continue;
+		char key[64];
+		sscanf(line, " %63s", key);
+		int i = sq_find(key);
+		bool indented = line[0] == ' ';
+		if (i < 0 || indented != (sq_group(i) >= 0)) bad++;
+		if (sq_group(i) >= 0) members++;
+		if (sq_is_toggle(i)) toggles++;
+	}
+	fclose(f);
+	CHECK(bad == 0, "%d lines are indented wrongly", bad);
+	CHECK(toggles == 3 && members == SQ_N - 4, "3 toggles and %d members were written (got %d toggles, %d members)", SQ_N - 4, toggles, members);
+	struct sq_cfg d;
+	sq_load(path, &d);
+	CHECK(d.v[SQ_DIM_TINT] == 0 && fabs(d.v[SQ_TARGET] - 0.33) < 1e-9, "indented lines load");
+	// Order and indentation in a hand-edited file do not matter.
+	f = fopen(path, "w");
+	fputs("target=0.7\n\t\t  dim_tint = false\nstatic = true\n        static_amount =   40   # comment\n", f);
+	fclose(f);
+	sq_load(path, &d);
+	CHECK(fabs(d.v[SQ_TARGET] - 0.7) < 1e-9 && d.v[SQ_DIM_TINT] == 0 && d.v[SQ_STATIC] == 1 && d.v[SQ_STATIC_AMOUNT] == 40,
+	      "hand-edited indentation and order are accepted");
+	// An old file without the toggles keeps today's behavior: brightness and dim_tint on, static off.
+	f = fopen(path, "w");
+	fputs("target = 0.5\ntint_blue = 0.5\n", f);
+	fclose(f);
+	sq_load(path, &d);
+	CHECK(d.v[SQ_BRIGHTNESS] == 1 && d.v[SQ_DIM_TINT] == 1 && d.v[SQ_STATIC] == 0, "toggles default to the old behavior");
+	unlink(path);
 }
 
 // The back buffer holds dimmed output wherever picom did not write. A frame with an empty
@@ -1220,8 +1679,11 @@ int main(void) {
 	test_size();
 	test_rise();
 	test_gate();
+	test_static();
 	test_color();
 	test_config();
+	test_groups();
+	test_toggles();
 	test_damage_shapes();
 	printf("\n%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;

@@ -8,8 +8,8 @@
 //   need     per pixel, d = 1 - gain(L): how much the pixel's own luminance L must be dimmed
 //   dilate   spread d outward with a linear falloff, D(x) = max over y of d(y) - slope*|x-y|
 //            (L1 distance), never across a monitor edge
-//   scene    optional: per monitor, whether more than a third of the screen's blurred
-//            brightness changed significantly since the previous frame. Only then do smooth
+//   scene    optional: per monitor, whether more than scene_pct percent of the screen's
+//            blurred brightness changed significantly since the previous frame. Only then do smooth
 //            and ramp apply, for a window of five time constants. Scrolling a page moves many
 //            pixels but barely changes the blurred brightness, so it never triggers them.
 //   smooth   optional per pixel: instant attack, exponential release with time constant
@@ -290,15 +290,15 @@ static const char *pl_fs_ramp =
 
 // Scene change detector, one fragment per monitor. It samples a 32 x 32 grid of the
 // monitor's blurred brightness and counts the samples whose brightness differs from the
-// previous frame by more than 0.03 or by more than 25 percent. When more than a third of
-// them differ, smoothing stays armed until t_rel + dur_d and brightening until
-// t_rel + dur_b (a duration of 0 leaves that one alone).
+// previous frame by more than 0.03 or by more than 25 percent. When more than the
+// fraction frac of them differ (scene_pct), smoothing stays armed until t_rel + dur_d and
+// brightening until t_rel + dur_b (a duration of 0 leaves that one alone).
 static const char *pl_fs_scene =
     PL_COMMON
     "uniform sampler2D means, prevm, scn_prev;\n"
     "uniform ivec4 box;\n"
     "uniform int idx;\n"
-    "uniform float t_rel, dur_d, dur_b;\n"
+    "uniform float t_rel, dur_d, dur_b, frac;\n"
     "out vec2 o;\n"
     "void main() {\n"
     "  vec2 prev = texelFetch(scn_prev, ivec2(idx, 0), 0).rg;\n"
@@ -309,7 +309,7 @@ static const char *pl_fs_scene =
     "      float n = texelFetch(means, q, 0).r, pv = texelFetch(prevm, q, 0).r;\n"
     "      if (abs(n - pv) > max(0.03, 0.25 * max(n, pv))) changed += 1.0;\n"
     "    }\n"
-    "  bool hit = changed / 1024.0 > 0.33;\n"
+    "  bool hit = changed / 1024.0 > frac;\n"
     "  o = hit ? vec2(dur_d > 0.0 ? t_rel + dur_d : prev.x, dur_b > 0.0 ? t_rel + dur_b : prev.y) : prev;\n"
     "}\n";
 
@@ -320,25 +320,70 @@ static const char *pl_fs_scene =
 // dim_gain multiplies the color channels where dimming is strong: it fades in with the
 // dimming strength, before any ramp shift. tint multiplies every pixel of the monitors and
 // is skipped, so pixels stay bit-exact, when it is 1 on all channels. enabled switches
-// off everything, tint included.
+// off everything, tint and static included.
+//
+// Static is mixed in last, in encoded color: out = mix(color, noise, static_amt). Every
+// update (static_hz times a second) draws a fresh, independent pattern: the frame number
+// goes into the hash seed, and nothing is blended between updates. A field is smooth value
+// noise with a lattice spacing of `grain` pixels (stretched sideways by `smear`), plus a
+// coarser field at three times the spacing weighted by `clusters`, standardized to unit
+// variance. Each channel is sqrt(1 - scol) times a shared field plus sqrt(scol) times its
+// own, and the result is level + contrast * field, clamped. Odd rows are darkened by
+// `scanlines`, and each row is shifted sideways by a random amount up to `jitter` pixels.
 static const char *pl_fs_final =
     PL_COMMON
     "uniform sampler2D S, D, RM, RS;\n"
-    "uniform float enabled, min_gain, gamma_dim, use_ramp;\n"
+    "uniform float enabled, min_gain, gamma_dim, use_ramp, use_dim;\n"
     "uniform vec3 dim_gain, tint;\n"
     "uniform vec2 lr_size;\n"
     "uniform vec4 lr_box;\n"
+    "uniform float static_amt, grain, scol, level, contrast, clusters, scanlines, smear, jitter;\n"
+    "uniform uint frame;\n"
     "out vec4 color;\n"
-    "void main() {\n"
+    "uint pcg(uint v) {\n"
+    "  uint s = v * 747796405u + 2891336453u;\n"
+    "  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;\n"
+    "  return (w >> 22u) ^ w;\n"
+    "}\n"
+    "float hash2(ivec2 p, uint seed) {\n"
+    "  return float(pcg(uint(p.x) + pcg(uint(p.y) + pcg(seed)))) * (1.0 / 4294967296.0);\n"
+    "}\n"
+    "float vnoise(vec2 q, uint seed) {\n"
+    "  vec2 i = floor(q);\n"
+    "  vec2 f = q - i;\n"
+    "  vec2 s = f * f * (3.0 - 2.0 * f);\n"
+    "  ivec2 ii = ivec2(i);\n"
+    "  float a = hash2(ii, seed), b = hash2(ii + ivec2(1, 0), seed);\n"
+    "  float c = hash2(ii + ivec2(0, 1), seed), d = hash2(ii + ivec2(1, 1), seed);\n"
+    "  return (mix(mix(a, b, s.x), mix(c, d, s.x), s.y) - 0.5) / 0.2154;\n"
+    "}\n"
+    "float field(vec2 p, uint seed) {\n"
+    "  float a = vnoise(p / vec2(grain * smear, grain), seed);\n"
+    "  float b = vnoise(p / vec2(grain * smear * 3.0, grain * 3.0), seed + 7919u);\n"
+    "  return (a + clusters * b) * inversesqrt(1.0 + clusters * clusters);\n"
+    "}\n"
+    "vec3 static_rgb(vec2 fc) {\n"
+    "  int row = int(fc.y);\n"
+    "  uint s0 = frame * 2654435769u;\n"
+    "  float jit = jitter * (hash2(ivec2(row, 0), s0 + 99u) * 2.0 - 1.0);\n"
+    "  vec2 p = vec2(fc.x + jit, fc.y);\n"
+    "  float shr = field(p, s0 + 1u);\n"
+    "  vec3 z = vec3(shr);\n"
+    "  if (scol > 0.0) {\n"
+    "    z = vec3(field(p, s0 + 2u), field(p, s0 + 3u), field(p, s0 + 4u));\n"
+    "    z = sqrt(1.0 - scol) * shr + sqrt(scol) * z;\n"
+    "  }\n"
+    "  vec3 n = clamp(vec3(level) + contrast * z, 0.0, 1.0);\n"
+    "  return n * (1.0 - scanlines * float(row & 1));\n"
+    "}\n"
+    "vec4 shade() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  vec4 s = texelFetch(S, p, 0);\n"
-    "  float d = texelFetch(D, p, 0).r;\n"
+    "  float d = use_dim > 0.5 ? texelFetch(D, p, 0).r : 0.0;\n"
     "  bool tinted = tint != vec3(1.0);\n"
-    "  if (enabled < 0.5) { color = s; return; }\n"
     "  // Pixels the falloff does not reach are copied bit for bit, unless the monitor is tinted.\n"
     "  if (d < 0.002) {\n"
-    "    color = tinted ? vec4(to_enc(to_lin(s.rgb) * tint), s.a) : s;\n"
-    "    return;\n"
+    "    return tinted ? vec4(to_enc(to_lin(s.rgb) * tint), s.a) : s;\n"
     "  }\n"
     "  float g = 1.0 - d;\n"
     "  float strength = (1.0 - min_gain) > 1e-4 ? clamp(d / (1.0 - min_gain), 0.0, 1.0) : 0.0;\n"
@@ -353,7 +398,15 @@ static const char *pl_fs_final =
     "  }\n"
     "  vec3 e = pow(s.rgb, vec3(1.0 + (gamma_dim - 1.0) * a));\n"
     "  vec3 lin = to_lin(e) * g * mix(vec3(1.0), dim_gain, strength);\n"
-    "  color = vec4(to_enc(lin * tint), s.a);\n"
+    "  return vec4(to_enc(lin * tint), s.a);\n"
+    "}\n"
+    "void main() {\n"
+    "  vec4 c = texelFetch(S, ivec2(gl_FragCoord.xy), 0);\n"
+    "  if (enabled >= 0.5) {\n"
+    "    c = shade();\n"
+    "    if (static_amt > 0.0) c.rgb = mix(c.rgb, static_rgb(gl_FragCoord.xy), static_amt);\n"
+    "  }\n"
+    "  color = c;\n"
     "}\n";
 
 static inline GLuint pl_compile(GLenum type, const char *src) {
@@ -601,7 +654,14 @@ static inline void pl_touch(struct pl *p, double now) {
 // True while a smoothing transition may still be running. There is no readback, so this is
 // a time bound: five time constants after the last change, plus a little.
 static inline bool pl_active(const struct pl *p, const struct sq_cfg *cfg, double now) {
+	if (p->s_valid && cfg->v[SQ_ENABLED] != 0 && cfg->v[SQ_STATIC] != 0 &&
+	    cfg->v[SQ_STATIC_AMOUNT] > 0) {
+		return true;  // static changes every 1 / static_hz seconds for as long as it is on
+	}
 	double slow = cfg->v[SQ_DARKENING_MS] > cfg->v[SQ_BRIGHTENING_MS] ? cfg->v[SQ_DARKENING_MS] : cfg->v[SQ_BRIGHTENING_MS];
+	if (cfg->v[SQ_BRIGHTNESS] == 0) {
+		slow = 0;  // no dimming, so nothing to smooth
+	}
 	return p->s_valid && p->have_input && now - p->last_input < 5.0 * slow / 1000.0 + 0.1;
 }
 
@@ -875,6 +935,7 @@ static inline void pl_scene(struct pl *p, const struct sq_cfg *cfg, double now) 
 	glUniform1f(PL_U(pr, "t_rel"), (float)pl_trel(p, now));
 	glUniform1f(PL_U(pr, "dur_d"), (float)dd);
 	glUniform1f(PL_U(pr, "dur_b"), (float)db);
+	glUniform1f(PL_U(pr, "frac"), (float)(cfg->v[SQ_SCENE_PCT] / 100.0));
 	pl_fbo_attach(p, p->scn[1 - p->scur]);
 	pl_bind(0, p->rlr_a, p->samp_nearest);
 	pl_bind(1, p->rlr_p, p->samp_nearest);
@@ -971,7 +1032,8 @@ static inline void pl_ramp_state(struct pl *p, const struct sq_cfg *cfg, double 
 	p->have_ramp_time = true;
 }
 
-static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex, bool use_ramp) {
+static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex, bool use_ramp,
+                            bool use_dim, double now) {
 	pl_base_state();
 	glBindVertexArray(p->vao);
 	glBindFramebuffer(GL_FRAMEBUFFER, p->target_fbo);
@@ -987,9 +1049,25 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	glUniform1f(PL_U(pr, "min_gain"), (float)cfg->v[SQ_MIN_GAIN]);
 	glUniform1f(PL_U(pr, "gamma_dim"), (float)cfg->v[SQ_GAMMA]);
 	glUniform1f(PL_U(pr, "use_ramp"), use_ramp ? 1.0f : 0.0f);
-	glUniform3f(PL_U(pr, "dim_gain"), (float)cfg->v[SQ_DIM_RED], (float)cfg->v[SQ_DIM_GREEN],
-	            (float)cfg->v[SQ_DIM_BLUE]);
-	glUniform3f(PL_U(pr, "tint"), p->tint[0], p->tint[1], p->tint[2]);
+	glUniform1f(PL_U(pr, "use_dim"), use_dim ? 1.0f : 0.0f);
+	// The dim_tint toggle switches off the color multipliers.
+	bool dt = cfg->v[SQ_DIM_TINT] != 0;
+	glUniform3f(PL_U(pr, "dim_gain"), dt ? (float)cfg->v[SQ_DIM_RED] : 1.0f,
+	            dt ? (float)cfg->v[SQ_DIM_GREEN] : 1.0f, dt ? (float)cfg->v[SQ_DIM_BLUE] : 1.0f);
+	glUniform3f(PL_U(pr, "tint"), dt ? p->tint[0] : 1.0f, dt ? p->tint[1] : 1.0f,
+	            dt ? p->tint[2] : 1.0f);
+	bool stat = cfg->v[SQ_STATIC] != 0 && cfg->v[SQ_STATIC_AMOUNT] > 0;
+	double hz = cfg->v[SQ_STATIC_HZ];
+	glUniform1f(PL_U(pr, "static_amt"), stat ? (float)(cfg->v[SQ_STATIC_AMOUNT] / 100.0) : 0.0f);
+	glUniform1f(PL_U(pr, "grain"), (float)cfg->v[SQ_STATIC_GRAIN_PX]);
+	glUniform1f(PL_U(pr, "scol"), (float)cfg->v[SQ_STATIC_COLOR]);
+	glUniform1f(PL_U(pr, "level"), (float)cfg->v[SQ_STATIC_LEVEL]);
+	glUniform1f(PL_U(pr, "contrast"), (float)cfg->v[SQ_STATIC_CONTRAST]);
+	glUniform1f(PL_U(pr, "clusters"), (float)cfg->v[SQ_STATIC_CLUSTERS]);
+	glUniform1f(PL_U(pr, "scanlines"), (float)cfg->v[SQ_STATIC_SCANLINES]);
+	glUniform1f(PL_U(pr, "smear"), (float)cfg->v[SQ_STATIC_SMEAR]);
+	glUniform1f(PL_U(pr, "jitter"), (float)cfg->v[SQ_STATIC_JITTER_PX]);
+	glUniform1ui(PL_U(pr, "frame"), (GLuint)(unsigned long long)floor(pl_trel(p, now) * hz));
 	glUniform2f(PL_U(pr, "lr_size"), (float)p->lrW, (float)p->lrH);
 	pl_bind(0, p->s_tex, p->samp_nearest);
 	pl_bind(1, dtex, p->samp_nearest);
@@ -1015,10 +1093,11 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		return;
 	}
 	bool enabled = cfg->v[SQ_ENABLED] != 0;
+	bool bright = enabled && cfg->v[SQ_BRIGHTNESS] != 0;  // the brightness group is on
 	bool ramp = cfg->v[SQ_BRIGHTENING_MS] > 0;
 	bool smoothing = cfg->v[SQ_DARKENING_MS] > 0;
 	GLuint dtex = p->dnow;
-	if (enabled) {
+	if (bright) {
 		if (!p->was_enabled) {
 			p->dirty = true;
 			p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
@@ -1061,8 +1140,8 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		}
 	} else {
 		p->dirty = true;
-		p->rs_valid = false;
+		p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
 	}
-	p->was_enabled = enabled;
-	pl_final(p, cfg, dtex, enabled && ramp);
+	p->was_enabled = bright;
+	pl_final(p, cfg, dtex, bright && ramp, bright, now);
 }
