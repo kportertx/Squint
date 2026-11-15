@@ -76,12 +76,14 @@ static bool chord_ok(const char *chord, char *why, size_t whylen) {
 	return ok;
 }
 
-static void draw(const struct sq_cfg *c, int sel, const char *path, const char *status) {
+static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct sq_cfg *start, int sel, const char *path, const char *status) {
 	printf("\x1b[2J\x1b[H");
 	printf("squint tuning\r\nconfig: %s\r\n\r\n", path);
+	printf(" %-22s %-14s %-14s %s\r\n", "", "value", "default", "range");
 	for (int i = 0; i < SQ_N; i++) {
-		char v[SQ_STRLEN + 8], lo[32], hi[32];
+		char v[SQ_STRLEN + 8], dv[SQ_STRLEN + 8], lo[32], hi[32];
 		sq_format_cfg(c, i, v, sizeof v);
+		sq_format_cfg(def, i, dv, sizeof dv);
 		bool is_str = sq_params[i].type == SQ_STR;
 		if (!is_str) {
 			sq_format_value(i, sq_params[i].min, lo, sizeof lo);
@@ -93,6 +95,7 @@ static void draw(const struct sq_cfg *c, int sel, const char *path, const char *
 		// working to turn squint back on.
 		bool master_off = i != SQ_ENABLED && c->v[SQ_ENABLED] == 0 && i != SQ_SHORTCUTS && g != SQ_SHORTCUTS;
 		bool inactive = (g >= 0 && c->v[g] == 0) || master_off;
+		bool changed = is_str ? strcmp(c->s[i], start->s[i]) != 0 : c->v[i] != start->v[i];
 		char label[40];
 		snprintf(label, sizeof label, "%s%s", g >= 0 ? "  " : "", sq_params[i].key);
 		if (inactive) {
@@ -102,9 +105,9 @@ static void draw(const struct sq_cfg *c, int sel, const char *path, const char *
 			printf("\x1b[7m");
 		}
 		if (is_str) {
-			printf(" %c %-19s %-30s", i == sel ? '>' : ' ', label, *v ? v : "(none)");
+			printf("%c%c %-19s %-14s %-14s", changed ? '*' : ' ', i == sel ? '>' : ' ', label, *v ? v : "(none)", *dv ? dv : "(none)");
 		} else {
-			printf(" %c %-19s %-8s %6s to %-6s", i == sel ? '>' : ' ', label, v, lo, hi);
+			printf("%c%c %-19s %-14s %-14s %6s to %-6s", changed ? '*' : ' ', i == sel ? '>' : ' ', label, v, dv, lo, hi);
 		}
 		if (i == sel || inactive) {
 			printf("\x1b[0m");
@@ -113,7 +116,7 @@ static void draw(const struct sq_cfg *c, int sel, const char *path, const char *
 	}
 	printf("\r\n %s\r\n\r\n", sq_params[sel].help);
 	printf(" up/down select   left/right adjust   PgUp/PgDn adjust x10   space toggle\r\n");
-	printf(" Enter record a shortcut by pressing it   e type it   r reset selected   R reset all   q quit\r\n\r\n %s\r\n", status);
+	printf(" Enter record a shortcut by pressing it   e type it   r reset to start   d reset to default   R/D all   q quit   * changed since start\r\n\r\n %s\r\n", status);
 	fflush(stdout);
 }
 
@@ -131,11 +134,17 @@ static void adjust(struct sq_cfg *c, int i, int steps) {
 	c->v[i] = sq_clamp(i, floor(x + 0.5) * p->step);
 }
 
+// Copies setting i from src into c.
+static void reset_one(struct sq_cfg *c, const struct sq_cfg *src, int i) {
+	c->v[i] = src->v[i];
+	memcpy(c->s[i], src->s[i], SQ_STRLEN);
+}
+
 // Records the keys the user presses for text setting i. Returns true when the setting changed.
-static bool record_chord(struct sq_cfg *c, int i, const char *path, char *msg, size_t msglen) {
+static bool record_chord(struct sq_cfg *c, const struct sq_cfg *def, const struct sq_cfg *start, int i, const char *path, char *msg, size_t msglen) {
 	char prompt[160];
 	snprintf(prompt, sizeof prompt, "Press the keys for %s now, for example Super+F1. Esc cancels. (20 s)", sq_params[i].key);
-	draw(c, i, path, prompt);
+	draw(c, def, start, i, path, prompt);
 	char chord[SQ_STRLEN], why[160];
 	if (!sq_capture_chord(chord, sizeof chord, why, sizeof why, 20000, -1)) {
 		snprintf(msg, msglen, "%s. Press e to type the chord instead", why);
@@ -157,7 +166,7 @@ static bool record_chord(struct sq_cfg *c, int i, const char *path, char *msg, s
 
 // Reads a line for text setting i at the bottom of the screen. Enter keeps it, Esc cancels,
 // and an empty line clears the setting. Returns true when the setting changed.
-static bool edit_string(struct sq_cfg *c, int i, const char *path, char *msg, size_t msglen) {
+static bool edit_string(struct sq_cfg *c, const struct sq_cfg *def, const struct sq_cfg *start, int i, const char *path, char *msg, size_t msglen) {
 	char buf[SQ_STRLEN] = "";
 	int n = 0;
 	snprintf(buf, sizeof buf, "%s", c->s[i]);
@@ -165,7 +174,7 @@ static bool edit_string(struct sq_cfg *c, int i, const char *path, char *msg, si
 	for (;;) {
 		char prompt[120];
 		snprintf(prompt, sizeof prompt, "%s = %s_   (Enter saves, Esc cancels, empty clears)", sq_params[i].key, buf);
-		draw(c, i, path, prompt);
+		draw(c, def, start, i, path, prompt);
 		unsigned char ch;
 		if (read(STDIN_FILENO, &ch, 1) != 1) {
 			return false;
@@ -204,12 +213,15 @@ static int interactive(const char *path) {
 	}
 	struct sq_cfg c;
 	sq_load(path, &c);
+	const struct sq_cfg start = c;  // what the file held when the tool opened
+	struct sq_cfg def;
+	sq_defaults(&def);
 	enter_raw();
 	int sel = 0;
 	char msg[200] = "";
 	const char *status = "";
 	for (;;) {
-		draw(&c, sel, path, status);
+		draw(&c, &def, &start, sel, path, status);
 		unsigned char ch;
 		if (read(STDIN_FILENO, &ch, 1) != 1) {
 			break;
@@ -233,24 +245,20 @@ static int interactive(const char *path) {
 		} else if (ch == '\r' || ch == '\n') {
 			if (sq_params[sel].type == SQ_STR) {
 				msg[0] = '\0';
-				changed = record_chord(&c, sel, path, msg, sizeof msg);
+				changed = record_chord(&c, &def, &start, sel, path, msg, sizeof msg);
 				status = msg;
 			}
 		} else if (ch == 'e') {
 			if (sq_params[sel].type == SQ_STR) {
 				msg[0] = '\0';
-				changed = edit_string(&c, sel, path, msg, sizeof msg);
+				changed = edit_string(&c, &def, &start, sel, path, msg, sizeof msg);
 				status = msg;
 			}
-		} else if (ch == 'r') {
-			if (sq_params[sel].type == SQ_STR) {
-				c.s[sel][0] = '\0';
-			} else {
-				c.v[sel] = sq_params[sel].def;
-			}
+		} else if (ch == 'r' || ch == 'd') {
+			reset_one(&c, ch == 'r' ? &start : &def, sel);
 			changed = true;
-		} else if (ch == 'R') {
-			sq_defaults(&c);
+		} else if (ch == 'R' || ch == 'D') {
+			c = ch == 'R' ? start : def;
 			changed = true;
 		} else if (ch == 0x1b) {
 			unsigned char seq[3] = {0, 0, 0};

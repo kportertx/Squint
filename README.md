@@ -102,7 +102,7 @@ squintctl set KEY VALUE   change one setting
 squintctl toggle NAME     flip an on/off setting (enabled, brightness, dim_tint, static, or shortcuts)
 ```
 
-In the tuning screen, up and down select a setting, left and right adjust it by one step, PgUp and PgDn adjust by ten steps, space flips a toggle, Enter edits a shortcut key, `r` resets the selected setting, `R` resets all, and `q` quits. Every change is saved at once. Values outside a setting's range are clamped.
+In the tuning screen, up and down select a setting, left and right adjust it by one step, PgUp and PgDn adjust by ten steps, space flips a toggle, Enter edits a shortcut key, `r` resets the selected setting to the value it had when the tool opened, `R` does that for every setting, `d` resets the selected setting to its default, `D` does that for every setting, and `q` quits. A `*` at the left of a row marks a setting that differs from the file as it was when the tool opened. Every change is saved at once. Values outside a setting's range are clamped.
 
 Settings come in groups. Each group has a toggle, and its settings are indented under it in the file and in the tuning screen. The tuning screen dims a group's settings while its toggle is off. The leading spaces are only layout, so the parser ignores them.
 
