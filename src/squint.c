@@ -139,10 +139,12 @@ static void span_end(struct span *s) {
 
 static void log_cfg(const char *why) {
 	say("%s: enabled=%g target=%g target_large=%g size_px=%g size_bias=%g min_gain=%g knee=%g "
-	    "tau_ms=%g rise_ms=%g falloff_px=%g gamma=%g",
+	    "darkening_ms=%g brightening_ms=%g falloff_px=%g gamma=%g dim_rgb=%g,%g,%g tint_rgb=%g,%g,%g",
 	    why, st.cfg.v[SQ_ENABLED], st.cfg.v[SQ_TARGET], st.cfg.v[SQ_TARGET_LARGE],
 	    st.cfg.v[SQ_SIZE_PX], st.cfg.v[SQ_SIZE_BIAS], st.cfg.v[SQ_MIN_GAIN], st.cfg.v[SQ_KNEE],
-	    st.cfg.v[SQ_TAU_MS], st.cfg.v[SQ_RISE_MS], st.cfg.v[SQ_FALLOFF_PX], st.cfg.v[SQ_GAMMA]);
+	    st.cfg.v[SQ_DARKENING_MS], st.cfg.v[SQ_BRIGHTENING_MS], st.cfg.v[SQ_FALLOFF_PX], st.cfg.v[SQ_GAMMA],
+	    st.cfg.v[SQ_DIM_RED], st.cfg.v[SQ_DIM_GREEN], st.cfg.v[SQ_DIM_BLUE], st.cfg.v[SQ_TINT_RED],
+	    st.cfg.v[SQ_TINT_GREEN], st.cfg.v[SQ_TINT_BLUE]);
 }
 
 static void log_stats(const char *why) {
@@ -285,6 +287,8 @@ static void run_pipeline(void) {
 	while (glGetError() != GL_NO_ERROR) {
 	}
 	if (ensure_gl() && st.pl.s_valid) {
+		pl_set_tint(&st.pl, (float)st.cfg.v[SQ_TINT_RED], (float)st.cfg.v[SQ_TINT_GREEN],
+		            (float)st.cfg.v[SQ_TINT_BLUE]);
 		span_begin(&st.dim_span);
 		pl_render(&st.pl, &st.cfg, now_s());
 		span_end(&st.dim_span);

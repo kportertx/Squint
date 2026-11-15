@@ -64,6 +64,10 @@ static int W, H;
 static struct pl pl;
 static struct pl_mon mons[PL_MAXMON];
 static int nmons;
+static float g_tint[3] = {1, 1, 1};  // the tint the model applies, set with set_tint()
+
+static void model_step(const struct sq_cfg *c, double now);
+static void model_reset(void);
 
 static void make_context(void) {
 	Display *d = XOpenDisplay(NULL);
@@ -94,6 +98,8 @@ static void make_context(void) {
 }
 
 static void setup(int w, int h, const struct pl_mon *m, int nm) {
+	model_reset();
+	g_tint[0] = g_tint[1] = g_tint[2] = 1.0f;
 	W = w;
 	H = h;
 	nmons = nm;
@@ -125,6 +131,13 @@ static void setup(int w, int h, const struct pl_mon *m, int nm) {
 
 static void teardown(void) {
 	pl_destroy(&pl);
+}
+
+static void set_tint(float r, float g, float b) {
+	g_tint[0] = r;
+	g_tint[1] = g;
+	g_tint[2] = b;
+	pl_set_tint(&pl, r, g, b);
 }
 
 // "picom wrote this": set a rectangle (X coordinates) of the back buffer.
@@ -159,6 +172,7 @@ static void render(const struct sq_cfg *cfg, double now) {
 	for (int y = 0; y < H; y++)
 		memcpy(out + (size_t)y * W * 4, tmp + (size_t)(H - 1 - y) * W * 4, (size_t)W * 4);
 	free(tmp);
+	model_step(cfg, now);
 }
 
 static const uint8_t *at(int x, int y) { return out + ((size_t)y * W + x) * 4; }
@@ -175,8 +189,8 @@ static struct sq_cfg base_cfg(void) {
 	c.v[SQ_TARGET] = 0.45;
 	c.v[SQ_TARGET_LARGE] = 0.45;  // size feature off unless a test turns it on
 	c.v[SQ_MIN_GAIN] = 0.35;
-	c.v[SQ_TAU_MS] = 0;
-	c.v[SQ_RISE_MS] = 0;
+	c.v[SQ_DARKENING_MS] = 0;
+	c.v[SQ_BRIGHTENING_MS] = 0;
 	c.v[SQ_FALLOFF_PX] = 8;
 	return c;
 }
@@ -296,31 +310,278 @@ static double *cpu_D(const struct sq_cfg *c) {
 	return D;
 }
 
-// Compares the whole of every monitor against the CPU model. Pixels outside every monitor
-// must equal what was written (they are never redrawn).
-static void compare_all(const char *what, const struct sq_cfg *c, double D_override_scale) {
-	(void)D_override_scale;
+// The CPU model is stateful, like the GPU pipeline: model_step is called once per GPU
+// render. It carries the smoothed dimming amount (darkening), the ramp state (brightening),
+// the previous frame's means, and the per-monitor scene-change windows across frames, and
+// produces the expected image in exp_img.
+static struct {
+	bool ds_valid, rs_valid, prev_valid, have_smooth, have_ramp, was_enabled, have_t0, have_used;
+	double last_smooth, last_ramp, t0;
+	double *ds;      // W*H smoothed D
+	double *rs;      // lw*lh*2 ramp state (brightness, gamma strength)
+	double *prev;    // lw*lh*2 the previous frame's means
+	double until[PL_MAXMON][2];  // per monitor: until when darkening and brightening are armed
+	double used[7];
+} M;
+static uint8_t *exp_img;
+
+static void model_reset(void) {
+	free(M.ds);
+	free(M.rs);
+	free(M.prev);
+	memset(&M, 0, sizeof M);
+	free(exp_img);
+	exp_img = NULL;
+}
+
+struct lrbox { int x0, y0, x1, y1; };
+
+static struct lrbox lr_box_of(int m) {
+	int f = 4, lw = (W + f - 1) / f, lh = (H + f - 1) / f;
+	int gy0 = H - (mons[m].y + mons[m].h), gy1 = H - mons[m].y;
+	struct lrbox b = {mons[m].x / f, gy0 / f, (mons[m].x + mons[m].w + f - 1) / f, (gy1 + f - 1) / f};
+	if (b.x1 > lw) b.x1 = lw;
+	if (b.y1 > lh) b.y1 = lh;
+	return b;
+}
+
+// Bilinear lookup in a lw x lh x 2 array at pixel (x, y), clamped inside monitor box b.
+static void lr_sample(const double *a, struct lrbox b, int x, int y, double out[2]) {
+	int f = 4, lw = (W + f - 1) / f, lh = (H + f - 1) / f;
+	double qx = fmin(fmax((x + 0.5) / f, b.x0 + 0.5), b.x1 - 0.5);
+	double qy = fmin(fmax((H - y - 0.5) / f, b.y0 + 0.5), b.y1 - 0.5);
+	double u = qx - 0.5, v = qy - 0.5;
+	int i0 = (int)floor(u), j0 = (int)floor(v);
+	double fx = u - i0, fy = v - j0;
+	for (int ch = 0; ch < 2; ch++) {
+#define T(i, j) a[(((j) < 0 ? 0 : ((j) > lh - 1 ? lh - 1 : (j))) * lw + ((i) < 0 ? 0 : ((i) > lw - 1 ? lw - 1 : (i)))) * 2 + ch]
+		out[ch] = (1 - fx) * (1 - fy) * T(i0, j0) + fx * (1 - fy) * T(i0 + 1, j0) +
+		          (1 - fx) * fy * T(i0, j0 + 1) + fx * fy * T(i0 + 1, j0 + 1);
+#undef T
+	}
+}
+
+// Blurred (brightness, gamma strength) of the content once dimmed by D: block means of
+// L * (1 - D) and D / (1 - min_gain), then a box mean per monitor, clipped to the monitor.
+static double *cpu_means(const double *D, const struct sq_cfg *c) {
+	int f = 4, lw = (W + f - 1) / f, lh = (H + f - 1) / f;
+	double mg = c->v[SQ_MIN_GAIN];
+	double *A = malloc((size_t)lw * lh * 2 * sizeof *A), *B = malloc((size_t)lw * lh * 2 * sizeof *B);
+	for (int i = 0; i < lw * lh * 2; i++) A[i] = B[i] = -2.0;
+	for (int by = 0; by < lh; by++)
+		for (int bx = 0; bx < lw; bx++) {
+			double sum[2] = {0, 0}, cnt = 0;
+			for (int j = 0; j < f; j++)
+				for (int i = 0; i < f; i++) {
+					int gx = bx * f + i, gy = by * f + j;
+					if (gx < W && gy < H) {
+						int px = (H - 1 - gy) * W + gx;
+						double d = D[px];
+						double a = (1 - mg) > 1e-4 ? fmin(fmax(d / (1 - mg), 0), 1) : 0;
+						sum[0] += lum(img + (size_t)px * 4) * (1 - d);
+						sum[1] += a;
+						cnt += 1;
+					}
+				}
+			A[(by * lw + bx) * 2] = sum[0] / cnt;
+			A[(by * lw + bx) * 2 + 1] = sum[1] / cnt;
+		}
+	int rt = (int)lround(c->v[SQ_SIZE_PX] / f);
+	rt = rt < 1 ? 1 : rt;
+	double *src = A, *dst = B;
+	for (int axis = 0; axis < 2; axis++) {
+		for (int m = 0; m < nmons; m++) {
+			struct lrbox b = lr_box_of(m);
+			for (int y = b.y0; y < b.y1; y++)
+				for (int x = b.x0; x < b.x1; x++) {
+					double acc[2] = {0, 0}, cnt = 0;
+					for (int k = -rt; k <= rt; k++) {
+						int qx = x + (axis == 0 ? k : 0), qy = y + (axis == 0 ? 0 : k);
+						if (qx >= b.x0 && qx < b.x1 && qy >= b.y0 && qy < b.y1) {
+							acc[0] += src[(qy * lw + qx) * 2];
+							acc[1] += src[(qy * lw + qx) * 2 + 1];
+							cnt += 1;
+						}
+					}
+					dst[(y * lw + x) * 2] = acc[0] / fmax(cnt, 1);
+					dst[(y * lw + x) * 2 + 1] = acc[1] / fmax(cnt, 1);
+				}
+		}
+		double *t = src; src = dst; dst = t;
+	}
+	free(dst);
+	return src;
+}
+
+static void model_step(const struct sq_cfg *c, double now) {
+	int f = 4, lw = (W + f - 1) / f, lh = (H + f - 1) / f;
+	free(exp_img);
+	exp_img = malloc((size_t)W * H * 4);
+	memcpy(exp_img, img, (size_t)W * H * 4);
+	bool enabled = c->v[SQ_ENABLED] != 0, ramp = c->v[SQ_BRIGHTENING_MS] > 0, smoothing = c->v[SQ_DARKENING_MS] > 0;
+	if (!M.have_t0) {
+		M.t0 = now;
+		M.have_t0 = true;
+	}
+	double t_rel = now - M.t0;
+	if (!enabled) {
+		M.rs_valid = false;
+		M.was_enabled = false;
+		return;
+	}
+	if (!M.was_enabled) {
+		M.ds_valid = M.rs_valid = M.prev_valid = false;
+	}
+	M.was_enabled = true;
+	double used[7] = {c->v[SQ_TARGET], c->v[SQ_MIN_GAIN], c->v[SQ_KNEE], c->v[SQ_FALLOFF_PX],
+	                  c->v[SQ_TARGET_LARGE], c->v[SQ_SIZE_PX], c->v[SQ_SIZE_BIAS]};
+	if (M.have_used && memcmp(used, M.used, sizeof used) != 0) {
+		M.prev_valid = false;  // a settings change must not look like a scene change
+	}
+	memcpy(M.used, used, sizeof used);
+	M.have_used = true;
+
 	double *D = cpu_D(c);
+	double mg = c->v[SQ_MIN_GAIN];
+	double *RM = NULL, *RS = NULL;
+	if (ramp || smoothing) {
+		RM = cpu_means(D, c);
+		if (M.prev_valid) {
+			double dd = smoothing ? 5.0 * c->v[SQ_DARKENING_MS] / 1000.0 + 0.1 : 0;
+			double db = ramp ? 5.0 * c->v[SQ_BRIGHTENING_MS] / 1000.0 + 0.1 : 0;
+			for (int m = 0; m < nmons; m++) {
+				struct lrbox b = lr_box_of(m);
+				int changed = 0;
+				for (int gy = 0; gy < 32; gy++)
+					for (int gx = 0; gx < 32; gx++) {
+						int qx = b.x0 + (int)((gx + 0.5) / 32.0 * (b.x1 - b.x0));
+						int qy = b.y0 + (int)((gy + 0.5) / 32.0 * (b.y1 - b.y0));
+						double n = RM[(qy * lw + qx) * 2], pv = M.prev[(qy * lw + qx) * 2];
+						if (fabs(n - pv) > fmax(0.03, 0.25 * fmax(n, pv))) changed++;
+					}
+				if (changed / 1024.0 > 0.33) {
+					if (dd > 0) M.until[m][0] = t_rel + dd;
+					if (db > 0) M.until[m][1] = t_rel + db;
+				}
+			}
+		}
+		if (!M.prev) M.prev = malloc((size_t)lw * lh * 2 * sizeof *M.prev);
+		memcpy(M.prev, RM, (size_t)lw * lh * 2 * sizeof *M.prev);
+		M.prev_valid = true;
+	} else {
+		M.prev_valid = false;
+	}
+
+	// Smoothed dimming amount: instant attack, slow release, only while a monitor is armed.
+	if (!M.ds) M.ds = calloc((size_t)W * H, sizeof *M.ds);
+	if (smoothing) {
+		double dt = M.have_smooth && now > M.last_smooth ? now - M.last_smooth : 0;
+		double k = 1 - exp(-dt / (c->v[SQ_DARKENING_MS] / 1000.0));
+		for (int m = 0; m < nmons; m++) {
+			bool armed = t_rel < M.until[m][0];
+			for (int y = mons[m].y; y < mons[m].y + mons[m].h; y++)
+				for (int x = mons[m].x; x < mons[m].x + mons[m].w; x++) {
+					int i = y * W + x;
+					double n = D[i];
+					M.ds[i] = !M.ds_valid ? n : (armed ? fmax(n, M.ds[i] + (n - M.ds[i]) * k) : n);
+				}
+		}
+		M.ds_valid = true;
+		M.last_smooth = now;
+		M.have_smooth = true;
+	} else {
+		memcpy(M.ds, D, (size_t)W * H * sizeof *D);
+		M.ds_valid = false;
+	}
+	free(D);
+
+	if (ramp) {
+		if (!M.rs) {
+			M.rs = malloc((size_t)lw * lh * 2 * sizeof *M.rs);
+			for (int i = 0; i < lw * lh * 2; i++) M.rs[i] = -2.0;
+		}
+		double dt = M.have_ramp && now > M.last_ramp ? now - M.last_ramp : 0;
+		double k = 1 - exp(-dt / (c->v[SQ_BRIGHTENING_MS] / 1000.0));
+		RS = malloc((size_t)lw * lh * 2 * sizeof *RS);
+		memcpy(RS, M.rs, (size_t)lw * lh * 2 * sizeof *RS);
+		for (int m = 0; m < nmons; m++) {
+			struct lrbox b = lr_box_of(m);
+			bool armed = t_rel < M.until[m][1];
+			for (int y = b.y0; y < b.y1; y++)
+				for (int x = b.x0; x < b.x1; x++) {
+					int o = (y * lw + x) * 2;
+					if (!M.rs_valid || !armed) {
+						RS[o] = RM[o];
+						RS[o + 1] = RM[o + 1];
+					} else {
+						double pb = M.rs[o], pa = M.rs[o + 1];
+						RS[o] = RM[o] > pb ? pb + (RM[o] - pb) * k : RM[o];
+						RS[o + 1] = RM[o + 1] + (pa - RM[o + 1]) * (1 - k);
+					}
+				}
+		}
+		memcpy(M.rs, RS, (size_t)lw * lh * 2 * sizeof *RS);
+		M.rs_valid = true;
+		M.last_ramp = now;
+		M.have_ramp = true;
+	} else {
+		M.rs_valid = false;
+	}
+
+	for (int m = 0; m < nmons; m++) {
+		struct lrbox b = lr_box_of(m);
+		for (int y = mons[m].y; y < mons[m].y + mons[m].h; y++)
+			for (int x = mons[m].x; x < mons[m].x + mons[m].w; x++) {
+				double d = M.ds[(size_t)y * W + x];
+				bool tinted = g_tint[0] != 1.0f || g_tint[1] != 1.0f || g_tint[2] != 1.0f;
+				if (d < 0.002) {
+					for (int ch = 0; ch < 3 && tinted; ch++) {
+						double v = img[((size_t)y * W + x) * 4 + ch] / 255.0;
+						exp_img[((size_t)y * W + x) * 4 + ch] = (uint8_t)lround(255 * enc(dec(v) * g_tint[ch]));
+					}
+					continue;
+				}
+				double g = 1 - d;
+				double a = (1 - mg) > 1e-4 ? fmin(fmax(d / (1 - mg), 0), 1) : 0;
+				double strength = a;
+				if (ramp) {
+					double mm[2], st[2];
+					lr_sample(RM, b, x, y, mm);
+					lr_sample(RS, b, x, y, st);
+					double w = fmin(fmax(d / 0.1, 0), 1);
+					double sc = mm[0] > 1e-4 ? fmin(fmax(st[0] / mm[0], 0), 1) : 1;
+					g *= 1 - (1 - sc) * w;
+					a = fmin(fmax(a + (st[1] - mm[1]) * w, 0), 1);
+				}
+				for (int ch = 0; ch < 3; ch++) {
+					double e = pow(img[((size_t)y * W + x) * 4 + ch] / 255.0, 1 + (c->v[SQ_GAMMA] - 1) * a);
+					double dg = c->v[SQ_DIM_RED + ch];
+					double lin = dec(e) * g * (1 + (dg - 1) * strength) * g_tint[ch];
+					exp_img[((size_t)y * W + x) * 4 + ch] = (uint8_t)lround(255 * enc(lin));
+				}
+			}
+	}
+	free(RM);
+	free(RS);
+}
+
+// Compares the whole of every monitor against the model's expected image. Pixels outside
+// every monitor must equal what was written (they are never redrawn).
+static void compare_all(const char *what, const struct sq_cfg *c, double unused) {
+	(void)c;
+	(void)unused;
 	int bad = 0, worst = 0, bx = -1, by = -1;
 	for (int y = 0; y < H; y++)
-		for (int x = 0; x < W; x++) {
-			bool in = false;
-			for (int m = 0; m < nmons; m++)
-				in = in || (x >= mons[m].x && x < mons[m].x + mons[m].w && y >= mons[m].y &&
-				            y < mons[m].y + mons[m].h);
-			const uint8_t *src = img + ((size_t)y * W + x) * 4;
-			const uint8_t *got = at(x, y);
+		for (int x = 0; x < W; x++)
 			for (int ch = 0; ch < 3; ch++) {
-				int want = in ? apply(src[ch], D[(size_t)y * W + x], c) : src[ch];
-				int diff = abs(got[ch] - want);
-				if (diff > 2) {
+				int want = exp_img[((size_t)y * W + x) * 4 + ch];
+				int diff = abs(at(x, y)[ch] - want);
+				if (diff > 3) {
 					bad++;
 					if (diff > worst) worst = diff, bx = x, by = y;
 				}
 			}
-		}
-	CHECK(bad == 0, "%s: %d channel values off by more than 2 (worst %d at %d,%d)", what, bad, worst, bx, by);
-	free(D);
+	CHECK(bad == 0, "%s: %d channel values off by more than 3 (worst %d at %d,%d)", what, bad, worst, bx, by);
 }
 
 // ---- scenarios --------------------------------------------------------------------------
@@ -423,9 +684,9 @@ static void test_gamma_and_enable(void) {
 }
 
 static void test_smoothing(void) {
-	printf("attack is instant, release follows exp(-dt/tau)\n");
+	printf("attack is instant; release follows exp(-dt/tau) after a scene change only\n");
 	struct sq_cfg c = base_cfg();
-	c.v[SQ_TAU_MS] = 300;
+	c.v[SQ_DARKENING_MS] = 300;
 	c.v[SQ_FALLOFF_PX] = 0;
 	struct pl_mon m[] = {{0, 0, 96, 64}};
 	setup(96, 64, m, 1);
@@ -433,8 +694,9 @@ static void test_smoothing(void) {
 	capture_full(0);
 	render(&c, 0);
 	expect_px("dark before", 28, 18, 40, 0);
-	put((struct pl_rect){20, 10, 36, 26}, 255, 255, 255);
-	capture((struct pl_rect){20, 10, 36, 26}, 0.01);
+	struct pl_rect big = {8, 6, 88, 58};  // two thirds of the monitor
+	put(big, 255, 255, 255);
+	capture(big, 0.01);
 	render(&c, 0.01);
 	double Dw = need_for(1.0, &c, c.v[SQ_TARGET]);
 	expect_px("white dimmed in the call that first shows it", 28, 18, apply(255, Dw, &c), 2);
@@ -442,16 +704,16 @@ static void test_smoothing(void) {
 	put((struct pl_rect){0, 0, 96, 64}, 40, 40, 40);
 	capture_full(0.31);
 	render(&c, 0.31);  // dt = 0.3 = one tau since the last smoothing step at 0.01
-	expect_px("1 tau after the white left", 28, 18, apply(40, Dw * exp(-1.0), &c), 2);
+	expect_px("1 tau after the white left", 28, 18, apply(40, Dw * exp(-1.0), &c), 3);
 	render(&c, 0.61);  // no new frame, smoothing only
-	expect_px("2 tau, no new frame", 28, 18, apply(40, Dw * exp(-2.0), &c), 2);
+	expect_px("2 tau, no new frame", 28, 18, apply(40, Dw * exp(-2.0), &c), 3);
 	render(&c, 5.0);
 	expect_px("fully released", 28, 18, 40, 0);
 
 	CHECK(pl_active(&pl, &c, 0.5), "active shortly after input");
 	CHECK(!pl_active(&pl, &c, 10.0), "inactive long after input");
-	c.v[SQ_TAU_MS] = 0;
-	CHECK(!pl_active(&pl, &c, 0.5), "with tau 0 only the short grace period is active");
+	c.v[SQ_DARKENING_MS] = 0;
+	CHECK(!pl_active(&pl, &c, 0.5), "with darkening 0 only the short grace period is active");
 	teardown();
 }
 
@@ -543,75 +805,373 @@ static void test_size(void) {
 	teardown();
 }
 
-// A newly bright area starts at min_gain and its gain floor rises toward 1 with time
-// constant rise, so its brightness climbs to the target instead of appearing at once.
+// New content that would be brighter is shown at the brightness and gamma strength that was
+// displayed before, and that level rises to the new one with time constant rise. Only blurred
+// values carry over, so the layout of the old content must not show in the new content.
 static void test_rise(void) {
-	printf("rise: new bright areas climb to their target\n");
+	printf("rise: new content starts at the old level and rises, with no burn-in\n");
 	struct sq_cfg c = base_cfg();
-	c.v[SQ_RISE_MS] = 200;
-	c.v[SQ_MIN_GAIN] = 0.05;  // a wide ramp: from 0.05 up to the 0.45 target gain
+	c.v[SQ_BRIGHTENING_MS] = 200;
+	c.v[SQ_MIN_GAIN] = 0.05;
+	c.v[SQ_SIZE_PX] = 24;
 	c.v[SQ_FALLOFF_PX] = 0;
+	c.v[SQ_GAMMA] = 1.6;
+	struct pl_mon m[] = {{0, 0, 128, 96}};
+	setup(128, 96, m, 1);
+	fill_dark();
+	capture_full(0);
+	render(&c, 0);
+	compare_all("first frame has no history", &c, 0);
+	double gt = 1 - need_for(1.0, &c, c.v[SQ_TARGET]);
+	int settled = apply(255, 1 - gt, &c);
+
+	// A large white block replaces dark content: it must start near the dark level.
+	struct pl_rect blk = {40, 20, 100, 76};
+	put(blk, 255, 255, 255);
+	capture(blk, 0.01);
+	double times[] = {0.01, 0.05, 0.1, 0.2, 0.4, 1.0, 3.0};
+	int last = 0;
+	for (int i = 0; i < 7; i++) {
+		render(&c, times[i]);
+		char name[48];
+		snprintf(name, sizeof name, "rise, white block at t=%.2f", times[i]);
+		compare_all(name, &c, 0);
+		if (i == 0) {
+			CHECK(at(70, 48)[0] < settled / 3, "block starts near the old dark level, got %d vs settled %d",
+			      at(70, 48)[0], settled);
+		}
+		CHECK(at(70, 48)[0] >= last, "brightness only rises, got %d after %d", at(70, 48)[0], last);
+		last = at(70, 48)[0];
+	}
+	expect_px("settled at the target", 70, 48, settled, 3);
+	expect_px("dark area untouched throughout", 5, 90, 40, 0);
+
+	// New content that is dimmer than before shows at once, and the displayed level falls
+	// with it, so brightening again starts from the dimmer level, not the old high one.
+	put(blk, 160, 160, 160);
+	capture(blk, 3.1);
+	render(&c, 3.1);
+	compare_all("dimmer content shows at once", &c, 0);
+	put(blk, 255, 255, 255);
+	capture(blk, 3.12);
+	render(&c, 3.12);
+	compare_all("brightening again starts from the dimmer level", &c, 0);
+	render(&c, 3.5);
+	compare_all("and then rises", &c, 0);
+
+	// The faint tail of the falloff is only partly affected by the ramp.
+	struct sq_cfg tail = c;
+	tail.v[SQ_FALLOFF_PX] = 14;
+	setup(128, 96, m, 1);
+	fill_dark();
+	capture_full(0);
+	render(&tail, 0);
+	put(blk, 255, 255, 255);
+	capture(blk, 0.01);
+	double tt[] = {0.01, 0.1, 0.5};
+	for (int i = 0; i < 3; i++) {
+		render(&tail, tt[i]);
+		char name[48];
+		snprintf(name, sizeof name, "falloff tail under the ramp, t=%.2f", tt[i]);
+		compare_all(name, &tail, 0);
+	}
+	CHECK(at(36, 48)[0] < 40, "a pixel in the falloff tail is dimmed below its original 40: %d", at(36, 48)[0]);
+
+	// No burn-in: the old content has fine stripes, the new content is a plain white page.
+	setup(128, 96, m, 1);
+	put((struct pl_rect){0, 0, 128, 96}, 255, 255, 255);
+	for (int x = 0; x < 128; x += 8) {
+		put((struct pl_rect){x, 0, x + 1, 96}, 0, 0, 0);
+	}
+	capture_full(0);
+	for (int i = 0; i <= 10; i++) {
+		render(&c, 0.05 * i);  // let the ramp state settle on the striped page
+	}
+	put((struct pl_rect){0, 0, 128, 96}, 255, 255, 255);
+	capture((struct pl_rect){0, 0, 128, 96}, 0.6);
+	render(&c, 0.61);
+	compare_all("striped page replaced by a plain page", &c, 0);
+	int worst = 0;
+	for (int y = 10; y < 86; y += 5)
+		for (int x = 20; x < 100; x++) {
+			int d = abs(at(x, y)[0] - at(x + 1, y)[0]);
+			if (d > worst) worst = d;
+		}
+	CHECK(worst <= 3, "plain page shows no trace of the old stripes: neighboring pixels differ by %d", worst);
+
+	// rise 0 shows content at once; toggling it resets the state.
+	c.v[SQ_BRIGHTENING_MS] = 0;
+	setup(128, 96, m, 1);
+	fill_dark();
+	capture_full(0);
+	render(&c, 0);
+	put(blk, 255, 255, 255);
+	capture(blk, 0.01);
+	render(&c, 0.01);
+	compare_all("rise 0", &c, 0);
+	expect_px("rise 0 is instant", 70, 48, settled, 3);
+	c.v[SQ_BRIGHTENING_MS] = 200;
+	render(&c, 0.02);
+	compare_all("rise switched on", &c, 0);
+	expect_px("switching rise on starts from the present", 70, 48, settled, 3);
+	teardown();
+
+	// Two monitors, tau and rise together.
+	struct sq_cfg c2 = c;
+	c2.v[SQ_DARKENING_MS] = 150;
+	struct pl_mon two[] = {{0, 0, 64, 96}, {64, 0, 64, 96}};
+	setup(128, 96, two, 2);
+	fill_dark();
+	capture_full(0);
+	render(&c2, 0);
+	put((struct pl_rect){40, 20, 100, 76}, 255, 255, 255);
+	capture((struct pl_rect){40, 20, 100, 76}, 0.01);
+	double t2[] = {0.01, 0.1, 0.3, 1.0};
+	for (int i = 0; i < 4; i++) {
+		render(&c2, t2[i]);
+		char name[48];
+		snprintf(name, sizeof name, "two monitors, tau and rise, t=%.2f", t2[i]);
+		compare_all(name, &c2, 0);
+	}
+	fill_dark();
+	capture_full(1.1);
+	render(&c2, 1.1);
+	compare_all("two monitors, content leaves", &c2, 0);
+	// A large block ends at the shared edge and a small patch touches it from the other side
+	// while both ramp: neither monitor's ramp state may leak into the other.
+	struct sq_cfg c3 = c;
+	setup(128, 96, two, 2);
+	fill_dark();
+	capture_full(0);
+	render(&c3, 0);
+	put((struct pl_rect){10, 20, 64, 76}, 255, 255, 255);
+	put((struct pl_rect){64, 40, 68, 44}, 255, 255, 255);
+	capture_full(0.01);
+	double t3[] = {0.01, 0.1, 0.4};
+	for (int i = 0; i < 3; i++) {
+		render(&c3, t3[i]);
+		char name[56];
+		snprintf(name, sizeof name, "ramp across a shared edge, t=%.2f", t3[i]);
+		compare_all(name, &c3, 0);
+	}
+	teardown();
+}
+
+static void test_color(void) {
+	printf("channel gains where dimming is strong, and per-monitor tints\n");
+	struct sq_cfg c = base_cfg();
+	c.v[SQ_DIM_RED] = 0.85;
+	c.v[SQ_DIM_BLUE] = 0.5;
+	c.v[SQ_FALLOFF_PX] = 8;
 	struct pl_mon m[] = {{0, 0, 96, 64}};
 	setup(96, 64, m, 1);
 	fill_dark();
+	put((struct pl_rect){20, 10, 40, 30}, 255, 255, 255);
+	put((struct pl_rect){60, 36, 80, 56}, 200, 200, 200);
 	capture_full(0);
 	render(&c, 0);
-	double mg = c.v[SQ_MIN_GAIN], Dw = need_for(1.0, &c, c.v[SQ_TARGET]), gt = 1 - Dw;
-	put((struct pl_rect){20, 10, 36, 26}, 255, 255, 255);
-	capture((struct pl_rect){20, 10, 36, 26}, 0.01);
-	// The floor f follows f' = f + (1 - f)(1 - exp(-dt / rise)), starting from min_gain.
-	double f = mg, t_prev = 0;
-	double times[] = {0.01, 0.05, 0.1, 0.2, 0.4, 1.0, 3.0};
-	for (int i = 0; i < 7; i++) {
-		f = f + (1 - f) * (1 - exp(-(times[i] - t_prev) / 0.2));
-		t_prev = times[i];
-		render(&c, times[i]);
-		double g = fmin(gt, f);
-		char name[48];
-		snprintf(name, sizeof name, "white at t=%.2f", times[i]);
-		expect_px(name, 28, 18, apply(255, 1 - g, &c), 3);
-		expect_px("dark pixel is never touched", 5, 60, 40, 0);
+	compare_all("dim_red and dim_blue", &c, 0);
+	CHECK(at(30, 20)[1] > at(30, 20)[0] && at(30, 20)[0] > at(30, 20)[2],
+	      "green untouched, red lowered a little, blue lowered most: %d,%d,%d", at(30, 20)[0],
+	      at(30, 20)[1], at(30, 20)[2]);
+	expect_px("far dark stays bit identical with no tint", 5, 60, 40, 0);
+	c.v[SQ_DIM_RED] = c.v[SQ_DIM_BLUE] = 1.0;
+	c.v[SQ_DIM_GREEN] = 0.6;
+	render(&c, 0.1);
+	compare_all("dim_green only", &c, 0);
+
+	// A whole-screen tint applies to every monitor, even where nothing is dimmed.
+	c.v[SQ_DIM_GREEN] = 1.0;
+	struct pl_mon two[] = {{0, 0, 64, 64}, {64, 0, 64, 64}};
+	setup(128, 64, two, 2);
+	fill_dark();
+	put((struct pl_rect){10, 10, 30, 30}, 255, 255, 255);
+	put((struct pl_rect){80, 10, 100, 30}, 255, 255, 255);
+	capture_full(0);
+	set_tint(1.0f, 0.8f, 0.5f);
+	render(&c, 0);
+	compare_all("global tint on two monitors", &c, 0);
+	for (int x = 50; x <= 110; x += 60) {
+		CHECK(at(x, 55)[2] < at(x, 55)[0], "dark pixel at x=%d is tinted toward amber: %d,%d,%d", x,
+		      at(x, 55)[0], at(x, 55)[1], at(x, 55)[2]);
 	}
-	CHECK(f > gt, "the floor has passed the target by the end");
-	expect_px("settled at the target", 28, 18, (int)lround(255 * enc(gt)), 2);
 
-	// The white leaves and returns: the ramp starts over.
+	set_tint(1.0f, 1.0f, 1.0f);
+	render(&c, 0.1);  // a tint change alone, with no new frame
+	compare_all("tint removed", &c, 0);
+	expect_px("untinted pixels are bit identical", 110, 55, 40, 0);
+	set_tint(0.9f, 1.0f, 1.0f);
+	render(&c, 0.15);
+	compare_all("a different tint", &c, 0);
+
+	c.v[SQ_ENABLED] = 0;
+	render(&c, 0.2);
+	compare_all("disabled switches the tint off too", &c, 0);
+	expect_px("disabled copies the dark pixel", 50, 55, 40, 0);
+	c.v[SQ_ENABLED] = 1;
+
+	// Tint together with the ramp and tau.
+	c.v[SQ_BRIGHTENING_MS] = 200;
+	c.v[SQ_DARKENING_MS] = 100;
+	c.v[SQ_SIZE_PX] = 24;
+	render(&c, 0.3);
 	fill_dark();
-	capture_full(3.1);
-	render(&c, 3.1);
-	expect_px("white gone", 28, 18, 40, 0);
-	put((struct pl_rect){20, 10, 36, 26}, 255, 255, 255);
-	capture((struct pl_rect){20, 10, 36, 26}, 3.11);
-	render(&c, 3.11);
-	double f2 = mg + (1 - mg) * (1 - exp(-0.01 / 0.2));
-	expect_px("ramp restarts near min_gain", 28, 18, apply(255, 1 - fmin(gt, f2), &c), 3);
-	CHECK(at(28, 18)[0] < (int)lround(255 * enc(gt)) - 20, "restarted ramp is well below the target");
+	capture_full(0.31);
+	render(&c, 0.31);
+	put((struct pl_rect){10, 10, 50, 50}, 255, 255, 255);
+	capture((struct pl_rect){10, 10, 50, 50}, 0.32);
+	double tt[] = {0.32, 0.4, 0.6, 1.5};
+	for (int i = 0; i < 4; i++) {
+		render(&c, tt[i]);
+		char name[48];
+		snprintf(name, sizeof name, "tint with ramp and tau, t=%.2f", tt[i]);
+		compare_all(name, &c, 0);
+	}
+	teardown();
+}
 
-	// rise = 0 shows it at once.
-	c.v[SQ_RISE_MS] = 0;
-	setup(96, 64, m, 1);
+// The config format: plain keys, clamping, and a save and load round trip.
+static void test_config(void) {
+	printf("config: keys, clamping, round trip\n");
+	struct sq_cfg c;
+	sq_defaults(&c);
+	CHECK(sq_set(&c, "target", "0.5") && c.v[SQ_TARGET] == 0.5, "plain key");
+	CHECK(!sq_set(&c, "bogus", "1"), "unknown key is rejected");
+	CHECK(!sq_set(&c, "target", "abc"), "bad value is rejected");
+	CHECK(!sq_set(&c, "tint_red.DP-5", "0.5"), "monitor suffixes are not supported");
+	CHECK(sq_set(&c, "tint_red", "5") && c.v[SQ_TINT_RED] == 1.0, "clamped to the maximum");
+	CHECK(sq_set(&c, "tint_red", "0") && fabs(c.v[SQ_TINT_RED] - 0.2) < 1e-9, "clamped to the minimum");
+	CHECK(sq_set(&c, "tint_blue", "0.7") && sq_set(&c, "dim_green", "0.6"), "tint and channel gain keys");
+	const char *path = "/tmp/squint-config-test.conf";
+	CHECK(sq_save(path, &c) == 0, "save");
+	struct sq_cfg d;
+	sq_load(path, &d);
+	CHECK(fabs(d.v[SQ_TINT_BLUE] - 0.7) < 0.006 && fabs(d.v[SQ_DIM_GREEN] - 0.6) < 0.006 &&
+	          fabs(d.v[SQ_TARGET] - 0.5) < 1e-9,
+	      "values round trip");
+	FILE *f = fopen(path, "a");
+	fputs("tint_red.DP-5 = 0.5\nunknown = 3\n", f);  // old per-monitor lines are ignored
+	fclose(f);
+	sq_load(path, &d);
+	CHECK(fabs(d.v[SQ_TINT_BLUE] - 0.7) < 0.006 && d.v[SQ_TINT_RED] > 0.19 && d.v[SQ_TINT_RED] < 0.21,
+	      "per-monitor lines in an old file are ignored");
+	unlink(path);
+}
+
+// Darkening and brightening smoothing apply only after a scene change: more than a third of
+// a monitor's blurred brightness changing significantly. Small changes, scrolling, and
+// settings changes must show at once.
+static void test_gate(void) {
+	printf("smoothing applies only after a scene change\n");
+	struct sq_cfg c = base_cfg();
+	c.v[SQ_BRIGHTENING_MS] = 400;
+	c.v[SQ_DARKENING_MS] = 400;
+	c.v[SQ_MIN_GAIN] = 0.05;
+	c.v[SQ_SIZE_PX] = 24;
+	c.v[SQ_FALLOFF_PX] = 0;
+	struct pl_mon m[] = {{0, 0, 128, 96}};
+	setup(128, 96, m, 1);
 	fill_dark();
 	capture_full(0);
 	render(&c, 0);
-	put((struct pl_rect){20, 10, 36, 26}, 255, 255, 255);
-	capture((struct pl_rect){20, 10, 36, 26}, 0.01);
+	double Dw = need_for(1.0, &c, c.v[SQ_TARGET]);
+	int settled = apply(255, Dw, &c);
+
+	// A small bright patch appears and goes away: both show at once.
+	struct pl_rect patch = {50, 40, 62, 52};
+	put(patch, 255, 255, 255);
+	capture(patch, 0.01);
 	render(&c, 0.01);
-	expect_px("rise 0 is instant", 28, 18, apply(255, Dw, &c), 2);
+	compare_all("small patch appears", &c, 0);
+	expect_px("small patch shows at once (no brightening ramp)", 56, 46, settled, 3);
+	put(patch, 40, 40, 40);
+	capture(patch, 0.02);
+	render(&c, 0.02);
+	compare_all("small patch leaves", &c, 0);
+	expect_px("small patch releases at once (no darkening fade)", 56, 46, 40, 0);
+
+	// Scrolling: a page with gray stripes moves 3 px per frame. Every frame shows at once.
+	setup(128, 96, m, 1);
+	double t = 0;
+	for (int frame = 0; frame < 14; frame++) {
+		put((struct pl_rect){0, 0, 128, 96}, 255, 255, 255);
+		for (int x = -8 + (frame * 3) % 8; x < 128; x += 8) {
+			int x1 = x < 0 ? 0 : x, x2 = x + 2 > 128 ? 128 : x + 2;
+			if (x2 > x1) put((struct pl_rect){x1, 0, x2, 96}, 40, 40, 40);
+		}
+		capture_full(t);
+		render(&c, t);
+		char name[48];
+		snprintf(name, sizeof name, "scrolling page, frame %d", frame);
+		compare_all(name, &c, 0);
+		if (frame > 0) {
+			int x = (frame * 3) % 8 + 4;  // a white column, and a column that was white last frame
+			expect_px("white shows at once", 8 * 4 + x % 8 + 2, 40, settled, 3);
+			int gx = -8 + (frame * 3) % 8 + 8 * 6;  // a gray stripe's left pixel
+			expect_px("a stripe is never held dim by the old white", gx, 40, 40, 0);
+		}
+		t += 0.05;
+	}
+
+	// A settings change on a static page is not a scene change.
+	setup(128, 96, m, 1);
+	put((struct pl_rect){0, 0, 128, 96}, 255, 255, 255);
+	c.v[SQ_TARGET_LARGE] = 1.0;  // keep the size feature off while the target moves
+	c.v[SQ_TARGET] = 0.25;
+	capture_full(0);
+	render(&c, 0);
+	c.v[SQ_TARGET] = 0.6;
+	render(&c, 0.05);
+	compare_all("target raised on a static page", &c, 0);
+	expect_px("the new target shows at once", 64, 48, apply(255, need_for(1.0, &c, 0.6), &c), 3);
+
+	// A scene change on one monitor arms only that monitor.
+	struct sq_cfg c2 = base_cfg();
+	c2.v[SQ_BRIGHTENING_MS] = 400;
+	c2.v[SQ_MIN_GAIN] = 0.05;
+	c2.v[SQ_SIZE_PX] = 24;
+	c2.v[SQ_FALLOFF_PX] = 0;
+	struct pl_mon two[] = {{0, 0, 64, 96}, {64, 0, 64, 96}};
+	setup(128, 96, two, 2);
+	fill_dark();
+	capture_full(0);
+	render(&c2, 0);
+	put((struct pl_rect){4, 4, 60, 92}, 255, 255, 255);  // most of monitor 0
+	put((struct pl_rect){90, 40, 100, 50}, 255, 255, 255);  // a small patch on monitor 1
+	capture_full(0.01);
+	render(&c2, 0.01);
+	compare_all("scene change on monitor 0 only, t=0.01", &c2, 0);
+	CHECK(at(30, 48)[0] < settled / 3, "monitor 0 ramps up from dark: %d vs %d", at(30, 48)[0], settled);
+	expect_px("monitor 1 patch shows at once", 95, 45, settled, 3);
+	render(&c2, 0.3);
+	compare_all("scene change on monitor 0 only, t=0.30", &c2, 0);
+	// A later small change on monitor 1 while monitor 0 is still armed must show at once.
+	put((struct pl_rect){70, 10, 80, 20}, 255, 255, 255);
+	capture((struct pl_rect){70, 10, 80, 20}, 0.4);
+	render(&c2, 0.4);
+	compare_all("a small change on monitor 1 while monitor 0 is armed", &c2, 0);
+	expect_px("monitor 1 is not armed by monitor 0", 75, 15, settled, 3);
+	render(&c2, 3.0);
+	expect_px("monitor 0 settles", 30, 48, settled, 3);
 	teardown();
 
-	// tau and rise together: release still uses tau.
-	c.v[SQ_RISE_MS] = 200;
-	c.v[SQ_TAU_MS] = 300;
-	setup(96, 64, m, 1);
+	// A change that is significant but covers well under a third of the monitor is not a
+	// scene change.
+	struct sq_cfg c3 = base_cfg();
+	c3.v[SQ_BRIGHTENING_MS] = 400;
+	c3.v[SQ_MIN_GAIN] = 0.05;
+	c3.v[SQ_SIZE_PX] = 16;
+	c3.v[SQ_FALLOFF_PX] = 0;
+	setup(128, 96, m, 1);
 	fill_dark();
-	put((struct pl_rect){20, 10, 36, 26}, 255, 255, 255);
 	capture_full(0);
-	render(&c, 0);  // the first frame has no history, so it starts at the target
-	expect_px("first frame starts at the target", 28, 18, apply(255, Dw, &c), 2);
-	fill_dark();
-	capture_full(0.3);
-	render(&c, 0.3);
-	expect_px("release after 1 tau", 28, 18, apply(40, Dw * exp(-1.0), &c), 3);
+	render(&c3, 0);
+	struct pl_rect mid = {20, 20, 60, 50};
+	put(mid, 255, 255, 255);
+	capture(mid, 0.01);
+	render(&c3, 0.01);
+	compare_all("a moderate block", &c3, 0);
+	expect_px("a moderate block shows at once", 40, 35, settled, 3);
 	teardown();
 }
 
@@ -659,6 +1219,9 @@ int main(void) {
 	test_smoothing();
 	test_size();
 	test_rise();
+	test_gate();
+	test_color();
+	test_config();
 	test_damage_shapes();
 	printf("\n%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;

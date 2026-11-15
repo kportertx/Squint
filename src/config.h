@@ -22,12 +22,19 @@ enum {
 	SQ_SIZE_BIAS,
 	SQ_MIN_GAIN,
 	SQ_KNEE,
-	SQ_TAU_MS,
-	SQ_RISE_MS,
+	SQ_DARKENING_MS,
+	SQ_BRIGHTENING_MS,
 	SQ_FALLOFF_PX,
 	SQ_GAMMA,
+	SQ_DIM_RED,
+	SQ_DIM_GREEN,
+	SQ_DIM_BLUE,
+	SQ_TINT_RED,
+	SQ_TINT_GREEN,
+	SQ_TINT_BLUE,
 	SQ_N
 };
+
 
 enum sq_type { SQ_BOOL, SQ_FLOAT, SQ_INT };
 
@@ -45,21 +52,33 @@ static const struct sq_param sq_params[SQ_N] = {
     [SQ_TARGET_LARGE] = {"target_large", SQ_FLOAT, 0.20, 0.05, 1.0, 0.01,
                          "Target inside large bright areas. At or above target, size has no effect."},
     [SQ_SIZE_PX] = {"size_px", SQ_INT, 192, 16, 512, 1,
-                    "Radius over which brightness is gathered to judge how large a bright area is."},
+                    "Radius over which brightness is gathered to judge how large a bright area is. Also the scale of the rise."},
     [SQ_SIZE_BIAS] = {"size_bias", SQ_FLOAT, 2.0, 1.0, 4.0, 0.1,
                       "How much brightness outweighs size. 1 is the plain average, higher counts bright pixels more."},
     [SQ_MIN_GAIN] = {"min_gain", SQ_FLOAT, 0.35, 0.05, 1.0, 0.01,
                      "Lowest gain allowed, so a pixel never goes fully black."},
     [SQ_KNEE] = {"knee", SQ_FLOAT, 0.10, 0.0, 0.5, 0.01,
                  "Width of the soft transition around the target."},
-    [SQ_TAU_MS] = {"tau_ms", SQ_INT, 0, 0, 5000, 25,
-                   "Release time after a pixel gets darker. Dimming applies instantly."},
-    [SQ_RISE_MS] = {"rise_ms", SQ_INT, 0, 0, 5000, 25,
-                    "Time for a newly bright area to climb from min_gain to its target brightness. 0 shows it at once."},
+    [SQ_DARKENING_MS] = {"darkening_ms", SQ_INT, 0, 0, 5000, 25,
+                         "How slowly dimming fades after content gets darker. Applies only after a large scene change. 0 is instant."},
+    [SQ_BRIGHTENING_MS] = {"brightening_ms", SQ_INT, 0, 0, 5000, 25,
+                           "Time for newly brighter content to rise from the brightness and gamma shown before. Applies only after a large scene change. 0 is instant."},
     [SQ_FALLOFF_PX] = {"falloff_px", SQ_INT, 24, 0, 128, 1,
                        "Distance over which the strongest dimming fades out around bright pixels. 0 dims only the bright pixels."},
     [SQ_GAMMA] = {"gamma", SQ_FLOAT, 1.0, 0.5, 3.0, 0.05,
                   "Gamma where dimming is strongest (1 = off). Above 1 darkens midtones, below 1 lifts them."},
+    [SQ_DIM_RED] = {"dim_red", SQ_FLOAT, 1.0, 0.2, 1.0, 0.01,
+                    "Red multiplier where dimming is strongest. It fades in with the dimming. 1 leaves red alone."},
+    [SQ_DIM_GREEN] = {"dim_green", SQ_FLOAT, 1.0, 0.2, 1.0, 0.01,
+                      "Green multiplier where dimming is strongest."},
+    [SQ_DIM_BLUE] = {"dim_blue", SQ_FLOAT, 1.0, 0.2, 1.0, 0.01,
+                     "Blue multiplier where dimming is strongest."},
+    [SQ_TINT_RED] = {"tint_red", SQ_FLOAT, 1.0, 0.2, 1.0, 0.01,
+                     "Red multiplier for the whole screen, dimmed or not. 1 leaves red alone."},
+    [SQ_TINT_GREEN] = {"tint_green", SQ_FLOAT, 1.0, 0.2, 1.0, 0.01,
+                       "Green multiplier for the whole screen."},
+    [SQ_TINT_BLUE] = {"tint_blue", SQ_FLOAT, 1.0, 0.2, 1.0, 0.01,
+                      "Blue multiplier for the whole screen."},
 };
 
 struct sq_cfg {
@@ -105,6 +124,13 @@ static inline int sq_find(const char *key) {
 			return i;
 		}
 	}
+	// Names used before the renames, so an old config file keeps working.
+	if (strcmp(key, "tau_ms") == 0) {
+		return SQ_DARKENING_MS;
+	}
+	if (strcmp(key, "rise_ms") == 0) {
+		return SQ_BRIGHTENING_MS;
+	}
 	return -1;
 }
 
@@ -126,6 +152,17 @@ static inline bool sq_parse_value(int i, const char *s, double *out) {
 		return false;
 	}
 	*out = sq_clamp(i, x);
+	return true;
+}
+
+// Sets one setting by key. Returns false for an unknown key or a bad value.
+static inline bool sq_set(struct sq_cfg *c, const char *key, const char *value) {
+	int i = sq_find(key);
+	double x;
+	if (i < 0 || !sq_parse_value(i, value, &x)) {
+		return false;
+	}
+	c->v[i] = x;
 	return true;
 }
 
@@ -154,11 +191,7 @@ static inline void sq_load(const char *path, struct sq_cfg *c) {
 		while (*v == ' ' || *v == '\t') v++;
 		char *ve = v + strlen(v);
 		while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t' || ve[-1] == '\n' || ve[-1] == '\r')) *--ve = '\0';
-		int i = sq_find(k);
-		double x;
-		if (i >= 0 && sq_parse_value(i, v, &x)) {
-			c->v[i] = x;
-		}
+		sq_set(c, k, v);
 	}
 	fclose(f);
 }

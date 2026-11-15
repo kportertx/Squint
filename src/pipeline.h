@@ -8,9 +8,17 @@
 //   need     per pixel, d = 1 - gain(L): how much the pixel's own luminance L must be dimmed
 //   dilate   spread d outward with a linear falloff, D(x) = max over y of d(y) - slope*|x-y|
 //            (L1 distance), never across a monitor edge
-//   smooth   optional per pixel: instant attack, exponential release with time constant tau,
-//            and a floor on the gain that starts at min_gain where an area newly becomes
-//            bright and rises toward 1 with time constant rise
+//   scene    optional: per monitor, whether more than a third of the screen's blurred
+//            brightness changed significantly since the previous frame. Only then do smooth
+//            and ramp apply, for a window of five time constants. Scrolling a page moves many
+//            pixels but barely changes the blurred brightness, so it never triggers them.
+//   smooth   optional per pixel: instant attack, exponential release with time constant
+//            darkening, armed by a scene change
+//   ramp     optional, regional, armed by a scene change: a blurred local brightness and gamma strength of the
+//            content as it will be displayed, versus the level that was displayed before.
+//            New content that would be brighter is shown at the old level first, and the
+//            level rises to the new one with time constant rise. Only blurred values carry
+//            over from frame to frame, never the layout of the old content.
 //   final    redraw every monitor pixel from S, scaled by 1 - D (and gamma), or copied
 //            unchanged where D is zero
 //
@@ -50,31 +58,38 @@ struct pl {
 	GLenum read_buf, draw_buf;
 
 	bool ready;
-	GLuint vao, fbo, prog[6];
+	GLuint vao, fbo, prog[9];
 	GLuint samp_nearest, samp_linear;
 
 	int W, H;
 	GLuint s_tex;           // undimmed screen, RGBA8
 	GLuint tex_a, tex_b;    // dilation ping-pong
 	GLuint dnow;            // dilated dimming amount D for the latest captured content
-	GLuint st[2];           // RG16F: smoothed D and the rise floor f, used only when smoothing
-	GLuint lr_a, lr_b;      // R16F at 1/PL_LR resolution: the size field
+	GLuint st[2];           // R16F: smoothed D, used only when tau > 0
+	GLuint lr_a, lr_b;      // RG16F at 1/PL_LR resolution: the size field (red channel)
+	GLuint rlr_a, rlr_b;    // RG16F at 1/PL_LR resolution: blurred (brightness, gamma strength)
+	GLuint rs[2];           // RG16F at 1/PL_LR resolution: the ramp state, what was displayed
+	GLuint rlr_p;           // RG16F at 1/PL_LR resolution: the previous frame's means
+	GLuint scn[2];          // RG32F PL_MAXMON x 1: per monitor, until when (seconds since t0)
+	                        // darkening (red) and brightening (green) smoothing stay armed
+	int scur;
 	int lrW, lrH;
-	int cur;
-	bool s_valid, st_valid, dirty;
+	int cur, rcur;
+	bool s_valid, st_valid, rs_valid, dirty, prev_valid, means_valid;
 
 	struct pl_mon mon[PL_MAXMON];
+	float tint[3];  // whole-screen color multipliers, 1 = unchanged
 	int nmon;
 
 	// Parameters the current dnow was computed with.
 	double used_target, used_min_gain, used_knee, used_target_large, used_size_px, used_size_bias;
 	int used_falloff;
 
-	bool have_input, have_smooth_time, was_enabled;
-	double last_input, last_smooth;
+	bool have_input, have_smooth_time, have_ramp_time, was_enabled, have_t0;
+	double last_input, last_smooth, last_ramp, t0;
 };
 
-enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL, PL_DOWN, PL_BOX };
+enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL, PL_DOWN, PL_BOX, PL_RDOWN, PL_RAMP, PL_SCENE };
 
 static void (*pl_logger)(const char *msg);
 
@@ -116,7 +131,7 @@ static const char *pl_fs_down =
     "uniform sampler2D S;\n"
     "uniform float bias;\n"
     "uniform ivec2 size;\n"
-    "out float o;\n"
+    "out vec2 o;\n"
     "void main() {\n"
     "  ivec2 b = ivec2(gl_FragCoord.xy) * 4;\n"
     "  float sum = 0.0, cnt = 0.0;\n"
@@ -129,7 +144,7 @@ static const char *pl_fs_down =
     "        cnt += 1.0;\n"
     "      }\n"
     "    }\n"
-    "  o = sum / cnt;\n"
+    "  o = vec2(sum / cnt, 0.0);\n"
     "}\n";
 
 // Separable box mean (mode 0) or box maximum (mode 1) along one axis, clipped to the
@@ -141,14 +156,15 @@ static const char *pl_fs_box =
     "uniform ivec2 dir;\n"
     "uniform int radius, mode;\n"
     "uniform ivec4 box;\n"
-    "out float o;\n"
+    "out vec2 o;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
-    "  float acc = mode == 1 ? -1.0 : 0.0, cnt = 0.0;\n"
+    "  vec2 acc = mode == 1 ? vec2(-1.0) : vec2(0.0);\n"
+    "  float cnt = 0.0;\n"
     "  for (int k = -radius; k <= radius; k++) {\n"
     "    ivec2 q = p + dir * k;\n"
     "    if (q.x >= box.x && q.y >= box.y && q.x < box.z && q.y < box.w) {\n"
-    "      float v = texelFetch(src, q, 0).r;\n"
+    "      vec2 v = texelFetch(src, q, 0).rg;\n"
     "      if (mode == 1) acc = max(acc, v); else { acc += v; cnt += 1.0; }\n"
     "    }\n"
     "  }\n"
@@ -211,44 +227,133 @@ static const char *pl_fs_dilate =
     "  o = v;\n"
     "}\n";
 
-// State is (D, f). D is the dimming amount with instant attack and release time tau. f is
-// a floor on the gain: it is held at min_gain while D is zero, and once D is nonzero it
-// rises toward 1 with time constant rise. The gain actually applied is min(1 - D, f), so
-// an area that newly becomes bright starts at min_gain and climbs to its target gain.
 static const char *pl_fs_smooth =
     PL_COMMON
-    "uniform sampler2D now_t, prev_t;\n"
-    "uniform float k_tau, k_rise, init, min_gain, use_rise;\n"
-    "out vec2 o;\n"
+    "uniform sampler2D now_t, prev_t, scn;\n"
+    "uniform float k_tau, init, t_rel;\n"
+    "uniform int idx;\n"
+    "out float o;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  float n = texelFetch(now_t, p, 0).r;\n"
-    "  vec2 prev = texelFetch(prev_t, p, 0).rg;\n"
-    "  float d = init > 0.5 ? n : max(n, mix(prev.r, n, k_tau));\n"
-    "  float f = 1.0;\n"
-    "  if (use_rise > 0.5) {\n"
-    "    if (d < 0.002) f = min_gain;\n"
-    "    else f = init > 0.5 ? 1.0 : prev.g + (1.0 - prev.g) * k_rise;\n"
-    "  }\n"
-    "  o = vec2(d, f);\n"
+    "  float prev = texelFetch(prev_t, p, 0).r;\n"
+    "  bool armed = t_rel < texelFetch(scn, ivec2(idx, 0), 0).r;\n"
+    "  o = init > 0.5 ? n : (armed ? max(n, mix(prev, n, k_tau)) : n);\n"
     "}\n";
 
-static const char *pl_fs_final =
+// Mean over each PL_LR x PL_LR block of the brightness the content will have once dimmed,
+// L * (1 - D), and of the gamma strength a = D / (1 - min_gain). Red is brightness, green
+// is strength.
+static const char *pl_fs_rdown =
     PL_COMMON
     "uniform sampler2D S, D;\n"
-    "uniform float enabled, min_gain, gamma_dim, use_rise;\n"
+    "uniform ivec2 size;\n"
+    "uniform float min_gain;\n"
+    "out vec2 o;\n"
+    "void main() {\n"
+    "  ivec2 b = ivec2(gl_FragCoord.xy) * 4;\n"
+    "  vec2 sum = vec2(0.0);\n"
+    "  float cnt = 0.0;\n"
+    "  for (int j = 0; j < 4; j++)\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "      ivec2 p = b + ivec2(i, j);\n"
+    "      if (p.x < size.x && p.y < size.y) {\n"
+    "        float L = dot(to_lin(texelFetch(S, p, 0).rgb), W709);\n"
+    "        float d = texelFetch(D, p, 0).r;\n"
+    "        float a = (1.0 - min_gain) > 1e-4 ? clamp(d / (1.0 - min_gain), 0.0, 1.0) : 0.0;\n"
+    "        sum += vec2(L * (1.0 - d), a);\n"
+    "        cnt += 1.0;\n"
+    "      }\n"
+    "    }\n"
+    "  o = sum / cnt;\n"
+    "}\n";
+
+// The ramp state is what was displayed: a brightness b and a gamma strength a per area.
+// Brightness may rise toward the new value with time constant rise but falls at once, so
+// new content that is dimmer than before shows immediately. The gamma strength moves
+// toward the new value in both directions, so the gamma changes smoothly too.
+static const char *pl_fs_ramp =
+    PL_COMMON
+    "uniform sampler2D means, prev, scn;\n"
+    "uniform float k, init, t_rel;\n"
+    "uniform int idx;\n"
+    "out vec2 o;\n"
+    "void main() {\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "  vec2 n = texelFetch(means, p, 0).rg;\n"
+    "  vec2 pv = texelFetch(prev, p, 0).rg;\n"
+    "  bool armed = t_rel < texelFetch(scn, ivec2(idx, 0), 0).g;\n"
+    "  // Without a scene change the state follows the content at once.\n"
+    "  if (init > 0.5 || !armed) { o = n; return; }\n"
+    "  o = vec2(n.x > pv.x ? pv.x + (n.x - pv.x) * k : n.x, n.y + (pv.y - n.y) * (1.0 - k));\n"
+    "}\n";
+
+// Scene change detector, one fragment per monitor. It samples a 32 x 32 grid of the
+// monitor's blurred brightness and counts the samples whose brightness differs from the
+// previous frame by more than 0.03 or by more than 25 percent. When more than a third of
+// them differ, smoothing stays armed until t_rel + dur_d and brightening until
+// t_rel + dur_b (a duration of 0 leaves that one alone).
+static const char *pl_fs_scene =
+    PL_COMMON
+    "uniform sampler2D means, prevm, scn_prev;\n"
+    "uniform ivec4 box;\n"
+    "uniform int idx;\n"
+    "uniform float t_rel, dur_d, dur_b;\n"
+    "out vec2 o;\n"
+    "void main() {\n"
+    "  vec2 prev = texelFetch(scn_prev, ivec2(idx, 0), 0).rg;\n"
+    "  float changed = 0.0;\n"
+    "  for (int gy = 0; gy < 32; gy++)\n"
+    "    for (int gx = 0; gx < 32; gx++) {\n"
+    "      ivec2 q = box.xy + ivec2((vec2(gx, gy) + 0.5) / 32.0 * vec2(box.zw - box.xy));\n"
+    "      float n = texelFetch(means, q, 0).r, pv = texelFetch(prevm, q, 0).r;\n"
+    "      if (abs(n - pv) > max(0.03, 0.25 * max(n, pv))) changed += 1.0;\n"
+    "    }\n"
+    "  bool hit = changed / 1024.0 > 0.33;\n"
+    "  o = hit ? vec2(dur_d > 0.0 ? t_rel + dur_d : prev.x, dur_b > 0.0 ? t_rel + dur_b : prev.y) : prev;\n"
+    "}\n";
+
+// With use_ramp, new content is scaled by s = displayed / new brightness (at most 1) and
+// its gamma strength is shifted by the difference between the displayed and the new
+// strength. Both are blurred quantities and apply with weight w = d / 0.1 (at most 1), so
+// pixels that are not being dimmed, and the faint tail of the falloff, are not touched.
+// dim_gain multiplies the color channels where dimming is strong: it fades in with the
+// dimming strength, before any ramp shift. tint multiplies every pixel of the monitors and
+// is skipped, so pixels stay bit-exact, when it is 1 on all channels. enabled switches
+// off everything, tint included.
+static const char *pl_fs_final =
+    PL_COMMON
+    "uniform sampler2D S, D, RM, RS;\n"
+    "uniform float enabled, min_gain, gamma_dim, use_ramp;\n"
+    "uniform vec3 dim_gain, tint;\n"
+    "uniform vec2 lr_size;\n"
+    "uniform vec4 lr_box;\n"
     "out vec4 color;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  vec4 s = texelFetch(S, p, 0);\n"
-    "  vec2 st = texelFetch(D, p, 0).rg;\n"
-    "  float d = st.r;\n"
-    "  // Pixels the falloff does not reach are copied bit for bit.\n"
-    "  if (enabled < 0.5 || d < 0.002) { color = s; return; }\n"
-    "  if (use_rise > 0.5) d = 1.0 - min(1.0 - d, st.g);\n"
-    "  float a = (1.0 - min_gain) > 1e-4 ? clamp(d / (1.0 - min_gain), 0.0, 1.0) : 0.0;\n"
+    "  float d = texelFetch(D, p, 0).r;\n"
+    "  bool tinted = tint != vec3(1.0);\n"
+    "  if (enabled < 0.5) { color = s; return; }\n"
+    "  // Pixels the falloff does not reach are copied bit for bit, unless the monitor is tinted.\n"
+    "  if (d < 0.002) {\n"
+    "    color = tinted ? vec4(to_enc(to_lin(s.rgb) * tint), s.a) : s;\n"
+    "    return;\n"
+    "  }\n"
+    "  float g = 1.0 - d;\n"
+    "  float strength = (1.0 - min_gain) > 1e-4 ? clamp(d / (1.0 - min_gain), 0.0, 1.0) : 0.0;\n"
+    "  float a = strength;\n"
+    "  if (use_ramp > 0.5) {\n"
+    "    vec2 q = clamp(gl_FragCoord.xy / float(4), lr_box.xy + 0.5, lr_box.zw - 0.5) / lr_size;\n"
+    "    vec2 m = texture(RM, q).rg, st = texture(RS, q).rg;\n"
+    "    float w = clamp(d / 0.1, 0.0, 1.0);\n"
+    "    float sc = m.x > 1e-4 ? clamp(st.x / m.x, 0.0, 1.0) : 1.0;\n"
+    "    g *= 1.0 - (1.0 - sc) * w;\n"
+    "    a = clamp(a + (st.y - m.y) * w, 0.0, 1.0);\n"
+    "  }\n"
     "  vec3 e = pow(s.rgb, vec3(1.0 + (gamma_dim - 1.0) * a));\n"
-    "  color = vec4(to_enc(to_lin(e) * (1.0 - d)), s.a);\n"
+    "  vec3 lin = to_lin(e) * g * mix(vec3(1.0), dim_gain, strength);\n"
+    "  color = vec4(to_enc(lin * tint), s.a);\n"
     "}\n";
 
 static inline GLuint pl_compile(GLenum type, const char *src) {
@@ -295,7 +400,7 @@ static inline GLuint pl_program(GLuint vs, const char *fs_src) {
 
 struct pl_glsave {
 	GLint draw_fbo, read_fbo, prog, vao, active_tex, vp[4], sc[4];
-	GLint tex[3], samp[3];
+	GLint tex[4], samp[4];
 	GLint read_buf, draw_buf;
 	GLint bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a;
 	GLboolean blend, scissor, stencil, depth, cull, fb_srgb, mask[4];
@@ -307,7 +412,7 @@ static inline void pl_gl_save(struct pl_glsave *g) {
 	glGetIntegerv(GL_CURRENT_PROGRAM, &g->prog);
 	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &g->vao);
 	glGetIntegerv(GL_ACTIVE_TEXTURE, &g->active_tex);
-	for (int u = 0; u < 3; u++) {
+	for (int u = 0; u < 4; u++) {
 		glActiveTexture(GL_TEXTURE0 + (GLenum)u);
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &g->tex[u]);
 		glGetIntegerv(GL_SAMPLER_BINDING, &g->samp[u]);
@@ -348,7 +453,7 @@ static inline void pl_gl_restore(const struct pl_glsave *g) {
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)g->draw_fbo);
 	glReadBuffer((GLenum)g->read_buf);
 	glDrawBuffer((GLenum)g->draw_buf);
-	for (int u = 2; u >= 0; u--) {
+	for (int u = 3; u >= 0; u--) {
 		glActiveTexture(GL_TEXTURE0 + (GLenum)u);
 		glBindSampler((GLuint)u, (GLuint)g->samp[u]);
 		glBindTexture(GL_TEXTURE_2D, (GLuint)g->tex[u]);
@@ -365,9 +470,10 @@ static inline bool pl_init(struct pl *p) {
 	if (!vs) {
 		return false;
 	}
-	const char *fs[6] = {pl_fs_need, pl_fs_dilate, pl_fs_smooth, pl_fs_final, pl_fs_down, pl_fs_box};
+	const char *fs[9] = {pl_fs_need, pl_fs_dilate, pl_fs_smooth, pl_fs_final, pl_fs_down,
+	                     pl_fs_box,  pl_fs_rdown,  pl_fs_ramp,   pl_fs_scene};
 	bool ok = true;
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < 9; i++) {
 		p->prog[i] = pl_program(vs, fs[i]);
 		ok = ok && p->prog[i];
 	}
@@ -377,6 +483,7 @@ static inline bool pl_init(struct pl *p) {
 	}
 	glGenVertexArrays(1, &p->vao);
 	glGenFramebuffers(1, &p->fbo);
+	p->tint[0] = p->tint[1] = p->tint[2] = 1.0f;
 	glGenSamplers(1, &p->samp_nearest);
 	glSamplerParameteri(p->samp_nearest, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glSamplerParameteri(p->samp_nearest, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -393,8 +500,9 @@ static inline bool pl_init(struct pl *p) {
 
 static inline void pl_free_screen(struct pl *p) {
 	if (p->s_tex) {
-		glDeleteTextures(8, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1],
-		                               p->lr_a, p->lr_b});
+		glDeleteTextures(15, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1],
+		                                p->lr_a, p->lr_b, p->rlr_a, p->rlr_b, p->rs[0], p->rs[1],
+		                                p->rlr_p, p->scn[0], p->scn[1]});
 		p->s_tex = 0;
 	}
 }
@@ -404,7 +512,7 @@ static inline void pl_destroy(struct pl *p) {
 		return;
 	}
 	pl_free_screen(p);
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < 9; i++) {
 		glDeleteProgram(p->prog[i]);
 	}
 	glDeleteVertexArrays(1, &p->vao);
@@ -437,13 +545,25 @@ static inline bool pl_ensure_screen(struct pl *p, int W, int H) {
 	p->tex_a = pl_tex(GL_R16F, GL_RED, W, H);
 	p->tex_b = pl_tex(GL_R16F, GL_RED, W, H);
 	p->dnow = pl_tex(GL_R16F, GL_RED, W, H);
-	p->st[0] = pl_tex(GL_RG16F, GL_RG, W, H);
-	p->st[1] = pl_tex(GL_RG16F, GL_RG, W, H);
+	p->st[0] = pl_tex(GL_R16F, GL_RED, W, H);
+	p->st[1] = pl_tex(GL_R16F, GL_RED, W, H);
 	p->lrW = (W + PL_LR - 1) / PL_LR;
 	p->lrH = (H + PL_LR - 1) / PL_LR;
-	p->lr_a = pl_tex(GL_R16F, GL_RED, p->lrW, p->lrH);
-	p->lr_b = pl_tex(GL_R16F, GL_RED, p->lrW, p->lrH);
-	p->s_valid = p->st_valid = false;
+	p->lr_a = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	p->lr_b = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	p->rlr_a = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	p->rlr_b = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	p->rs[0] = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	p->rs[1] = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	p->rlr_p = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	float zeros[2 * PL_MAXMON] = {0};
+	for (int i = 0; i < 2; i++) {
+		p->scn[i] = pl_tex(GL_RG32F, GL_RG, PL_MAXMON, 1);
+		glBindTexture(GL_TEXTURE_2D, p->scn[i]);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, PL_MAXMON, 1, GL_RG, GL_FLOAT, zeros);
+		glBindTexture(GL_TEXTURE_2D, 0);
+	}
+	p->s_valid = p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
 	p->dirty = true;
 	return true;
 }
@@ -459,11 +579,19 @@ static inline bool pl_set_monitors(struct pl *p, const struct pl_mon *mons, int 
 	memcpy(p->mon, mons, (size_t)nmon * sizeof *mons);
 	p->nmon = nmon;
 	p->dirty = true;
-	p->st_valid = false;
+	p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
 	return true;
 }
 
 // ---- per-frame work ---------------------------------------------------------------------
+
+// Sets the whole-screen tint. It takes effect on the next pl_render and needs no
+// recomputation of the dimming.
+static inline void pl_set_tint(struct pl *p, float r, float g, float b) {
+	p->tint[0] = r;
+	p->tint[1] = g;
+	p->tint[2] = b;
+}
 
 static inline void pl_touch(struct pl *p, double now) {
 	p->last_input = now;
@@ -473,7 +601,7 @@ static inline void pl_touch(struct pl *p, double now) {
 // True while a smoothing transition may still be running. There is no readback, so this is
 // a time bound: five time constants after the last change, plus a little.
 static inline bool pl_active(const struct pl *p, const struct sq_cfg *cfg, double now) {
-	double slow = cfg->v[SQ_TAU_MS] > cfg->v[SQ_RISE_MS] ? cfg->v[SQ_TAU_MS] : cfg->v[SQ_RISE_MS];
+	double slow = cfg->v[SQ_DARKENING_MS] > cfg->v[SQ_BRIGHTENING_MS] ? cfg->v[SQ_DARKENING_MS] : cfg->v[SQ_BRIGHTENING_MS];
 	return p->s_valid && p->have_input && now - p->last_input < 5.0 * slow / 1000.0 + 0.1;
 }
 
@@ -692,8 +820,16 @@ static inline void pl_dilate(struct pl *p, const struct sq_cfg *cfg) {
 	p->dirty = false;
 }
 
+static inline double pl_trel(struct pl *p, double now) {
+	if (!p->have_t0) {
+		p->t0 = now;
+		p->have_t0 = true;
+	}
+	return now - p->t0;
+}
+
 static inline void pl_smooth(struct pl *p, const struct sq_cfg *cfg, double now) {
-	double tau = cfg->v[SQ_TAU_MS] / 1000.0, rise = cfg->v[SQ_RISE_MS] / 1000.0;
+	double tau = cfg->v[SQ_DARKENING_MS] / 1000.0;
 	double dt = p->have_smooth_time && now > p->last_smooth ? now - p->last_smooth : 0.0;
 	pl_base_state();
 	glBindVertexArray(p->vao);
@@ -702,16 +838,17 @@ static inline void pl_smooth(struct pl *p, const struct sq_cfg *cfg, double now)
 	glUseProgram(pr);
 	glUniform1i(PL_U(pr, "now_t"), 0);
 	glUniform1i(PL_U(pr, "prev_t"), 1);
-	glUniform1f(PL_U(pr, "k_tau"), tau > 0 ? (float)(1.0 - exp(-dt / tau)) : 1.0f);
-	glUniform1f(PL_U(pr, "k_rise"), rise > 0 ? (float)(1.0 - exp(-dt / rise)) : 1.0f);
+	glUniform1i(PL_U(pr, "scn"), 2);
+	glUniform1f(PL_U(pr, "k_tau"), (float)(1.0 - exp(-dt / tau)));
 	glUniform1f(PL_U(pr, "init"), p->st_valid ? 0.0f : 1.0f);
-	glUniform1f(PL_U(pr, "min_gain"), (float)cfg->v[SQ_MIN_GAIN]);
-	glUniform1f(PL_U(pr, "use_rise"), rise > 0 ? 1.0f : 0.0f);
+	glUniform1f(PL_U(pr, "t_rel"), (float)pl_trel(p, now));
 	pl_fbo_attach(p, p->st[1 - p->cur]);
 	pl_bind(0, p->dnow, p->samp_nearest);
 	pl_bind(1, p->st[p->cur], p->samp_nearest);
+	pl_bind(2, p->scn[p->scur], p->samp_nearest);
 	glEnable(GL_SCISSOR_TEST);
 	for (int i = 0; i < p->nmon; i++) {
+		glUniform1i(PL_U(pr, "idx"), i);
 		pl_scissor_mon(p, &p->mon[i]);
 		pl_draw();
 	}
@@ -722,7 +859,119 @@ static inline void pl_smooth(struct pl *p, const struct sq_cfg *cfg, double now)
 	p->have_smooth_time = true;
 }
 
-static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex, bool use_rise) {
+// Compares this frame's means (rlr_a) with the previous frame's (rlr_p) and arms the
+// smoothing windows of every monitor whose scene changed.
+static inline void pl_scene(struct pl *p, const struct sq_cfg *cfg, double now) {
+	double dd = cfg->v[SQ_DARKENING_MS] > 0 ? 5.0 * cfg->v[SQ_DARKENING_MS] / 1000.0 + 0.1 : 0.0;
+	double db = cfg->v[SQ_BRIGHTENING_MS] > 0 ? 5.0 * cfg->v[SQ_BRIGHTENING_MS] / 1000.0 + 0.1 : 0.0;
+	pl_base_state();
+	glBindVertexArray(p->vao);
+	glViewport(0, 0, PL_MAXMON, 1);
+	GLuint pr = p->prog[PL_SCENE];
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "means"), 0);
+	glUniform1i(PL_U(pr, "prevm"), 1);
+	glUniform1i(PL_U(pr, "scn_prev"), 2);
+	glUniform1f(PL_U(pr, "t_rel"), (float)pl_trel(p, now));
+	glUniform1f(PL_U(pr, "dur_d"), (float)dd);
+	glUniform1f(PL_U(pr, "dur_b"), (float)db);
+	pl_fbo_attach(p, p->scn[1 - p->scur]);
+	pl_bind(0, p->rlr_a, p->samp_nearest);
+	pl_bind(1, p->rlr_p, p->samp_nearest);
+	pl_bind(2, p->scn[p->scur], p->samp_nearest);
+	glEnable(GL_SCISSOR_TEST);
+	for (int i = 0; i < p->nmon; i++) {
+		struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
+		glUniform4i(PL_U(pr, "box"), b.x0, b.y0, b.x1, b.y1);
+		glUniform1i(PL_U(pr, "idx"), i);
+		glScissor(i, 0, 1, 1);
+		pl_draw();
+	}
+	glDisable(GL_SCISSOR_TEST);
+	p->scur = 1 - p->scur;
+}
+
+// Blurred (brightness, gamma strength) of the content as it will be displayed: block means
+// of L * (1 - D) and D / (1 - min_gain), then a box mean of radius size_px clipped to each
+// monitor. The result is in rlr_a.
+static inline void pl_ramp_means(struct pl *p, const struct sq_cfg *cfg, GLuint dtex) {
+	int rt = (int)lround(cfg->v[SQ_SIZE_PX] / PL_LR);
+	rt = rt < 1 ? 1 : rt;
+	pl_base_state();
+	glBindVertexArray(p->vao);
+	glViewport(0, 0, p->lrW, p->lrH);
+	glDisable(GL_SCISSOR_TEST);
+
+	GLuint pr = p->prog[PL_RDOWN];
+	pl_fbo_attach(p, p->rlr_a);
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "S"), 0);
+	glUniform1i(PL_U(pr, "D"), 1);
+	glUniform2i(PL_U(pr, "size"), p->W, p->H);
+	glUniform1f(PL_U(pr, "min_gain"), (float)cfg->v[SQ_MIN_GAIN]);
+	pl_bind(0, p->s_tex, p->samp_nearest);
+	pl_bind(1, dtex, p->samp_nearest);
+	pl_draw();
+
+	pr = p->prog[PL_BOX];
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "src"), 0);
+	glUniform1i(PL_U(pr, "radius"), rt);
+	glUniform1i(PL_U(pr, "mode"), 0);
+	glEnable(GL_SCISSOR_TEST);
+	GLuint src = p->rlr_a, dst = p->rlr_b;
+	for (int axis = 0; axis < 2; axis++) {
+		pl_fbo_attach(p, dst);
+		pl_bind(0, src, p->samp_nearest);
+		glUniform2i(PL_U(pr, "dir"), axis == 0 ? 1 : 0, axis == 0 ? 0 : 1);
+		for (int i = 0; i < p->nmon; i++) {
+			struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
+			glUniform4i(PL_U(pr, "box"), b.x0, b.y0, b.x1, b.y1);
+			glScissor(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+			pl_draw();
+		}
+		GLuint t = src;
+		src = dst;
+		dst = t;
+	}
+	glDisable(GL_SCISSOR_TEST);
+	// Two passes leave the result in rlr_a: a to b, then b to a.
+}
+
+// Advances the ramp state toward the means with time constant rise.
+static inline void pl_ramp_state(struct pl *p, const struct sq_cfg *cfg, double now) {
+	double rise = cfg->v[SQ_BRIGHTENING_MS] / 1000.0;
+	double dt = p->have_ramp_time && now > p->last_ramp ? now - p->last_ramp : 0.0;
+	pl_base_state();
+	glBindVertexArray(p->vao);
+	glViewport(0, 0, p->lrW, p->lrH);
+	GLuint pr = p->prog[PL_RAMP];
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "means"), 0);
+	glUniform1i(PL_U(pr, "prev"), 1);
+	glUniform1i(PL_U(pr, "scn"), 2);
+	glUniform1f(PL_U(pr, "k"), (float)(1.0 - exp(-dt / rise)));
+	glUniform1f(PL_U(pr, "init"), p->rs_valid ? 0.0f : 1.0f);
+	glUniform1f(PL_U(pr, "t_rel"), (float)pl_trel(p, now));
+	pl_fbo_attach(p, p->rs[1 - p->rcur]);
+	pl_bind(0, p->rlr_a, p->samp_nearest);
+	pl_bind(1, p->rs[p->rcur], p->samp_nearest);
+	pl_bind(2, p->scn[p->scur], p->samp_nearest);
+	glEnable(GL_SCISSOR_TEST);
+	for (int i = 0; i < p->nmon; i++) {
+		struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
+		glUniform1i(PL_U(pr, "idx"), i);
+		glScissor(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+		pl_draw();
+	}
+	glDisable(GL_SCISSOR_TEST);
+	p->rcur = 1 - p->rcur;
+	p->rs_valid = true;
+	p->last_ramp = now;
+	p->have_ramp_time = true;
+}
+
+static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex, bool use_ramp) {
 	pl_base_state();
 	glBindVertexArray(p->vao);
 	glBindFramebuffer(GL_FRAMEBUFFER, p->target_fbo);
@@ -732,14 +981,24 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	glUseProgram(pr);
 	glUniform1i(PL_U(pr, "S"), 0);
 	glUniform1i(PL_U(pr, "D"), 1);
+	glUniform1i(PL_U(pr, "RM"), 2);
+	glUniform1i(PL_U(pr, "RS"), 3);
 	glUniform1f(PL_U(pr, "enabled"), (float)cfg->v[SQ_ENABLED]);
 	glUniform1f(PL_U(pr, "min_gain"), (float)cfg->v[SQ_MIN_GAIN]);
 	glUniform1f(PL_U(pr, "gamma_dim"), (float)cfg->v[SQ_GAMMA]);
-	glUniform1f(PL_U(pr, "use_rise"), use_rise ? 1.0f : 0.0f);
+	glUniform1f(PL_U(pr, "use_ramp"), use_ramp ? 1.0f : 0.0f);
+	glUniform3f(PL_U(pr, "dim_gain"), (float)cfg->v[SQ_DIM_RED], (float)cfg->v[SQ_DIM_GREEN],
+	            (float)cfg->v[SQ_DIM_BLUE]);
+	glUniform3f(PL_U(pr, "tint"), p->tint[0], p->tint[1], p->tint[2]);
+	glUniform2f(PL_U(pr, "lr_size"), (float)p->lrW, (float)p->lrH);
 	pl_bind(0, p->s_tex, p->samp_nearest);
 	pl_bind(1, dtex, p->samp_nearest);
+	pl_bind(2, p->rlr_a, p->samp_linear);
+	pl_bind(3, p->rs[p->rcur], p->samp_linear);
 	glEnable(GL_SCISSOR_TEST);
 	for (int i = 0; i < p->nmon; i++) {
+		struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
+		glUniform4f(PL_U(pr, "lr_box"), (float)b.x0, (float)b.y0, (float)b.x1, (float)b.y1);
 		pl_scissor_mon(p, &p->mon[i]);
 		pl_draw();
 	}
@@ -747,31 +1006,47 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 }
 
 // Runs the whole pipeline. With nothing damaged since the last call it only advances the
-// smoothing, which is how release and rise continue while the screen is otherwise still.
-// When disabled it still redraws every monitor pixel from S, because picom's buffer-age
-// repaint would otherwise leave stale dimmed pixels in the other back buffers.
-// The caller must have saved and must restore the host's GL state.
+// smoothing and the ramp, which is how release and rise continue while the screen is
+// otherwise still. When disabled it still redraws every monitor pixel from S, because
+// picom's buffer-age repaint would otherwise leave stale dimmed pixels in the other back
+// buffers. The caller must have saved and must restore the host's GL state.
 static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now) {
 	if (!p->ready || !p->s_valid || p->nmon == 0) {
 		return;
 	}
 	bool enabled = cfg->v[SQ_ENABLED] != 0;
-	bool rise = cfg->v[SQ_RISE_MS] > 0;
-	bool smoothing = cfg->v[SQ_TAU_MS] > 0 || rise;
+	bool ramp = cfg->v[SQ_BRIGHTENING_MS] > 0;
+	bool smoothing = cfg->v[SQ_DARKENING_MS] > 0;
 	GLuint dtex = p->dnow;
 	if (enabled) {
 		if (!p->was_enabled) {
 			p->dirty = true;
-			p->st_valid = false;
+			p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
 		}
 		if (p->used_target != cfg->v[SQ_TARGET] || p->used_min_gain != cfg->v[SQ_MIN_GAIN] ||
 		    p->used_knee != cfg->v[SQ_KNEE] || p->used_falloff != (int)cfg->v[SQ_FALLOFF_PX] ||
 		    p->used_target_large != cfg->v[SQ_TARGET_LARGE] ||
 		    p->used_size_px != cfg->v[SQ_SIZE_PX] || p->used_size_bias != cfg->v[SQ_SIZE_BIAS]) {
 			p->dirty = true;
+			p->prev_valid = false;  // a settings change must not look like a scene change
 		}
-		if (p->dirty) {
+		bool dilated = p->dirty;
+		if (dilated) {
 			pl_dilate(p, cfg);
+		}
+		if (ramp || smoothing) {
+			if (dilated || !p->means_valid) {
+				GLuint t = p->rlr_a;  // the old means become the previous means
+				p->rlr_a = p->rlr_p;
+				p->rlr_p = t;
+				pl_ramp_means(p, cfg, p->dnow);
+				if (p->prev_valid) {
+					pl_scene(p, cfg, now);
+				}
+				p->prev_valid = p->means_valid = true;
+			}
+		} else {
+			p->prev_valid = p->means_valid = false;
 		}
 		if (smoothing) {
 			pl_smooth(p, cfg, now);
@@ -779,9 +1054,15 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		} else {
 			p->st_valid = false;  // the next time smoothing turns on, start from the present
 		}
+		if (ramp) {
+			pl_ramp_state(p, cfg, now);
+		} else {
+			p->rs_valid = false;
+		}
 	} else {
 		p->dirty = true;
+		p->rs_valid = false;
 	}
 	p->was_enabled = enabled;
-	pl_final(p, cfg, dtex, enabled && rise);
+	pl_final(p, cfg, dtex, enabled && ramp);
 }
