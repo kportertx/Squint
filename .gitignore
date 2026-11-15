@@ -1,0 +1,11 @@
+# Build outputs
+/squint.so
+/squint.so.tmp
+/squintctl
+/pipeline_test
+
+# Local scratch: extracted libev headers, downloaded packages, the old cell pipeline
+/build/
+
+# Read-only clone of picom v12.5 used as a reference. It has its own git repository.
+/ref/
