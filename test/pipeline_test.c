@@ -1676,13 +1676,17 @@ static void test_keys(void) {
 	struct sq_cfg c;
 	sq_defaults(&c);
 	for (int i = SQ_KEY_ENABLED; i <= SQ_KEY_STATIC; i++) {
-		CHECK(c.s[i][0] == '\0' && sq_params[i].type == SQ_STR && sq_group(i) == SQ_SHORTCUTS, "%s is an empty text setting in the shortcuts group", sq_params[i].key);
+		CHECK(c.s[i][0] != '\0' && sq_params[i].type == SQ_STR && sq_group(i) == SQ_SHORTCUTS, "%s is a text setting with a default key, in the shortcuts group", sq_params[i].key);
 		CHECK(sq_key_target(i) >= 0 && sq_params[sq_key_target(i)].type == SQ_BOOL, "%s flips an on/off setting", sq_params[i].key);
 	}
 	CHECK(sq_key_target(SQ_KEY_ENABLED) == SQ_ENABLED && sq_key_target(SQ_KEY_BRIGHTNESS) == SQ_BRIGHTNESS &&
 	          sq_key_target(SQ_KEY_DIM_TINT) == SQ_DIM_TINT && sq_key_target(SQ_KEY_STATIC) == SQ_STATIC && sq_key_target(SQ_TARGET) < 0,
 	      "each key flips the toggle it is named for");
-	CHECK(c.v[SQ_SHORTCUTS] == 0, "shortcuts default to off, with no keys set");
+	CHECK(!strcmp(c.s[SQ_KEY_ENABLED], "Super+F1") && !strcmp(c.s[SQ_KEY_BRIGHTNESS], "Super+F2") &&
+	          !strcmp(c.s[SQ_KEY_DIM_TINT], "Super+F3") && !strcmp(c.s[SQ_KEY_STATIC], "Super+F4"),
+	      "the default keys are Super+F1 to Super+F4");
+	CHECK(c.v[SQ_SHORTCUTS] == 0, "shortcuts default to off");
+	CHECK(sq_set(&c, "key_dim_tint", "") && c.s[SQ_KEY_DIM_TINT][0] == '\0', "a default key can be cleared");
 	c.v[SQ_SHORTCUTS] = 1;
 	CHECK(sq_set(&c, "key_static", "Ctrl+Alt+s") && !strcmp(c.s[SQ_KEY_STATIC], "Ctrl+Alt+s"), "set a key");
 	CHECK(!sq_set(&c, "key_static", "Foo+s") && !strcmp(c.s[SQ_KEY_STATIC], "Ctrl+Alt+s"), "a bad chord is rejected and the old one stays");
@@ -1711,7 +1715,7 @@ static void test_keys(void) {
 	fputs("key_static = Foo+Bar+s\n", f);
 	fclose(f);
 	sq_load(path, &d);
-	CHECK(d.s[SQ_KEY_STATIC][0] == '\0', "a malformed chord in the file is ignored");
+	CHECK(!strcmp(d.s[SQ_KEY_STATIC], "Super+F4"), "a malformed chord in the file is ignored, so the default stays");
 	unlink(path);
 }
 

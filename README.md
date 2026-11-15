@@ -155,10 +155,10 @@ static = false
   static_jitter_px = 0.50
 
 shortcuts = false
-  key_enabled =
-  key_brightness =
-  key_dim_tint =
-  key_static =
+  key_enabled = Super+F1
+  key_brightness = Super+F2
+  key_dim_tint = Super+F3
+  key_static = Super+F4
 ```
 
 A setting missing from the file takes its default. The tint is amber by default (`tint_green` 0.80 and `tint_blue` 0.50), so it shows as soon as you turn `dim_tint` on.
@@ -221,7 +221,7 @@ While static is on, squint presents `static_hz` frames a second, even when nothi
 
 ### Shortcut keys
 
-The shortcuts group lets a key flip each toggle from anywhere, whichever window has focus. The keys are empty and `shortcuts` is off by default, so squint grabs no key until you set one and turn `shortcuts` on. Turning `shortcuts` off releases them all at once.
+The shortcuts group lets a key flip each toggle from anywhere, whichever window has focus. The default keys are Super+F1 for `enabled`, Super+F2 for `brightness`, Super+F3 for `dim_tint`, and Super+F4 for `static`. `shortcuts` is off by default, so squint grabs no key until you turn it on. Turning `shortcuts` off releases them all at once.
 
 | Setting | Flips |
 |---|---|

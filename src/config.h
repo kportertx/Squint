@@ -103,6 +103,7 @@ struct sq_param {
 	enum sq_type type;
 	double def, min, max, step;
 	const char *help;
+	const char *sdef;  // default of a text setting, NULL for empty
 };
 
 static const struct sq_param sq_params[SQ_N] = {
@@ -168,15 +169,15 @@ static const struct sq_param sq_params[SQ_N] = {
     [SQ_STATIC_JITTER_PX] = {"static_jitter_px", SQ_FLOAT, 0.5, 0.0, 4.0, 0.1,
                              "Random sideways shift of each row, in pixels, for a slight tracking wobble."},
     [SQ_SHORTCUTS] = {"shortcuts", SQ_BOOL, 0, 0, 1, 1,
-                      "Turn on to listen for the shortcut keys below. Off releases every key. Keys are empty until you set them."},
+                      "Turn on to listen for the shortcut keys below. Off releases every key."},
     [SQ_KEY_ENABLED] = {"key_enabled", SQ_STR, 0, 0, 0, 0,
-                        "Key that flips enabled. Written like Ctrl+Alt+s or Super+Shift+F5. Empty means none."},
+                        "Key that flips enabled. Written like Ctrl+Alt+s or Super+Shift+F5. Empty means none.", "Super+F1"},
     [SQ_KEY_BRIGHTNESS] = {"key_brightness", SQ_STR, 0, 0, 0, 0,
-                           "Key that flips brightness. Empty means none."},
+                           "Key that flips brightness. Empty means none.", "Super+F2"},
     [SQ_KEY_DIM_TINT] = {"key_dim_tint", SQ_STR, 0, 0, 0, 0,
-                         "Key that flips dim_tint. Empty means none."},
+                         "Key that flips dim_tint. Empty means none.", "Super+F3"},
     [SQ_KEY_STATIC] = {"key_static", SQ_STR, 0, 0, 0, 0,
-                       "Key that flips static. Empty means none."},
+                       "Key that flips static. Empty means none.", "Super+F4"},
 };
 
 struct sq_cfg {
@@ -202,6 +203,9 @@ static inline void sq_defaults(struct sq_cfg *c) {
 	memset(c, 0, sizeof *c);
 	for (int i = 0; i < SQ_N; i++) {
 		c->v[i] = sq_params[i].def;
+		if (sq_params[i].sdef) {
+			snprintf(c->s[i], SQ_STRLEN, "%s", sq_params[i].sdef);
+		}
 	}
 }
 
