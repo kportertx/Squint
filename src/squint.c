@@ -138,9 +138,11 @@ static void span_end(struct span *s) {
 }
 
 static void log_cfg(const char *why) {
-	say("%s: enabled=%g target=%g min_gain=%g knee=%g tau_ms=%g falloff_px=%g gamma=%g", why,
-	    st.cfg.v[SQ_ENABLED], st.cfg.v[SQ_TARGET], st.cfg.v[SQ_MIN_GAIN], st.cfg.v[SQ_KNEE],
-	    st.cfg.v[SQ_TAU_MS], st.cfg.v[SQ_FALLOFF_PX], st.cfg.v[SQ_GAMMA]);
+	say("%s: enabled=%g target=%g target_large=%g size_px=%g size_bias=%g min_gain=%g knee=%g "
+	    "tau_ms=%g rise_ms=%g falloff_px=%g gamma=%g",
+	    why, st.cfg.v[SQ_ENABLED], st.cfg.v[SQ_TARGET], st.cfg.v[SQ_TARGET_LARGE],
+	    st.cfg.v[SQ_SIZE_PX], st.cfg.v[SQ_SIZE_BIAS], st.cfg.v[SQ_MIN_GAIN], st.cfg.v[SQ_KNEE],
+	    st.cfg.v[SQ_TAU_MS], st.cfg.v[SQ_RISE_MS], st.cfg.v[SQ_FALLOFF_PX], st.cfg.v[SQ_GAMMA]);
 }
 
 static void log_stats(const char *why) {

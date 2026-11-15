@@ -3,10 +3,14 @@
 //
 // Data flow, per frame that changed the screen:
 //   capture  copy the damaged rectangles of the back buffer into S (the undimmed screen)
+//   size     optional: a local measure M of how large and bright the surroundings are, from
+//            a power mean of luminance over size_px, lowers each pixel's target as M rises
 //   need     per pixel, d = 1 - gain(L): how much the pixel's own luminance L must be dimmed
 //   dilate   spread d outward with a linear falloff, D(x) = max over y of d(y) - slope*|x-y|
 //            (L1 distance), never across a monitor edge
-//   smooth   optional per pixel: instant attack, exponential release with time constant tau
+//   smooth   optional per pixel: instant attack, exponential release with time constant tau,
+//            and a floor on the gain that starts at min_gain where an area newly becomes
+//            bright and rises toward 1 with time constant rise
 //   final    redraw every monitor pixel from S, scaled by 1 - D (and gamma), or copied
 //            unchanged where D is zero
 //
@@ -30,6 +34,7 @@
 #include "config.h"
 
 #define PL_MAXMON 8
+#define PL_LR 4  // the size field is computed at 1/PL_LR resolution
 
 struct pl_rect {
 	int x1, y1, x2, y2;  // half open
@@ -45,14 +50,16 @@ struct pl {
 	GLenum read_buf, draw_buf;
 
 	bool ready;
-	GLuint vao, fbo, prog[4];
-	GLuint samp_nearest;
+	GLuint vao, fbo, prog[6];
+	GLuint samp_nearest, samp_linear;
 
 	int W, H;
 	GLuint s_tex;           // undimmed screen, RGBA8
 	GLuint tex_a, tex_b;    // dilation ping-pong
 	GLuint dnow;            // dilated dimming amount D for the latest captured content
-	GLuint st[2];           // smoothed D, used only when tau > 0
+	GLuint st[2];           // RG16F: smoothed D and the rise floor f, used only when smoothing
+	GLuint lr_a, lr_b;      // R16F at 1/PL_LR resolution: the size field
+	int lrW, lrH;
 	int cur;
 	bool s_valid, st_valid, dirty;
 
@@ -60,14 +67,14 @@ struct pl {
 	int nmon;
 
 	// Parameters the current dnow was computed with.
-	double used_target, used_min_gain, used_knee;
+	double used_target, used_min_gain, used_knee, used_target_large, used_size_px, used_size_bias;
 	int used_falloff;
 
 	bool have_input, have_smooth_time, was_enabled;
 	double last_input, last_smooth;
 };
 
-enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL };
+enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL, PL_DOWN, PL_BOX };
 
 static void (*pl_logger)(const char *msg);
 
@@ -102,20 +109,79 @@ static const char *pl_vs =
 	"             step(0.0031308, c));\n"                                              \
 	"}\n"
 
-// d = 1 - gain for the pixel's own luminance. The gain is target / (target + excess)
-// with a quadratic knee around the target, floored at min_gain.
-static const char *pl_fs_need =
+// Mean of L^bias over each PL_LR x PL_LR block of S. Blocks cut off by the screen edge
+// average only the pixels that exist.
+static const char *pl_fs_down =
     PL_COMMON
     "uniform sampler2D S;\n"
-    "uniform float target, min_gain, knee;\n"
+    "uniform float bias;\n"
+    "uniform ivec2 size;\n"
+    "out float o;\n"
+    "void main() {\n"
+    "  ivec2 b = ivec2(gl_FragCoord.xy) * 4;\n"
+    "  float sum = 0.0, cnt = 0.0;\n"
+    "  for (int j = 0; j < 4; j++)\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "      ivec2 p = b + ivec2(i, j);\n"
+    "      if (p.x < size.x && p.y < size.y) {\n"
+    "        float L = dot(to_lin(texelFetch(S, p, 0).rgb), W709);\n"
+    "        sum += pow(max(L, 1e-6), bias);\n"
+    "        cnt += 1.0;\n"
+    "      }\n"
+    "    }\n"
+    "  o = sum / cnt;\n"
+    "}\n";
+
+// Separable box mean (mode 0) or box maximum (mode 1) along one axis, clipped to the
+// monitor box (x0, y0, x1, y1 in texels, end exclusive). The mean divides by the number of
+// texels inside the box, so it stays a true mean at monitor edges.
+static const char *pl_fs_box =
+    PL_COMMON
+    "uniform sampler2D src;\n"
+    "uniform ivec2 dir;\n"
+    "uniform int radius, mode;\n"
+    "uniform ivec4 box;\n"
+    "out float o;\n"
+    "void main() {\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "  float acc = mode == 1 ? -1.0 : 0.0, cnt = 0.0;\n"
+    "  for (int k = -radius; k <= radius; k++) {\n"
+    "    ivec2 q = p + dir * k;\n"
+    "    if (q.x >= box.x && q.y >= box.y && q.x < box.z && q.y < box.w) {\n"
+    "      float v = texelFetch(src, q, 0).r;\n"
+    "      if (mode == 1) acc = max(acc, v); else { acc += v; cnt += 1.0; }\n"
+    "    }\n"
+    "  }\n"
+    "  o = mode == 1 ? acc : acc / max(cnt, 1.0);\n"
+    "}\n";
+
+// d = 1 - gain for the pixel's own luminance. The gain is target / (target + excess) with
+// a quadratic knee around the target, floored at min_gain. With use_size, the target falls
+// from `target` to `target_large` as the local measure M = mean(L^bias)^(1/bias) rises from
+// 0.2 to 0.5. A patch of luminance L covering a fraction C of the neighborhood has
+// M = L * C^(1/bias), so brighter patches count as large at smaller sizes.
+static const char *pl_fs_need =
+    PL_COMMON
+    "uniform sampler2D S, LR;\n"
+    "uniform float target, min_gain, knee, use_size, bias, target_large;\n"
+    "uniform vec2 lr_size;\n"
+    "uniform vec4 lr_box;\n"  // x0, y0, x1, y1 of the monitor in LR texels
     "out float o;\n"
     "void main() {\n"
     "  vec3 c = texelFetch(S, ivec2(gl_FragCoord.xy), 0).rgb;\n"
     "  float L = dot(to_lin(c), W709);\n"
-    "  float over = L - target;\n"
+    "  float tgt = target;\n"
+    "  if (use_size > 0.5) {\n"
+    "    vec2 q = gl_FragCoord.xy / float(4);\n"
+    "    q = clamp(q, lr_box.xy + 0.5, lr_box.zw - 0.5);\n"
+    "    float M = pow(max(texture(LR, q / lr_size).r, 0.0), 1.0 / bias);\n"
+    "    float s = clamp((M - 0.2) / 0.3, 0.0, 1.0);\n"
+    "    tgt = mix(target, min(target_large, target), s * s * (3.0 - 2.0 * s));\n"
+    "  }\n"
+    "  float over = L - tgt;\n"
     "  float h = 0.5 * knee;\n"
     "  float excess = over <= -h ? 0.0 : (over >= h ? over : (over + h) * (over + h) / (2.0 * knee));\n"
-    "  float g = clamp(target / (target + excess), min_gain, 1.0);\n"
+    "  float g = clamp(tgt / (tgt + excess), min_gain, 1.0);\n"
     "  o = 1.0 - g;\n"
     "}\n";
 
@@ -145,29 +211,41 @@ static const char *pl_fs_dilate =
     "  o = v;\n"
     "}\n";
 
+// State is (D, f). D is the dimming amount with instant attack and release time tau. f is
+// a floor on the gain: it is held at min_gain while D is zero, and once D is nonzero it
+// rises toward 1 with time constant rise. The gain actually applied is min(1 - D, f), so
+// an area that newly becomes bright starts at min_gain and climbs to its target gain.
 static const char *pl_fs_smooth =
     PL_COMMON
     "uniform sampler2D now_t, prev_t;\n"
-    "uniform float k, init;\n"
-    "out float o;\n"
+    "uniform float k_tau, k_rise, init, min_gain, use_rise;\n"
+    "out vec2 o;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  float n = texelFetch(now_t, p, 0).r;\n"
-    "  float prev = texelFetch(prev_t, p, 0).r;\n"
-    "  o = init > 0.5 ? n : max(n, mix(prev, n, k));\n"
+    "  vec2 prev = texelFetch(prev_t, p, 0).rg;\n"
+    "  float d = init > 0.5 ? n : max(n, mix(prev.r, n, k_tau));\n"
+    "  float f = 1.0;\n"
+    "  if (use_rise > 0.5) {\n"
+    "    if (d < 0.002) f = min_gain;\n"
+    "    else f = init > 0.5 ? 1.0 : prev.g + (1.0 - prev.g) * k_rise;\n"
+    "  }\n"
+    "  o = vec2(d, f);\n"
     "}\n";
 
 static const char *pl_fs_final =
     PL_COMMON
     "uniform sampler2D S, D;\n"
-    "uniform float enabled, min_gain, gamma_dim;\n"
+    "uniform float enabled, min_gain, gamma_dim, use_rise;\n"
     "out vec4 color;\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  vec4 s = texelFetch(S, p, 0);\n"
-    "  float d = texelFetch(D, p, 0).r;\n"
+    "  vec2 st = texelFetch(D, p, 0).rg;\n"
+    "  float d = st.r;\n"
     "  // Pixels the falloff does not reach are copied bit for bit.\n"
     "  if (enabled < 0.5 || d < 0.002) { color = s; return; }\n"
+    "  if (use_rise > 0.5) d = 1.0 - min(1.0 - d, st.g);\n"
     "  float a = (1.0 - min_gain) > 1e-4 ? clamp(d / (1.0 - min_gain), 0.0, 1.0) : 0.0;\n"
     "  vec3 e = pow(s.rgb, vec3(1.0 + (gamma_dim - 1.0) * a));\n"
     "  color = vec4(to_enc(to_lin(e) * (1.0 - d)), s.a);\n"
@@ -287,9 +365,9 @@ static inline bool pl_init(struct pl *p) {
 	if (!vs) {
 		return false;
 	}
-	const char *fs[4] = {pl_fs_need, pl_fs_dilate, pl_fs_smooth, pl_fs_final};
+	const char *fs[6] = {pl_fs_need, pl_fs_dilate, pl_fs_smooth, pl_fs_final, pl_fs_down, pl_fs_box};
 	bool ok = true;
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 6; i++) {
 		p->prog[i] = pl_program(vs, fs[i]);
 		ok = ok && p->prog[i];
 	}
@@ -304,13 +382,19 @@ static inline bool pl_init(struct pl *p) {
 	glSamplerParameteri(p->samp_nearest, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glSamplerParameteri(p->samp_nearest, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glSamplerParameteri(p->samp_nearest, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glGenSamplers(1, &p->samp_linear);
+	glSamplerParameteri(p->samp_linear, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glSamplerParameteri(p->samp_linear, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glSamplerParameteri(p->samp_linear, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glSamplerParameteri(p->samp_linear, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	p->ready = true;
 	return true;
 }
 
 static inline void pl_free_screen(struct pl *p) {
 	if (p->s_tex) {
-		glDeleteTextures(6, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1]});
+		glDeleteTextures(8, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1],
+		                               p->lr_a, p->lr_b});
 		p->s_tex = 0;
 	}
 }
@@ -320,12 +404,12 @@ static inline void pl_destroy(struct pl *p) {
 		return;
 	}
 	pl_free_screen(p);
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 6; i++) {
 		glDeleteProgram(p->prog[i]);
 	}
 	glDeleteVertexArrays(1, &p->vao);
 	glDeleteFramebuffers(1, &p->fbo);
-	glDeleteSamplers(1, &p->samp_nearest);
+	glDeleteSamplers(2, (GLuint[]){p->samp_nearest, p->samp_linear});
 	p->ready = p->s_valid = false;
 	p->W = p->H = 0;
 }
@@ -353,8 +437,12 @@ static inline bool pl_ensure_screen(struct pl *p, int W, int H) {
 	p->tex_a = pl_tex(GL_R16F, GL_RED, W, H);
 	p->tex_b = pl_tex(GL_R16F, GL_RED, W, H);
 	p->dnow = pl_tex(GL_R16F, GL_RED, W, H);
-	p->st[0] = pl_tex(GL_R16F, GL_RED, W, H);
-	p->st[1] = pl_tex(GL_R16F, GL_RED, W, H);
+	p->st[0] = pl_tex(GL_RG16F, GL_RG, W, H);
+	p->st[1] = pl_tex(GL_RG16F, GL_RG, W, H);
+	p->lrW = (W + PL_LR - 1) / PL_LR;
+	p->lrH = (H + PL_LR - 1) / PL_LR;
+	p->lr_a = pl_tex(GL_R16F, GL_RED, p->lrW, p->lrH);
+	p->lr_b = pl_tex(GL_R16F, GL_RED, p->lrW, p->lrH);
 	p->s_valid = p->st_valid = false;
 	p->dirty = true;
 	return true;
@@ -385,8 +473,8 @@ static inline void pl_touch(struct pl *p, double now) {
 // True while a smoothing transition may still be running. There is no readback, so this is
 // a time bound: five time constants after the last change, plus a little.
 static inline bool pl_active(const struct pl *p, const struct sq_cfg *cfg, double now) {
-	return p->s_valid && p->have_input &&
-	       now - p->last_input < 5.0 * cfg->v[SQ_TAU_MS] / 1000.0 + 0.1;
+	double slow = cfg->v[SQ_TAU_MS] > cfg->v[SQ_RISE_MS] ? cfg->v[SQ_TAU_MS] : cfg->v[SQ_RISE_MS];
+	return p->s_valid && p->have_input && now - p->last_input < 5.0 * slow / 1000.0 + 0.1;
 }
 
 // Copies rectangles (X coordinates) of the target framebuffer into S. The rectangles must
@@ -463,12 +551,85 @@ static inline void pl_base_state(void) {
 	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 }
 
-// need + dilate: leaves D in dnow.
+static inline bool pl_size_active(const struct sq_cfg *cfg) {
+	return cfg->v[SQ_TARGET_LARGE] < cfg->v[SQ_TARGET] - 1e-6;
+}
+
+// A monitor's rectangle in size-field texels. The size field is y up like every texture, so
+// the rectangle is flipped first.
+struct pl_lrbox {
+	int x0, y0, x1, y1;
+};
+
+static inline struct pl_lrbox pl_lr_box(const struct pl *p, const struct pl_mon *m) {
+	int gy0 = p->H - (m->y + m->h), gy1 = p->H - m->y;
+	struct pl_lrbox b = {m->x / PL_LR, gy0 / PL_LR, (m->x + m->w + PL_LR - 1) / PL_LR,
+	                     (gy1 + PL_LR - 1) / PL_LR};
+	if (b.x1 > p->lrW) b.x1 = p->lrW;
+	if (b.y1 > p->lrH) b.y1 = p->lrH;
+	return b;
+}
+
+// Computes the size field into lr_a: the box mean of L^bias over size_px, then spread
+// outward with a box maximum of half that radius so the edge of a large bright area keeps
+// the measure of its interior instead of showing a bright rim.
+static inline void pl_size_field(struct pl *p, const struct sq_cfg *cfg) {
+	int rt = (int)lround(cfg->v[SQ_SIZE_PX] / PL_LR);
+	int rm = (int)lround(cfg->v[SQ_SIZE_PX] / (2.0 * PL_LR));
+	rt = rt < 1 ? 1 : rt;
+	rm = rm < 1 ? 1 : rm;
+
+	pl_base_state();
+	glBindVertexArray(p->vao);
+	glViewport(0, 0, p->lrW, p->lrH);
+	glDisable(GL_SCISSOR_TEST);
+
+	GLuint pr = p->prog[PL_DOWN];
+	pl_fbo_attach(p, p->lr_a);
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "S"), 0);
+	glUniform1f(PL_U(pr, "bias"), (float)cfg->v[SQ_SIZE_BIAS]);
+	glUniform2i(PL_U(pr, "size"), p->W, p->H);
+	pl_bind(0, p->s_tex, p->samp_nearest);
+	pl_draw();
+
+	pr = p->prog[PL_BOX];
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "src"), 0);
+	glEnable(GL_SCISSOR_TEST);
+	GLuint src = p->lr_a, dst = p->lr_b;
+	for (int pass = 0; pass < 4; pass++) {
+		int mode = pass >= 2, axis = pass & 1;
+		pl_fbo_attach(p, dst);
+		pl_bind(0, src, p->samp_nearest);
+		glUniform2i(PL_U(pr, "dir"), axis == 0 ? 1 : 0, axis == 0 ? 0 : 1);
+		glUniform1i(PL_U(pr, "radius"), mode ? rm : rt);
+		glUniform1i(PL_U(pr, "mode"), mode);
+		for (int i = 0; i < p->nmon; i++) {
+			struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
+			glUniform4i(PL_U(pr, "box"), b.x0, b.y0, b.x1, b.y1);
+			glScissor(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+			pl_draw();
+		}
+		GLuint t = src;
+		src = dst;
+		dst = t;
+	}
+	glDisable(GL_SCISSOR_TEST);
+	// Four passes leave the result in lr_a: a->b, b->a, a->b, b->a.
+}
+
+// size + need + dilate: leaves D in dnow.
 static inline void pl_dilate(struct pl *p, const struct sq_cfg *cfg) {
 	int R = (int)cfg->v[SQ_FALLOFF_PX];
 	int K = R > 0 ? pl_dilate_levels(R) : 0;
 	float min_gain = (float)cfg->v[SQ_MIN_GAIN];
 	float slope = R > 0 ? (1.0f - min_gain) / (float)R : 0.0f;
+	bool use_size = pl_size_active(cfg);
+
+	if (use_size) {
+		pl_size_field(p, cfg);
+	}
 
 	pl_base_state();
 	glBindVertexArray(p->vao);
@@ -476,20 +637,30 @@ static inline void pl_dilate(struct pl *p, const struct sq_cfg *cfg) {
 
 	GLuint pr = p->prog[PL_NEED];
 	pl_fbo_attach(p, K == 0 ? p->dnow : p->tex_a);
-	glDisable(GL_SCISSOR_TEST);
 	glUseProgram(pr);
 	glUniform1i(PL_U(pr, "S"), 0);
+	glUniform1i(PL_U(pr, "LR"), 1);
 	glUniform1f(PL_U(pr, "target"), (float)cfg->v[SQ_TARGET]);
 	glUniform1f(PL_U(pr, "min_gain"), min_gain);
 	glUniform1f(PL_U(pr, "knee"), (float)cfg->v[SQ_KNEE]);
+	glUniform1f(PL_U(pr, "use_size"), use_size ? 1.0f : 0.0f);
+	glUniform1f(PL_U(pr, "bias"), (float)cfg->v[SQ_SIZE_BIAS]);
+	glUniform1f(PL_U(pr, "target_large"), (float)cfg->v[SQ_TARGET_LARGE]);
+	glUniform2f(PL_U(pr, "lr_size"), (float)p->lrW, (float)p->lrH);
 	pl_bind(0, p->s_tex, p->samp_nearest);
-	pl_draw();
+	pl_bind(1, p->lr_a, p->samp_linear);
+	glEnable(GL_SCISSOR_TEST);
+	for (int i = 0; i < p->nmon; i++) {
+		struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
+		glUniform4f(PL_U(pr, "lr_box"), (float)b.x0, (float)b.y0, (float)b.x1, (float)b.y1);
+		pl_scissor_mon(p, &p->mon[i]);
+		pl_draw();
+	}
 
 	pr = p->prog[PL_DILATE];
 	glUseProgram(pr);
 	glUniform1i(PL_U(pr, "src"), 0);
 	glUniform1f(PL_U(pr, "slope"), slope);
-	glEnable(GL_SCISSOR_TEST);
 	GLuint src = p->tex_a;
 	int total = 2 * K, pass = 0;
 	for (int axis = 0; axis < 2; axis++) {
@@ -515,13 +686,15 @@ static inline void pl_dilate(struct pl *p, const struct sq_cfg *cfg) {
 	p->used_min_gain = cfg->v[SQ_MIN_GAIN];
 	p->used_knee = cfg->v[SQ_KNEE];
 	p->used_falloff = R;
+	p->used_target_large = cfg->v[SQ_TARGET_LARGE];
+	p->used_size_px = cfg->v[SQ_SIZE_PX];
+	p->used_size_bias = cfg->v[SQ_SIZE_BIAS];
 	p->dirty = false;
 }
 
 static inline void pl_smooth(struct pl *p, const struct sq_cfg *cfg, double now) {
-	double tau = cfg->v[SQ_TAU_MS] / 1000.0;
+	double tau = cfg->v[SQ_TAU_MS] / 1000.0, rise = cfg->v[SQ_RISE_MS] / 1000.0;
 	double dt = p->have_smooth_time && now > p->last_smooth ? now - p->last_smooth : 0.0;
-	float k = (float)(1.0 - exp(-dt / tau));
 	pl_base_state();
 	glBindVertexArray(p->vao);
 	glViewport(0, 0, p->W, p->H);
@@ -529,8 +702,11 @@ static inline void pl_smooth(struct pl *p, const struct sq_cfg *cfg, double now)
 	glUseProgram(pr);
 	glUniform1i(PL_U(pr, "now_t"), 0);
 	glUniform1i(PL_U(pr, "prev_t"), 1);
-	glUniform1f(PL_U(pr, "k"), k);
+	glUniform1f(PL_U(pr, "k_tau"), tau > 0 ? (float)(1.0 - exp(-dt / tau)) : 1.0f);
+	glUniform1f(PL_U(pr, "k_rise"), rise > 0 ? (float)(1.0 - exp(-dt / rise)) : 1.0f);
 	glUniform1f(PL_U(pr, "init"), p->st_valid ? 0.0f : 1.0f);
+	glUniform1f(PL_U(pr, "min_gain"), (float)cfg->v[SQ_MIN_GAIN]);
+	glUniform1f(PL_U(pr, "use_rise"), rise > 0 ? 1.0f : 0.0f);
 	pl_fbo_attach(p, p->st[1 - p->cur]);
 	pl_bind(0, p->dnow, p->samp_nearest);
 	pl_bind(1, p->st[p->cur], p->samp_nearest);
@@ -546,7 +722,7 @@ static inline void pl_smooth(struct pl *p, const struct sq_cfg *cfg, double now)
 	p->have_smooth_time = true;
 }
 
-static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex) {
+static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex, bool use_rise) {
 	pl_base_state();
 	glBindVertexArray(p->vao);
 	glBindFramebuffer(GL_FRAMEBUFFER, p->target_fbo);
@@ -559,6 +735,7 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex)
 	glUniform1f(PL_U(pr, "enabled"), (float)cfg->v[SQ_ENABLED]);
 	glUniform1f(PL_U(pr, "min_gain"), (float)cfg->v[SQ_MIN_GAIN]);
 	glUniform1f(PL_U(pr, "gamma_dim"), (float)cfg->v[SQ_GAMMA]);
+	glUniform1f(PL_U(pr, "use_rise"), use_rise ? 1.0f : 0.0f);
 	pl_bind(0, p->s_tex, p->samp_nearest);
 	pl_bind(1, dtex, p->samp_nearest);
 	glEnable(GL_SCISSOR_TEST);
@@ -570,16 +747,17 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex)
 }
 
 // Runs the whole pipeline. With nothing damaged since the last call it only advances the
-// smoothing, which is how release continues while the screen is otherwise still. When
-// disabled it still redraws every monitor pixel from S, because picom's buffer-age repaint
-// would otherwise leave stale dimmed pixels in the other back buffers.
+// smoothing, which is how release and rise continue while the screen is otherwise still.
+// When disabled it still redraws every monitor pixel from S, because picom's buffer-age
+// repaint would otherwise leave stale dimmed pixels in the other back buffers.
 // The caller must have saved and must restore the host's GL state.
 static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now) {
 	if (!p->ready || !p->s_valid || p->nmon == 0) {
 		return;
 	}
 	bool enabled = cfg->v[SQ_ENABLED] != 0;
-	bool smoothing = cfg->v[SQ_TAU_MS] > 0;
+	bool rise = cfg->v[SQ_RISE_MS] > 0;
+	bool smoothing = cfg->v[SQ_TAU_MS] > 0 || rise;
 	GLuint dtex = p->dnow;
 	if (enabled) {
 		if (!p->was_enabled) {
@@ -587,7 +765,9 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 			p->st_valid = false;
 		}
 		if (p->used_target != cfg->v[SQ_TARGET] || p->used_min_gain != cfg->v[SQ_MIN_GAIN] ||
-		    p->used_knee != cfg->v[SQ_KNEE] || p->used_falloff != (int)cfg->v[SQ_FALLOFF_PX]) {
+		    p->used_knee != cfg->v[SQ_KNEE] || p->used_falloff != (int)cfg->v[SQ_FALLOFF_PX] ||
+		    p->used_target_large != cfg->v[SQ_TARGET_LARGE] ||
+		    p->used_size_px != cfg->v[SQ_SIZE_PX] || p->used_size_bias != cfg->v[SQ_SIZE_BIAS]) {
 			p->dirty = true;
 		}
 		if (p->dirty) {
@@ -603,5 +783,5 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		p->dirty = true;
 	}
 	p->was_enabled = enabled;
-	pl_final(p, cfg, dtex);
+	pl_final(p, cfg, dtex, enabled && rise);
 }
