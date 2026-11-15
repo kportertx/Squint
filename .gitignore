@@ -9,3 +9,4 @@
 
 # Read-only clone of picom v12.5 used as a reference. It has its own git repository.
 /ref/
+/hotkey_test

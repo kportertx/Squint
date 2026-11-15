@@ -183,9 +183,22 @@ static void expect_px(const char *what, int x, int y, int want, int tol) {
 	CHECK(ok, "%s at (%d,%d): got %d,%d,%d want %d (tol %d)", what, x, y, p[0], p[1], p[2], want, tol);
 }
 
+// The baseline every test starts from. It sets every setting explicitly, so the tests do not
+// depend on the defaults squint ships with: brightness and dim_tint on, static and shortcuts
+// off, and neutral values everywhere.
 static struct sq_cfg base_cfg(void) {
 	struct sq_cfg c;
 	sq_defaults(&c);
+	double base[SQ_N] = {[SQ_ENABLED] = 1, [SQ_BRIGHTNESS] = 1, [SQ_TARGET] = 0.45, [SQ_TARGET_LARGE] = 0.20,
+	                     [SQ_SIZE_PX] = 192, [SQ_SIZE_BIAS] = 2.0, [SQ_MIN_GAIN] = 0.35, [SQ_KNEE] = 0.10,
+	                     [SQ_DARKENING_MS] = 0, [SQ_BRIGHTENING_MS] = 0, [SQ_SCENE_PCT] = 33, [SQ_FALLOFF_PX] = 24,
+	                     [SQ_GAMMA] = 1.0, [SQ_DIM_TINT] = 1, [SQ_DIM_RED] = 1, [SQ_DIM_GREEN] = 1, [SQ_DIM_BLUE] = 1,
+	                     [SQ_TINT_RED] = 1, [SQ_TINT_GREEN] = 1, [SQ_TINT_BLUE] = 1, [SQ_STATIC] = 0,
+	                     [SQ_STATIC_AMOUNT] = 10, [SQ_STATIC_GRAIN_PX] = 2.0, [SQ_STATIC_COLOR] = 0.0, [SQ_STATIC_HZ] = 60,
+	                     [SQ_STATIC_LEVEL] = 0.5, [SQ_STATIC_CONTRAST] = 0.22, [SQ_STATIC_CLUSTERS] = 0.3,
+	                     [SQ_STATIC_SCANLINES] = 0.15, [SQ_STATIC_SMEAR] = 1.3, [SQ_STATIC_JITTER_PX] = 0.5,
+	                     [SQ_SHORTCUTS] = 1};
+	memcpy(c.v, base, sizeof base);
 	c.v[SQ_TARGET] = 0.45;
 	c.v[SQ_TARGET_LARGE] = 0.45;  // size feature off unless a test turns it on
 	c.v[SQ_MIN_GAIN] = 0.35;
@@ -1614,7 +1627,7 @@ static void test_groups(void) {
 	}
 	fclose(f);
 	CHECK(bad == 0, "%d lines are indented wrongly", bad);
-	CHECK(toggles == 3 && members == SQ_N - 4, "3 toggles and %d members were written (got %d toggles, %d members)", SQ_N - 4, toggles, members);
+	CHECK(toggles == 4 && members == SQ_N - 5, "4 toggles and %d members were written (got %d toggles, %d members)", SQ_N - 5, toggles, members);
 	struct sq_cfg d;
 	sq_load(path, &d);
 	CHECK(d.v[SQ_DIM_TINT] == 0 && fabs(d.v[SQ_TARGET] - 0.33) < 1e-9, "indented lines load");
@@ -1630,7 +1643,75 @@ static void test_groups(void) {
 	fputs("target = 0.5\ntint_blue = 0.5\n", f);
 	fclose(f);
 	sq_load(path, &d);
-	CHECK(d.v[SQ_BRIGHTNESS] == 1 && d.v[SQ_DIM_TINT] == 1 && d.v[SQ_STATIC] == 0, "toggles default to the old behavior");
+	CHECK(d.v[SQ_ENABLED] == 1 && d.v[SQ_BRIGHTNESS] == 1 && d.v[SQ_DIM_TINT] == 0 && d.v[SQ_STATIC] == 0 && d.v[SQ_SHORTCUTS] == 0,
+	      "a file without the toggles gets the shipped toggle defaults: only enabled and brightness on");
+	for (int i = 0; i < SQ_N; i++) {
+		if (sq_params[i].type == SQ_STR) continue;
+		CHECK(sq_clamp(i, sq_params[i].def) == sq_params[i].def, "the default of %s is inside its range", sq_params[i].key);
+		if (sq_params[i].type == SQ_BOOL) {
+			bool on = i == SQ_ENABLED || i == SQ_BRIGHTNESS;
+			CHECK(sq_params[i].def == (on ? 1 : 0), "the default of toggle %s is %s", sq_params[i].key, on ? "on" : "off");
+		}
+	}
+	unlink(path);
+}
+
+// Shortcut chords and the text settings that hold them.
+static void test_keys(void) {
+	printf("shortcut chords and text settings\n");
+	unsigned mods;
+	char key[SQ_STRLEN];
+	CHECK(sq_parse_chord("Ctrl+Alt+s", &mods, key, sizeof key) && mods == (SQ_MOD_CTRL | SQ_MOD_ALT) && !strcmp(key, "s"), "Ctrl+Alt+s");
+	CHECK(sq_parse_chord("super+SHIFT+F5", &mods, key, sizeof key) && mods == (SQ_MOD_SUPER | SQ_MOD_SHIFT) && !strcmp(key, "F5"), "modifier names ignore case");
+	CHECK(sq_parse_chord("Control+Mod1+space", &mods, key, sizeof key) && mods == (SQ_MOD_CTRL | SQ_MOD_ALT) && !strcmp(key, "space"), "Control and Mod1 are aliases");
+	CHECK(sq_parse_chord(" Ctrl + s ", &mods, key, sizeof key) && mods == SQ_MOD_CTRL && !strcmp(key, "s"), "spaces around the parts are ignored");
+	CHECK(sq_parse_chord("F5", &mods, key, sizeof key) && mods == 0 && !strcmp(key, "F5"), "a key alone");
+	CHECK(sq_parse_chord("", &mods, key, sizeof key) && mods == 0 && !*key, "an empty chord means no key");
+	CHECK(!sq_parse_chord("Ctrl+", &mods, key, sizeof key), "a trailing + is malformed");
+	CHECK(!sq_parse_chord("+s", &mods, key, sizeof key), "a leading + is malformed");
+	CHECK(!sq_parse_chord("Foo+s", &mods, key, sizeof key), "an unknown modifier is malformed");
+	CHECK(!sq_parse_chord("Ctrl+a b", &mods, key, sizeof key), "a space inside a key name is malformed");
+	CHECK(!sq_parse_chord("Ctrl+Alt+Shift+Super+Mod2+Mod3+Mod5+Mod1+s", &mods, key, sizeof key), "too many parts are malformed");
+
+	struct sq_cfg c;
+	sq_defaults(&c);
+	for (int i = SQ_KEY_ENABLED; i <= SQ_KEY_STATIC; i++) {
+		CHECK(c.s[i][0] == '\0' && sq_params[i].type == SQ_STR && sq_group(i) == SQ_SHORTCUTS, "%s is an empty text setting in the shortcuts group", sq_params[i].key);
+		CHECK(sq_key_target(i) >= 0 && sq_params[sq_key_target(i)].type == SQ_BOOL, "%s flips an on/off setting", sq_params[i].key);
+	}
+	CHECK(sq_key_target(SQ_KEY_ENABLED) == SQ_ENABLED && sq_key_target(SQ_KEY_BRIGHTNESS) == SQ_BRIGHTNESS &&
+	          sq_key_target(SQ_KEY_DIM_TINT) == SQ_DIM_TINT && sq_key_target(SQ_KEY_STATIC) == SQ_STATIC && sq_key_target(SQ_TARGET) < 0,
+	      "each key flips the toggle it is named for");
+	CHECK(c.v[SQ_SHORTCUTS] == 0, "shortcuts default to off, with no keys set");
+	c.v[SQ_SHORTCUTS] = 1;
+	CHECK(sq_set(&c, "key_static", "Ctrl+Alt+s") && !strcmp(c.s[SQ_KEY_STATIC], "Ctrl+Alt+s"), "set a key");
+	CHECK(!sq_set(&c, "key_static", "Foo+s") && !strcmp(c.s[SQ_KEY_STATIC], "Ctrl+Alt+s"), "a bad chord is rejected and the old one stays");
+	CHECK(sq_set(&c, "key_brightness", "Super+b") && sq_set(&c, "key_enabled", "Super+Shift+F12"), "set two more");
+	const char *path = "/tmp/squint-keys-test.conf";
+	CHECK(sq_save(path, &c) == 0, "save");
+	FILE *f = fopen(path, "r");
+	char line[200], all[4000] = "";
+	while (fgets(line, sizeof line, f)) strncat(all, line, sizeof all - strlen(all) - 1);
+	fclose(f);
+	CHECK(strstr(all, "\nshortcuts = true\n  key_enabled = Super+Shift+F12\n  key_brightness = Super+b\n  key_dim_tint =\n  key_static = Ctrl+Alt+s\n"),
+	      "the shortcuts group is written with its keys indented, and an empty key without a trailing space:\n%s", strstr(all, "shortcuts") ? strstr(all, "shortcuts") : "(missing)");
+	struct sq_cfg d;
+	sq_load(path, &d);
+	CHECK(!strcmp(d.s[SQ_KEY_STATIC], "Ctrl+Alt+s") && !strcmp(d.s[SQ_KEY_BRIGHTNESS], "Super+b") &&
+	          !strcmp(d.s[SQ_KEY_ENABLED], "Super+Shift+F12") && d.s[SQ_KEY_DIM_TINT][0] == '\0',
+	      "keys round trip, empty ones stay empty");
+	CHECK(sq_set(&d, "key_static", "") && d.s[SQ_KEY_STATIC][0] == '\0', "an empty value clears a key");
+	f = fopen(path, "w");
+	fputs("shortcuts = false\n    key_static   =    Ctrl+Alt+x   # comment\nkey_enabled=\n", f);
+	fclose(f);
+	sq_load(path, &d);
+	CHECK(d.v[SQ_SHORTCUTS] == 0 && !strcmp(d.s[SQ_KEY_STATIC], "Ctrl+Alt+x") && d.s[SQ_KEY_ENABLED][0] == '\0',
+	      "a hand-edited file with odd spacing and a comment loads");
+	f = fopen(path, "w");
+	fputs("key_static = Foo+Bar+s\n", f);
+	fclose(f);
+	sq_load(path, &d);
+	CHECK(d.s[SQ_KEY_STATIC][0] == '\0', "a malformed chord in the file is ignored");
 	unlink(path);
 }
 
@@ -1683,6 +1764,7 @@ int main(void) {
 	test_color();
 	test_config();
 	test_groups();
+	test_keys();
 	test_toggles();
 	test_damage_shapes();
 	printf("\n%d checks, %d failed\n", checks, failures);

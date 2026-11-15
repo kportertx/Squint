@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "hotkey.h"
 #include "pipeline.h"
 
 #include <picom/api.h>
@@ -54,6 +55,11 @@ struct state {
 	ev_stat conf_watch;
 	bool conf_watch_on, cfg_dirty;
 
+	struct hk hk;  // global shortcut keys
+	bool hk_on;
+	ev_io hk_io;
+	bool hk_io_on;
+
 	ev_timer timer;
 	bool timer_on;
 	double last_present, last_stats;
@@ -68,6 +74,7 @@ struct state {
 };
 
 static struct state st;
+static void hk_shutdown(struct ev_loop *loop);
 static FILE *log_file;
 
 static double now_s(void) {
@@ -339,6 +346,7 @@ static void w_deinit(backend_t *b) {
 		ev_stat_stop(b->loop, &st.conf_watch);
 		st.conf_watch_on = false;
 	}
+	hk_shutdown(b->loop);
 	span_free(&st.copy_span);
 	span_free(&st.dim_span);
 	pl_destroy(&st.pl);
@@ -348,16 +356,101 @@ static void w_deinit(backend_t *b) {
 	st.orig_deinit(b);
 }
 
+// Flips an on/off setting in the config file and applies it. The file is read again first, so
+// a change made by squintctl a moment ago is not lost, and written the way squintctl writes it.
+static void flip_setting(int idx) {
+	struct sq_cfg f;
+	sq_load(st.conf_path, &f);
+	f.v[idx] = f.v[idx] != 0 ? 0 : 1;
+	if (sq_save(st.conf_path, &f) != 0) {
+		say("shortcut: cannot write %s", st.conf_path);
+		return;
+	}
+	st.cfg = f;
+	st.cfg_dirty = true;
+	say("shortcut: %s is now %s", sq_params[idx].key, f.v[idx] != 0 ? "on" : "off");
+}
+
+static void hk_cb(struct ev_loop *loop, ev_io *w, int revents) {
+	(void)loop;
+	(void)w;
+	(void)revents;
+	int acts[HK_MAX];
+	int n = hk_poll(&st.hk, now_s(), acts, HK_MAX);
+	for (int i = 0; i < n; i++) {
+		flip_setting(acts[i]);
+	}
+	if (xcb_connection_has_error(st.hk.c)) {
+		say("shortcut: the X connection failed, shortcut keys are off until picom restarts");
+		ev_io_stop(loop, &st.hk_io);
+		st.hk_io_on = false;
+	}
+}
+
+static void hk_shutdown(struct ev_loop *loop) {
+	if (st.hk_io_on) {
+		ev_io_stop(loop, &st.hk_io);
+		st.hk_io_on = false;
+	}
+	if (st.hk_on) {
+		hk_close(&st.hk);
+		st.hk_on = false;
+	}
+}
+
+// Grabs the shortcut keys named in the config, after releasing the ones grabbed before. With
+// no keys set, or with shortcuts off, nothing stays grabbed and no connection stays open.
+static void apply_hotkeys(struct ev_loop *loop) {
+	const char *chords[SQ_KEY_STATIC - SQ_KEY_ENABLED + 1];
+	int idx[SQ_KEY_STATIC - SQ_KEY_ENABLED + 1], n = 0;
+	if (st.cfg.v[SQ_SHORTCUTS] != 0) {
+		for (int i = SQ_KEY_ENABLED; i <= SQ_KEY_STATIC; i++) {
+			if (st.cfg.s[i][0]) {
+				chords[n] = st.cfg.s[i];
+				idx[n++] = i;
+			}
+		}
+	}
+	if (n == 0) {
+		hk_shutdown(loop);
+		return;
+	}
+	if (!st.dpy) {
+		st.dpy = XOpenDisplay(NULL);
+	}
+	if (!st.hk_on) {
+		if (!st.dpy || !hk_open(&st.hk)) {
+			say("shortcut: cannot open the X connection, shortcut keys are off");
+			return;
+		}
+		st.hk_on = true;
+	}
+	hk_ungrab_all(&st.hk);
+	for (int k = 0; k < n; k++) {
+		char why[120];
+		if (hk_grab(&st.hk, st.dpy, chords[k], sq_key_target(idx[k]), why, sizeof why)) {
+			say("shortcut: %s flips %s", chords[k], sq_params[sq_key_target(idx[k])].key);
+		} else {
+			say("shortcut: %s (%s): %s", sq_params[idx[k]].key, chords[k], why);
+		}
+	}
+	if (!st.hk_io_on) {
+		ev_io_init(&st.hk_io, hk_cb, hk_fd(&st.hk), EV_READ);
+		ev_io_start(loop, &st.hk_io);
+		st.hk_io_on = true;
+	}
+}
+
 // libev calls this when the config file is replaced, changed, or created. squintctl
 // writes by rename, which libev reports as a new inode. No GL work happens here. The next
 // present or timer tick picks the new values up, with the context known to be current.
 static void conf_cb(struct ev_loop *loop, ev_stat *w, int revents) {
-	(void)loop;
 	(void)w;
 	(void)revents;
 	sq_load(st.conf_path, &st.cfg);
 	st.cfg_dirty = true;
 	log_cfg("config reloaded");
+	apply_hotkeys(loop);
 }
 
 // Presents on its own while a smoothing transition may still be running and picom has
@@ -429,6 +522,7 @@ static void entry(struct backend_base *b, void *user_data) {
 	ev_stat_init(&st.conf_watch, conf_cb, st.conf_path, 0.0);
 	ev_stat_start(b->loop, &st.conf_watch);
 	st.conf_watch_on = true;
+	apply_hotkeys(b->loop);
 
 	ev_timer_init(&st.timer, timer_cb, 0.0, 1.0 / 60.0);
 	ev_timer_start(b->loop, &st.timer);
