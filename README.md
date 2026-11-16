@@ -19,6 +19,7 @@ What squint adds beyond dimming:
 - Per-channel color multipliers and a whole-screen tint, so you can reduce blue light in bright areas or tint the screen.
 - Shortcut keys and a tuning tool. Settings take effect as you change them.
 - An optional [VSS](https://visualsnowsyndrome.com) relief overlay, off by default. It is the `static` setting: moving noise over the screen.
+- Optional RGB lines, off by default, for fun. squint finds thin straight lines on screen (window borders, table grid lines, separators) and recolors them with moving color, such as a rainbow or a snake, in the style of a gaming keyboard. The color keeps the brightness of the line it replaces, so it never gets brighter than the screen unless you ask.
 
 ## How it works
 
@@ -32,7 +33,8 @@ The steps, in order:
 4. **Falloff.** The dimming spreads outward from bright pixels with a straight-line falloff over `falloff_px`, so the area just around a bright region darkens a little too, fading to nothing. It never crosses a monitor edge, and pixels the falloff does not reach are copied bit for bit.
 5. **Scene changes.** squint compares each monitor's blurred brightness with the previous frame at 1,024 sample points. When more than `scene_pct` percent of the points changed significantly (by more than 0.03, or by more than 25 percent), that monitor counts as having a scene change. Scrolling a page moves many pixels but barely changes the blurred brightness, so it does not count.
 6. **Smoothing.** After a scene change, `darkening_ms` makes dimming fade out slowly when content gets darker, and `brightening_ms` makes newly brighter content start at the brightness and gamma that was shown before and rise to the new level. Each stays active for five times its setting after the scene change. Without a scene change, the screen follows the content at once.
-7. **Final pass.** Gamma, the per-channel dim multipliers, and the whole-screen tint are applied, then the optional static overlay is mixed in.
+7. **Final pass.** Gamma, the per-channel dim multipliers, and the whole-screen tint are applied. Then the optional RGB lines are recolored, and last the optional static overlay is mixed in.
+8. **Lines.** Only with `rgb` on, and only when the screen has changed since the last search. squint searches the undimmed copy for lines (see the RGB lines section) and keeps the result in a mask. The final pass reads that mask on every frame, so the animation costs almost nothing extra.
 
 The brightness measurements use the screen after dimming, so a dimmed window does not look bright to the scene detector.
 
@@ -99,10 +101,10 @@ Edit the file with the tuning tool:
 squintctl                 interactive tuning screen
 squintctl show            print the config file location and the current settings
 squintctl set KEY VALUE   change one setting
-squintctl toggle NAME     flip an on/off setting (enabled, brightness, dim_tint, static, or shortcuts)
+squintctl toggle NAME     flip an on/off setting (enabled, brightness, dim_tint, static, rgb, or shortcuts)
 ```
 
-In the tuning screen, up and down select a setting, left and right adjust it by one step, PgUp and PgDn adjust by ten steps, space flips a toggle, Enter edits a shortcut key, `r` resets the selected setting to the value it had when the tool opened, `R` does that for every setting, `d` resets the selected setting to its default, `D` does that for every setting, and `q` quits. A `*` at the left of a row marks a setting that differs from the file as it was when the tool opened. Every change is saved at once. Values outside a setting's range are clamped.
+In the tuning screen, which scrolls when the settings do not fit the terminal (the header shows which rows are in view), up and down select a setting, left and right adjust it by one step, PgUp and PgDn adjust by ten steps, space flips a toggle, Enter edits a shortcut key, `r` resets the selected setting to the value it had when the tool opened, `R` does that for every setting, `d` resets the selected setting to its default, `D` does that for every setting, and `q` quits. A `*` at the left of a row marks a setting that differs from the file as it was when the tool opened. Every change is saved at once. Values outside a setting's range are clamped.
 
 Settings come in groups. Each group has a toggle, and its settings are indented under it in the file and in the tuning screen. The tuning screen dims a group's settings while its toggle is off. The leading spaces are only layout, so the parser ignores them.
 
@@ -116,7 +118,7 @@ bindsym $mod+Shift+d exec --no-startup-id squintctl toggle enabled
 
 ### Defaults and example
 
-Only `enabled` and `brightness` are on by default. `dim_tint`, `static`, and `shortcuts` are off, and you turn each group on when you want it. The numbers are the values the author uses. This is the default configuration, laid out the way the file is written:
+Only `enabled` and `brightness` are on by default. `dim_tint`, `static`, `rgb`, and `shortcuts` are off, and you turn each group on when you want it. The numbers are the values the author uses. This is the default configuration, laid out the way the file is written:
 
 ```
 enabled = true
@@ -154,11 +156,32 @@ static = false
   static_smear = 1.30
   static_jitter_px = 0.50
 
+rgb = false
+  rgb_effect = rainbow
+  rgb_speed = 0.50
+  rgb_luma = 1.00
+  rgb_min_luma = 0.00
+  rgb_hue = 200
+  rgb_hue_span = 360
+  rgb_saturation = 1.00
+  rgb_length_px = 120
+  rgb_gap_px = 200
+  rgb_tail = 0.60
+  rgb_direction = forward
+  rgb_sync = false
+  rgb_line_min_px = 48
+  rgb_line_thick_px = 3
+  rgb_line_contrast = 0.15
+  rgb_horizontal = true
+  rgb_vertical = true
+
 shortcuts = false
   key_enabled = Super+F1
   key_brightness = Super+F2
   key_dim_tint = Super+F3
   key_static = Super+F4
+  key_rgb = Super+F5
+  key_rgb_effect = Super+F6
 ```
 
 A setting missing from the file takes its default. The tint is amber by default (`tint_green` 0.80 and `tint_blue` 0.50), so it shows as soon as you turn `dim_tint` on.
@@ -219,9 +242,40 @@ Each update draws a fresh, independent pattern with no blending between updates.
 
 While static is on, squint presents `static_hz` frames a second, even when nothing else on screen changes, so the GPU cannot idle.
 
+### RGB group
+
+`rgb` recolors thin straight lines with moving color. It is off by default.
+
+**What counts as a line.** A horizontal line is a band of at most `rgb_line_thick_px` rows of one color, at least `rgb_line_min_px` pixels long. The row on at least one side of the band must differ from it in brightness by at least `rgb_line_contrast`. One side is enough, because a window border or scroll bar often touches a nearly matching color on the other side. Vertical lines work the same with columns. Where another line of the same color crosses a line, as in a grid, the crossing does not break it: squint bridges crossings up to `rgb_line_thick_px` pixels wide. Two pixels are the same color when no channel differs by more than 5 out of 255. A line stops at the edge of its monitor. A line that crosses two monitors counts on each one separately, so it must be long enough on each.
+
+**What color it gets.** The new color keeps the luminance of the pixel it replaces, measured after dimming and tint, multiplied by `rgb_luma` and capped at white. The hue comes from the effect. When a saturated color cannot be that bright (pure blue tops out near 7 percent luminance), squint mixes it toward gray of the same luminance until it fits, so the luminance is exact and the color gives way. A black line has no luminance to inherit and stays black, unless `rgb_min_luma` sets a floor.
+
+| Setting | Default | Range | Meaning |
+|---|---|---|---|
+| `rgb_effect` | rainbow | solid, breathe, rainbow, snake, wave | `solid` is one color. `breathe` fades it in and out. `rainbow` moves the hue along each line. `snake` moves a lit segment along each line and leaves the rest alone. `wave` moves ripples of brightness along each line. |
+| `rgb_speed` | 0.5 | 0.1 to 5 | Cycles per second for `breathe`. For the others, how many lengths (`rainbow`, `wave`) or segment periods (`snake`) pass per second. |
+| `rgb_luma` | 1.0 | 0.1 to 4 | Brightness multiplier on the brightness of the pixel being replaced. |
+| `rgb_min_luma` | 0 | 0 to 1 | Floor for that brightness before the multiplier, so dark lines can light up. |
+| `rgb_hue` | 200 | 0 to 359 | Base hue in degrees: 0 red, 120 green, 240 blue. |
+| `rgb_hue_span` | 360 | 0 to 360 | Degrees of hue that `rainbow` and `snake` sweep. |
+| `rgb_saturation` | 1.0 | 0 to 1 | Color strength, up to 1. |
+| `rgb_length_px` | 120 | 10 to 1000 | Length of one `rainbow` or `wave` cycle, or of the `snake` segment. |
+| `rgb_gap_px` | 200 | 0 to 2000 | Unlit pixels between `snake` segments. |
+| `rgb_tail` | 0.6 | 0 to 1 | How softly a `snake` fades toward its tail. 0 is a hard block. |
+| `rgb_direction` | forward | forward, backward, alternate | Which way motion runs along a line: right or down, left or up, or reversed on every other line. |
+| `rgb_sync` | false | false to true | On, every line moves in step. Off, each line has its own phase. |
+| `rgb_line_min_px` | 48 | 8 to 256 | Shortest run that counts as a line. |
+| `rgb_line_thick_px` | 3 | 1 to 5 | Thickest line. |
+| `rgb_line_contrast` | 0.15 | 0.02 to 1 | Brightness difference a line needs from the pixels on at least one side, in encoded luma. Light gray grid lines on white differ by about 0.1, so lower this to catch them. |
+| `rgb_horizontal`, `rgb_vertical` | true | false to true | Which directions to search. |
+
+`rgb_effect` and `rgb_direction` are names in the file (`rgb_effect = snake`), and the tuning screen steps through them with left and right.
+
+While `rgb` is on with any effect but `solid`, squint presents a frame about every 15 ms, even when nothing else on screen changes, so the GPU cannot idle. The search for lines runs on every frame that picom draws something, and takes 8 to 13 ms on the benchmark setup (see Known limitations).
+
 ### Shortcut keys
 
-The shortcuts group lets a key flip each toggle from anywhere, whichever window has focus. The default keys are Super+F1 for `enabled`, Super+F2 for `brightness`, Super+F3 for `dim_tint`, and Super+F4 for `static`. `shortcuts` is off by default, so squint grabs no key until you turn it on. Turning `shortcuts` off releases them all at once.
+The shortcuts group lets a key flip each toggle from anywhere, whichever window has focus. The default keys are Super+F1 for `enabled`, Super+F2 for `brightness`, Super+F3 for `dim_tint`, Super+F4 for `static`, Super+F5 for `rgb`, and Super+F6 for the next RGB effect. `shortcuts` is off by default, so squint grabs no key until you turn it on. Turning `shortcuts` off releases them all at once.
 
 | Setting | Flips |
 |---|---|
@@ -229,6 +283,8 @@ The shortcuts group lets a key flip each toggle from anywhere, whichever window 
 | `key_brightness` | `brightness` |
 | `key_dim_tint` | `dim_tint` |
 | `key_static` | `static` |
+| `key_rgb` | `rgb` |
+| `key_rgb_effect` | `rgb_effect`, which steps to the next effect and wraps from `wave` to `solid` |
 
 In the tuning screen, select a key setting and press Enter, then press the keys you want, for example Super+F1. squint records the chord itself, so it also gets chords a terminal cannot see, such as anything with Super. While it waits, squint holds the keyboard for up to 20 seconds. Escape alone cancels. Press `e` instead to type the chord as text.
 
@@ -257,10 +313,13 @@ squint writes a log to `/tmp/squint.log`, or to the file named by `SQUINT_LOG`. 
 - two monitors, monitors that do not line up with the internal blocks, and a screen size that is not a power of two;
 - damage shapes from picom, including empty damage and hundreds of small rectangles;
 - the config file format, clamping, and the grouped layout;
-- all eight combinations of the three toggles;
-- the shortcut chord parser and the text settings that hold chords.
+- all eight combinations of the brightness, dim_tint, and static toggles;
+- the RGB line search against a brute-force model, with thickness, length, contrast on one side or neither, crossing lines, direction, and monitor edges, and the RGB effects: luminance inheritance, the gamut fallback, the minimum luminance, and the timing and direction of each effect;
+- the shortcut chord parser, the text settings that hold chords, and the enum settings (names, ranges, and the file round trip).
 
 `make test` also runs `test/hotkey_test.c`, which grabs a chord on the running X server and sends key presses with the XTest extension. It checks that a chord fires once, that a repeat inside 0.3 s is ignored, that the wrong modifiers do not fire, that a chord another connection already holds is refused, and that released keys are free to grab again. The chord is Ctrl+Alt plus a spare key (F24, or one of the XF86Launch keys), which the test grabs before sending it. It also checks that key names match without regard to case, and that recording a chord from real key presses gets Super+F1, modifiers in a fixed order, and Ctrl+Escape right, ignores modifiers pressed alone, cancels on Escape, and times out. If the keyboard has none of them, or the server has no XTest extension, the test says so and passes.
+
+Nothing in the suite drives the tuning screen or the shortcut that steps `rgb_effect`. The tuning screen was checked by hand in a pseudo-terminal at several sizes, including a resize. The effect shortcut has not been run in picom.
 
 The pipeline test needs a display and a GPU driver with OpenGL 3.3. The CPU model of the falloff is brute force and slow on large images, so the large tests use falloff 0.
 
@@ -272,12 +331,15 @@ The pipeline test needs a display and a GPU driver with OpenGL 3.3. The CPU mode
 - **Fullscreen windows that picom unredirects** (with `--unredir-if-possible`) bypass the compositor, so squint cannot dim them.
 - **Monitor changes.** squint reads the monitor layout when picom starts and when the root window changes size. If you rearrange monitors without changing the total size, restart picom.
 - **Bright shades flatten.** Pixels above `target` all land near the same level, so white and light grays end up close together. `knee` only rounds the corner. A lower `target_large` makes this stronger.
-- **Shortcut keys.** They are plain toggles. There is no key for a single setting, and no chord can include a mouse button. The Num Lock and Caps Lock variants of a chord are grabbed but were not tested live, because the test would change your lock state.
+- **Shortcut keys.** They flip a toggle, and `key_rgb_effect` steps through the RGB effects. There is no key for any other setting, and no chord can include a mouse button. The Num Lock and Caps Lock variants of a chord are grabbed but were not tested live, because the test would change your lock state.
 - **No per-application rules.** Dimming applies to the screen. There is no list of windows to skip, and there is one tint for all monitors.
 - **No vsync.** picom runs without vsync by default. Animated static may tear unless you start picom with `--vsync`. This has not been tested on this setup.
 - **GPU cost.** Measured in a standalone benchmark on the RTX A1000 at full clock, with a 3760x2640 root over three monitors, a frame that changes part of the screen takes about 3 to 6 ms, depending on the settings. A frame with nothing new takes under 1 ms. Static takes about 0.8 ms per update in gray and 2 ms in color. Real use with the GPU at a lower clock reads two to four times higher. Power and fan use are not measured.
-- **Memory.** squint keeps several full-screen textures, about 14 bytes per pixel of the root window, or about 140 MB for a 3760x2640 root.
-- **Fixed thresholds.** The scene-change thresholds (0.03 or 25 percent per sample point) and the size measure's range (0.2 to 0.5) are constants in `src/pipeline.h`, not settings.
+- **Memory.** squint keeps several full-screen textures, about 16 bytes per pixel of the root window, or about 160 MB for a 3760x2640 root.
+- **RGB cost.** The search for lines is full-screen and runs whenever picom draws anything, even a blinking cursor. On the benchmark setup (3840x2640, three monitors) it took 8.3 ms with `rgb_line_min_px` 16, 11.4 ms with 64, and 12.5 ms with 256. The animation itself added about 0.15 ms a frame. Searching only the damaged part of the screen would cut this, and is not done.
+- **RGB false positives.** Anything flat and thin that contrasts with one side counts, such as a 2 px colored header bar, a divider, or a progress bar. Text underlines are usually too short. Raise `rgb_line_min_px` or `rgb_line_contrast` to drop weaker matches. A line that is anti-aliased, a gradient, or a different color in each pixel is not found.
+- **RGB speed unit.** `rgb_speed` is a cycle rate, so changing it while an effect runs makes the animation jump to a new phase.
+- **Fixed thresholds.** The scene-change thresholds (0.03 or 25 percent per sample point), the size measure's range (0.2 to 0.5), and the same-color tolerance of the line search (5 out of 255) are constants in `src/pipeline.h`, not settings.
 - **No test window.** The original plan included a test window that alternates between black and white. It has not been written.
 
 ## Layout

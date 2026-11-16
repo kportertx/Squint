@@ -149,14 +149,14 @@ static void span_end(struct span *s) {
 static void log_cfg(const char *why) {
 	say("%s: enabled=%g target=%g target_large=%g size_px=%g size_bias=%g min_gain=%g knee=%g "
 	    "darkening_ms=%g brightening_ms=%g scene_pct=%g falloff_px=%g gamma=%g dim_rgb=%g,%g,%g tint_rgb=%g,%g,%g "
-	    "groups: brightness=%g dim_tint=%g static=%g",
+	    "groups: brightness=%g dim_tint=%g static=%g rgb=%g",
 	    why, st.cfg.v[SQ_ENABLED], st.cfg.v[SQ_TARGET], st.cfg.v[SQ_TARGET_LARGE],
 	    st.cfg.v[SQ_SIZE_PX], st.cfg.v[SQ_SIZE_BIAS], st.cfg.v[SQ_MIN_GAIN], st.cfg.v[SQ_KNEE],
 	    st.cfg.v[SQ_DARKENING_MS], st.cfg.v[SQ_BRIGHTENING_MS], st.cfg.v[SQ_SCENE_PCT],
 	    st.cfg.v[SQ_FALLOFF_PX], st.cfg.v[SQ_GAMMA],
 	    st.cfg.v[SQ_DIM_RED], st.cfg.v[SQ_DIM_GREEN], st.cfg.v[SQ_DIM_BLUE], st.cfg.v[SQ_TINT_RED],
 	    st.cfg.v[SQ_TINT_GREEN], st.cfg.v[SQ_TINT_BLUE], st.cfg.v[SQ_BRIGHTNESS], st.cfg.v[SQ_DIM_TINT],
-	    st.cfg.v[SQ_STATIC]);
+	    st.cfg.v[SQ_STATIC], st.cfg.v[SQ_RGB]);
 }
 
 static void log_stats(const char *why) {
@@ -356,19 +356,30 @@ static void w_deinit(backend_t *b) {
 	st.orig_deinit(b);
 }
 
-// Flips an on/off setting in the config file and applies it. The file is read again first, so
-// a change made by squintctl a moment ago is not lost, and written the way squintctl writes it.
+// Flips an on/off setting, or steps an enum setting to its next choice and back to the first
+// after the last, in the config file, and applies it. The file is read again first, so a
+// change made by squintctl a moment ago is not lost, and written the way squintctl writes it.
 static void flip_setting(int idx) {
 	struct sq_cfg f;
 	sq_load(st.conf_path, &f);
-	f.v[idx] = f.v[idx] != 0 ? 0 : 1;
+	if (sq_params[idx].type == SQ_ENUM) {
+		f.v[idx] = f.v[idx] + 1 > sq_params[idx].max ? sq_params[idx].min : f.v[idx] + 1;
+	} else {
+		f.v[idx] = f.v[idx] != 0 ? 0 : 1;
+	}
 	if (sq_save(st.conf_path, &f) != 0) {
 		say("shortcut: cannot write %s", st.conf_path);
 		return;
 	}
 	st.cfg = f;
 	st.cfg_dirty = true;
-	say("shortcut: %s is now %s", sq_params[idx].key, f.v[idx] != 0 ? "on" : "off");
+	if (sq_params[idx].type == SQ_ENUM) {
+		char name[SQ_STRLEN];
+		sq_enum_name(idx, (int)f.v[idx], name, sizeof name);
+		say("shortcut: %s is now %s", sq_params[idx].key, name);
+	} else {
+		say("shortcut: %s is now %s", sq_params[idx].key, f.v[idx] != 0 ? "on" : "off");
+	}
 }
 
 static void hk_cb(struct ev_loop *loop, ev_io *w, int revents) {
@@ -401,10 +412,10 @@ static void hk_shutdown(struct ev_loop *loop) {
 // Grabs the shortcut keys named in the config, after releasing the ones grabbed before. With
 // no keys set, or with shortcuts off, nothing stays grabbed and no connection stays open.
 static void apply_hotkeys(struct ev_loop *loop) {
-	const char *chords[SQ_KEY_STATIC - SQ_KEY_ENABLED + 1];
-	int idx[SQ_KEY_STATIC - SQ_KEY_ENABLED + 1], n = 0;
+	const char *chords[SQ_KEY_RGB_EFFECT - SQ_KEY_ENABLED + 1];
+	int idx[SQ_KEY_RGB_EFFECT - SQ_KEY_ENABLED + 1], n = 0;
 	if (st.cfg.v[SQ_SHORTCUTS] != 0) {
-		for (int i = SQ_KEY_ENABLED; i <= SQ_KEY_STATIC; i++) {
+		for (int i = SQ_KEY_ENABLED; i <= SQ_KEY_RGB_EFFECT; i++) {
 			if (st.cfg.s[i][0]) {
 				chords[n] = st.cfg.s[i];
 				idx[n++] = i;

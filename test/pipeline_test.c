@@ -1627,7 +1627,7 @@ static void test_groups(void) {
 	}
 	fclose(f);
 	CHECK(bad == 0, "%d lines are indented wrongly", bad);
-	CHECK(toggles == 4 && members == SQ_N - 5, "4 toggles and %d members were written (got %d toggles, %d members)", SQ_N - 5, toggles, members);
+	CHECK(toggles == 5 && members == SQ_N - 6, "5 toggles and %d members were written (got %d toggles, %d members)", SQ_N - 6, toggles, members);
 	struct sq_cfg d;
 	sq_load(path, &d);
 	CHECK(d.v[SQ_DIM_TINT] == 0 && fabs(d.v[SQ_TARGET] - 0.33) < 1e-9, "indented lines load");
@@ -1649,7 +1649,8 @@ static void test_groups(void) {
 		if (sq_params[i].type == SQ_STR) continue;
 		CHECK(sq_clamp(i, sq_params[i].def) == sq_params[i].def, "the default of %s is inside its range", sq_params[i].key);
 		if (sq_params[i].type == SQ_BOOL) {
-			bool on = i == SQ_ENABLED || i == SQ_BRIGHTNESS;
+			// rgb_horizontal and rgb_vertical are on/off members of the rgb group, not toggles.
+			bool on = i == SQ_ENABLED || i == SQ_BRIGHTNESS || i == SQ_RGB_HORIZONTAL || i == SQ_RGB_VERTICAL;
 			CHECK(sq_params[i].def == (on ? 1 : 0), "the default of toggle %s is %s", sq_params[i].key, on ? "on" : "off");
 		}
 	}
@@ -1675,9 +1676,9 @@ static void test_keys(void) {
 
 	struct sq_cfg c;
 	sq_defaults(&c);
-	for (int i = SQ_KEY_ENABLED; i <= SQ_KEY_STATIC; i++) {
+	for (int i = SQ_KEY_ENABLED; i <= SQ_KEY_RGB_EFFECT; i++) {
 		CHECK(c.s[i][0] != '\0' && sq_params[i].type == SQ_STR && sq_group(i) == SQ_SHORTCUTS, "%s is a text setting with a default key, in the shortcuts group", sq_params[i].key);
-		CHECK(sq_key_target(i) >= 0 && sq_params[sq_key_target(i)].type == SQ_BOOL, "%s flips an on/off setting", sq_params[i].key);
+		CHECK(sq_key_target(i) >= 0 && (sq_params[sq_key_target(i)].type == SQ_BOOL || sq_params[sq_key_target(i)].type == SQ_ENUM), "%s changes an on/off or enum setting", sq_params[i].key);
 	}
 	CHECK(sq_key_target(SQ_KEY_ENABLED) == SQ_ENABLED && sq_key_target(SQ_KEY_BRIGHTNESS) == SQ_BRIGHTNESS &&
 	          sq_key_target(SQ_KEY_DIM_TINT) == SQ_DIM_TINT && sq_key_target(SQ_KEY_STATIC) == SQ_STATIC && sq_key_target(SQ_TARGET) < 0,
@@ -1754,6 +1755,503 @@ static void test_damage_shapes(void) {
 	teardown();
 }
 
+// ---- RGB lines --------------------------------------------------------------------------
+
+static int px_at(int x, int y, int ch) { return img[((size_t)y * W + x) * 4 + ch]; }
+static bool inbox(const struct pl_mon *m, int x, int y) {
+	return x >= m->x && y >= m->y && x < m->x + m->w && y < m->y + m->h;
+}
+static bool same_px(int x1, int y1, int x2, int y2) {
+	for (int ch = 0; ch < 3; ch++)
+		if (abs(px_at(x1, y1, ch) - px_at(x2, y2, ch)) > 5) return false;
+	return true;
+}
+static double eluma(int x, int y) {
+	return 0.2126 * px_at(x, y, 0) / 255.0 + 0.7152 * px_at(x, y, 1) / 255.0 + 0.0722 * px_at(x, y, 2) / 255.0;
+}
+
+// Thin enough and different enough from at least one side, measured across the line.
+static bool cpu_cand(const struct pl_mon *m, int x, int y, int dir, int thick, double contrast) {
+	int ax = dir == 0 ? 0 : 1, ay = dir == 0 ? 1 : 0;  // across
+	int a = 1, b = 1;
+	for (; a <= thick; a++) {
+		int qx = x - ax * a, qy = y - ay * a;
+		if (!inbox(m, qx, qy) || !same_px(qx, qy, x, y)) break;
+	}
+	for (; b <= thick; b++) {
+		int qx = x + ax * b, qy = y + ay * b;
+		if (!inbox(m, qx, qy) || !same_px(qx, qy, x, y)) break;
+	}
+	int ax1 = x - ax * a, ay1 = y - ay * a, bx1 = x + ax * b, by1 = y + ay * b;
+	if (a + b - 1 > thick || !inbox(m, ax1, ay1) || !inbox(m, bx1, by1)) return false;
+	return fabs(eluma(ax1, ay1) - eluma(x, y)) >= contrast || fabs(eluma(bx1, by1) - eluma(x, y)) >= contrast;
+}
+
+// Candidates after a closing along the line: a maximum then a minimum over radius pixels,
+// with taps outside the monitor ignored. Then a window of X consecutive linked pixels through
+// each pixel, brute force.
+static void cpu_lines(const struct sq_cfg *c, bool *mask[2]) {
+	int X = (int)c->v[SQ_RGB_LINE_MIN_PX], thick = (int)c->v[SQ_RGB_LINE_THICK_PX];
+	double contrast = c->v[SQ_RGB_LINE_CONTRAST];
+	int radius = (thick + 1) / 2;
+	bool *cd = malloc((size_t)W * H), *ce = malloc((size_t)W * H), *cc = malloc((size_t)W * H);
+	for (int dir = 0; dir < 2; dir++) {
+		memset(mask[dir], 0, (size_t)W * H);
+		if (c->v[dir == 0 ? SQ_RGB_HORIZONTAL : SQ_RGB_VERTICAL] == 0) continue;
+		int dx = dir == 0 ? 1 : 0, dy = dir == 0 ? 0 : 1;
+		for (int mi = 0; mi < nmons; mi++) {
+			const struct pl_mon *m = &mons[mi];
+			for (int y = m->y; y < m->y + m->h; y++)
+				for (int x = m->x; x < m->x + m->w; x++) cc[(size_t)y * W + x] = cpu_cand(m, x, y, dir, thick, contrast);
+			for (int y = m->y; y < m->y + m->h; y++)
+				for (int x = m->x; x < m->x + m->w; x++) {
+					bool v = false;
+					for (int k = -radius; k <= radius; k++) {
+						int qx = x + dx * k, qy = y + dy * k;
+						if (inbox(m, qx, qy) && cc[(size_t)qy * W + qx]) v = true;
+					}
+					cd[(size_t)y * W + x] = v;
+				}
+			for (int y = m->y; y < m->y + m->h; y++)
+				for (int x = m->x; x < m->x + m->w; x++) {
+					bool v = true;
+					for (int k = -radius; k <= radius; k++) {
+						int qx = x + dx * k, qy = y + dy * k;
+						if (inbox(m, qx, qy) && !cd[(size_t)qy * W + qx]) v = false;
+					}
+					ce[(size_t)y * W + x] = v;
+				}
+			for (int y = m->y; y < m->y + m->h; y++)
+				for (int x = m->x; x < m->x + m->w; x++) {
+					// A window starts at (sx, sy) and covers X pixels along the line.
+					for (int back = 0; back < X; back++) {
+						int sx = x - dx * back, sy = y - dy * back;
+						bool ok = true;
+						for (int i = 0; i < X - 1 && ok; i++) {
+							int px = sx + dx * i, py = sy + dy * i, qx = px + dx, qy = py + dy;
+							ok = inbox(m, px, py) && inbox(m, qx, qy) && ce[(size_t)py * W + px] &&
+							     ce[(size_t)qy * W + qx] && same_px(px, py, qx, qy);
+						}
+						if (ok) {
+							mask[dir][(size_t)y * W + x] = true;
+							break;
+						}
+					}
+				}
+		}
+	}
+	free(cd);
+	free(ce);
+	free(cc);
+}
+
+// line_tex as the GPU holds it, indexed with X-down rows.
+static void read_lines(uint8_t *g) {
+	uint8_t *tmp = malloc((size_t)W * H * 2);
+	glBindTexture(GL_TEXTURE_2D, pl.line_tex);
+	glGetTexImage(GL_TEXTURE_2D, 0, GL_RG, GL_UNSIGNED_BYTE, tmp);
+	for (int y = 0; y < H; y++) memcpy(g + (size_t)y * W * 2, tmp + (size_t)(H - 1 - y) * W * 2, (size_t)W * 2);
+	free(tmp);
+}
+
+static struct sq_cfg rgb_cfg(void) {
+	struct sq_cfg c = base_cfg();
+	c.v[SQ_BRIGHTNESS] = 0;
+	c.v[SQ_DIM_TINT] = 0;
+	c.v[SQ_RGB] = 1;
+	c.v[SQ_RGB_EFFECT] = 0;
+	c.v[SQ_RGB_SPEED] = 1.0;
+	c.v[SQ_RGB_LUMA] = 1.0;
+	c.v[SQ_RGB_MIN_LUMA] = 0.0;
+	c.v[SQ_RGB_HUE] = 200;
+	c.v[SQ_RGB_HUE_SPAN] = 360;
+	c.v[SQ_RGB_SATURATION] = 1.0;
+	c.v[SQ_RGB_LENGTH_PX] = 60;
+	c.v[SQ_RGB_GAP_PX] = 60;
+	c.v[SQ_RGB_TAIL] = 0.0;
+	c.v[SQ_RGB_DIRECTION] = 0;
+	c.v[SQ_RGB_SYNC] = 1;
+	c.v[SQ_RGB_LINE_MIN_PX] = 48;
+	c.v[SQ_RGB_LINE_THICK_PX] = 3;
+	c.v[SQ_RGB_LINE_CONTRAST] = 0.15;
+	c.v[SQ_RGB_HORIZONTAL] = 1;
+	c.v[SQ_RGB_VERTICAL] = 1;
+	return c;
+}
+
+// White page with lines of gray 100: H1 1 px (y 20), H2 3 px (y 40 to 42), H3 4 px (y 60 to 63),
+// H4 short (y 80, 30 px), H5 low contrast gray 235 (y 100), V1 2 px wide and 60 long (x 200,
+// 201), V2 20 long (x 100).
+static void draw_lines_scene(void) {
+	put((struct pl_rect){0, 0, 240, 160}, 255, 255, 255);
+	put((struct pl_rect){10, 20, 230, 21}, 100, 100, 100);
+	put((struct pl_rect){10, 40, 230, 43}, 100, 100, 100);
+	put((struct pl_rect){10, 60, 230, 64}, 100, 100, 100);
+	put((struct pl_rect){10, 80, 40, 81}, 100, 100, 100);
+	put((struct pl_rect){10, 100, 150, 101}, 235, 235, 235);
+	put((struct pl_rect){200, 90, 202, 150}, 100, 100, 100);
+	put((struct pl_rect){100, 110, 101, 130}, 100, 100, 100);
+}
+
+static void compare_lines(const char *what, const struct sq_cfg *c) {
+	bool *m0 = malloc((size_t)W * H), *m1 = malloc((size_t)W * H);
+	bool *mm[2] = {m0, m1};
+	cpu_lines(c, mm);
+	uint8_t *g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	int bad = 0, first = -1;
+	for (int i = 0; i < W * H; i++)
+		for (int d = 0; d < 2; d++)
+			if ((g[i * 2 + d] > 127) != mm[d][i]) {
+				if (!bad++) first = i * 2 + d;
+			}
+	CHECK(bad == 0, "%s: %d line pixels differ from the CPU model, first at (%d,%d) channel %d", what, bad,
+	      first >= 0 ? (first / 2) % W : 0, first >= 0 ? (first / 2) / W : 0, first >= 0 ? first % 2 : 0);
+	free(m0);
+	free(m1);
+	free(g);
+}
+
+static void test_rgb_lines(void) {
+	printf("rgb line detection\n");
+	struct pl_mon m1[] = {{0, 0, 240, 160}};
+	setup(240, 160, m1, 1);
+	draw_lines_scene();
+	capture_full(0);
+	struct sq_cfg c = rgb_cfg();
+	render(&c, 0);
+	compare_lines("defaults", &c);
+	uint8_t *g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(100, 20, 0) && !MASK(100, 20, 1), "a 1 px horizontal line is marked horizontal only");
+	CHECK(MASK(10, 20, 0) && MASK(229, 20, 0) && !MASK(9, 20, 0) && !MASK(230, 20, 0), "the line is marked from end to end");
+	CHECK(MASK(100, 40, 0) && MASK(100, 41, 0) && MASK(100, 42, 0), "all three rows of a 3 px line");
+	CHECK(!MASK(100, 60, 0) && !MASK(100, 61, 0), "a 4 px band is too thick");
+	CHECK(!MASK(20, 80, 0), "30 px is too short");
+	CHECK(!MASK(100, 100, 0), "gray 235 on white is below the contrast limit");
+	CHECK(MASK(200, 120, 1) && MASK(201, 120, 1) && !MASK(200, 120, 0), "a 2 px vertical line is marked vertical only");
+	CHECK(!MASK(100, 120, 1), "a 20 px vertical line is too short");
+	CHECK(!MASK(150, 130, 0) && !MASK(150, 130, 1), "plain white is not a line");
+	free(g);
+	#undef MASK
+
+	struct sq_cfg d = c;
+	d.v[SQ_RGB_LINE_MIN_PX] = 16;
+	d.v[SQ_RGB_LINE_THICK_PX] = 5;
+	d.v[SQ_RGB_LINE_CONTRAST] = 0.05;
+	render(&d, 0.1);  // changed detection settings recompute the lines without new damage
+	compare_lines("min 16, thickness 5, contrast 0.05", &d);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(100, 61, 0) && MASK(20, 80, 0) && MASK(100, 100, 0) && MASK(100, 120, 1), "looser limits find the band, the short lines, and the faint line");
+	free(g);
+	#undef MASK
+
+	struct sq_cfg e = c;
+	e.v[SQ_RGB_VERTICAL] = 0;
+	render(&e, 0.2);
+	compare_lines("horizontal only", &e);
+	e.v[SQ_RGB_VERTICAL] = 1;
+	e.v[SQ_RGB_HORIZONTAL] = 0;
+	render(&e, 0.3);
+	compare_lines("vertical only", &e);
+	e.v[SQ_RGB_VERTICAL] = 0;
+	render(&e, 0.4);
+	compare_lines("neither direction", &e);
+	teardown();
+
+	// Contrast on one side is enough. These lines have a gray 110 region on one side and white
+	// on the other. The third line, gray 120 inside the gray 110 region, contrasts on neither side.
+	struct pl_mon m4[] = {{0, 0, 120, 100}};
+	setup(120, 100, m4, 1);
+	put((struct pl_rect){0, 0, 120, 100}, 255, 255, 255);
+	put((struct pl_rect){0, 31, 120, 70}, 110, 110, 110);
+	put((struct pl_rect){10, 30, 110, 31}, 100, 100, 100);
+	put((struct pl_rect){10, 70, 110, 71}, 100, 100, 100);
+	put((struct pl_rect){10, 50, 110, 51}, 120, 120, 120);
+	capture_full(0);
+	struct sq_cfg h = rgb_cfg();
+	render(&h, 0);
+	compare_lines("lines with low contrast on one side", &h);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(60, 30, 0) && MASK(60, 70, 0), "a line that contrasts on one side is a line");
+	CHECK(!MASK(60, 50, 0), "a line that contrasts on neither side is not a line");
+	free(g);
+	#undef MASK
+	teardown();
+
+	// Lines of one color cross without breaking each other.
+	struct pl_mon m5[] = {{0, 0, 200, 160}};
+	setup(200, 160, m5, 1);
+	put((struct pl_rect){0, 0, 200, 160}, 255, 255, 255);
+	for (int y = 20; y <= 140; y += 20) put((struct pl_rect){10, y, 190, y + 1}, 100, 100, 100);
+	put((struct pl_rect){100, 5, 101, 155}, 100, 100, 100);
+	capture_full(0);
+	struct sq_cfg x = rgb_cfg();
+	render(&x, 0);
+	compare_lines("a grid of lines", &x);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(100, 30, 1) && MASK(100, 20, 1) && MASK(100, 100, 1), "the vertical line is whole, 19 px between crossings and all");
+	CHECK(MASK(50, 40, 0) && MASK(100, 40, 0) && MASK(150, 40, 0), "the horizontal line is whole across the vertical one");
+	free(g);
+	#undef MASK
+	teardown();
+
+	// A line that runs across two monitors counts on each one separately.
+	struct pl_mon m2[] = {{0, 0, 120, 40}, {120, 0, 120, 40}};
+	setup(240, 40, m2, 2);
+	put((struct pl_rect){0, 0, 240, 40}, 255, 255, 255);
+	put((struct pl_rect){0, 20, 240, 21}, 100, 100, 100);
+	capture_full(0);
+	struct sq_cfg f = rgb_cfg();
+	f.v[SQ_RGB_LINE_MIN_PX] = 100;
+	render(&f, 0);
+	compare_lines("a line split over two monitors, long enough on each", &f);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(60, 20, 0) && MASK(119, 20, 0) && MASK(120, 20, 0) && MASK(200, 20, 0), "both halves are lines at 100 px");
+	free(g);
+	f.v[SQ_RGB_LINE_MIN_PX] = 130;
+	render(&f, 0.1);
+	compare_lines("a line split over two monitors, too short on each", &f);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	CHECK(!MASK(60, 20, 0) && !MASK(200, 20, 0), "the line does not count across the monitor edge");
+	free(g);
+	#undef MASK
+	teardown();
+}
+
+// Mean absolute difference between the pixel and a gray of the same value, as a measure of color.
+static int chroma(int x, int y) {
+	const uint8_t *p = at(x, y);
+	int hi = p[0] > p[1] ? p[0] : p[1], lo = p[0] < p[1] ? p[0] : p[1];
+	hi = hi > p[2] ? hi : p[2];
+	lo = lo < p[2] ? lo : p[2];
+	return hi - lo;
+}
+
+static void expect_lum(const char *what, int x, int y, double want, double tol) {
+	double got = lum(at(x, y));
+	CHECK(fabs(got - want) <= tol, "%s at (%d,%d): luminance %.4f, want %.4f (tol %.3f)", what, x, y, got, want, tol);
+}
+
+static void test_rgb_effects(void) {
+	printf("rgb effects\n");
+	struct pl_mon m1[] = {{0, 0, 240, 160}};
+	setup(240, 160, m1, 1);
+	draw_lines_scene();
+	capture_full(0);
+	struct sq_cfg c = rgb_cfg();
+	double L0 = lum((uint8_t[]){100, 100, 100});
+
+	// Solid: the luminance of the pixel it replaces, times rgb_luma.
+	render(&c, 100.0);
+	expect_lum("solid keeps the luminance", 100, 20, L0, 0.006);
+	CHECK(chroma(100, 20) > 40, "solid is colored (chroma %d)", chroma(100, 20));
+	expect_px("pixels that are not on a line are untouched", 120, 5, 255, 0);
+	expect_px("a short line is untouched", 20, 80, 100, 0);
+	c.v[SQ_RGB_LUMA] = 2.0;
+	render(&c, 100.1);
+	expect_lum("rgb_luma 2 doubles it", 100, 20, 2 * L0, 0.008);
+	c.v[SQ_RGB_LUMA] = 4.0;
+	render(&c, 100.2);
+	expect_lum("rgb_luma 4 keeps the exact luminance although blue runs out", 100, 20, 4 * L0, 0.01);
+	c.v[SQ_RGB_LUMA] = 1.0;
+
+	// Breathe: 0.1 + 0.9 * (0.5 + 0.5 sin(2 pi cycle)). The first render fixed cycle 0 at t = 100.
+	c.v[SQ_RGB_EFFECT] = 1;
+	render(&c, 100.0);
+	expect_lum("breathe at cycle 0", 100, 20, 0.55 * L0, 0.008);
+	render(&c, 100.25);
+	expect_lum("breathe at the top", 100, 20, L0, 0.008);
+	render(&c, 100.75);
+	expect_lum("breathe at the bottom", 100, 20, 0.1 * L0, 0.008);
+
+	// Snake: 60 px segments with 60 px gaps would be too dense to test; use 100 and 100.
+	c.v[SQ_RGB_EFFECT] = 3;
+	c.v[SQ_RGB_LENGTH_PX] = 100;
+	c.v[SQ_RGB_GAP_PX] = 100;
+	render(&c, 101.0);
+	expect_lum("snake body keeps the luminance", 150, 20, L0, 0.006);
+	CHECK(chroma(150, 20) > 40, "the snake body is colored");
+	expect_px("outside the snake the line is as it was", 50, 20, 100, 0);
+	c.v[SQ_RGB_DIRECTION] = 1;
+	render(&c, 101.0);
+	expect_px("backward: the lit and unlit parts swap", 150, 20, 100, 0);
+	CHECK(chroma(50, 20) > 40, "backward: the first part is lit");
+	c.v[SQ_RGB_DIRECTION] = 0;
+	render(&c, 101.5);  // half a cycle: the head has moved 100 px
+	expect_px("the segment has moved on", 150, 20, 100, 0);
+	CHECK(chroma(50, 20) > 40, "the segment reached the other half");
+
+	// Rainbow: one hue cycle every rgb_length_px.
+	c.v[SQ_RGB_EFFECT] = 2;
+	c.v[SQ_RGB_LENGTH_PX] = 60;
+	render(&c, 102.0);
+	const uint8_t a1[3] = {at(40, 20)[0], at(40, 20)[1], at(40, 20)[2]};
+	const uint8_t a2[3] = {at(100, 20)[0], at(100, 20)[1], at(100, 20)[2]};
+	const uint8_t a3[3] = {at(70, 20)[0], at(70, 20)[1], at(70, 20)[2]};
+	CHECK(abs(a1[0] - a2[0]) + abs(a1[1] - a2[1]) + abs(a1[2] - a2[2]) <= 6, "rainbow repeats every length: %d,%d,%d and %d,%d,%d", a1[0], a1[1], a1[2], a2[0], a2[1], a2[2]);
+	CHECK(abs(a1[0] - a3[0]) + abs(a1[1] - a3[1]) + abs(a1[2] - a3[2]) > 60, "half a length away the hue differs");
+	expect_lum("rainbow keeps the luminance", 40, 20, L0, 0.008);
+	expect_lum("rainbow keeps the luminance elsewhere", 70, 20, L0, 0.008);
+	render(&c, 102.25);
+	CHECK(abs(at(40, 20)[0] - a1[0]) + abs(at(40, 20)[1] - a1[1]) + abs(at(40, 20)[2] - a1[2]) > 40, "rainbow moves with time");
+
+	// Wave: brightness 0.2 to 1 along the line, one cycle per length.
+	c.v[SQ_RGB_EFFECT] = 4;
+	c.v[SQ_RGB_LENGTH_PX] = 80;
+	render(&c, 103.0);
+	double hi = lum(at(20, 20)), lo = lum(at(60, 20));
+	CHECK(hi > 0.9 * L0 && lo / hi > 0.17 && lo / hi < 0.24, "wave crest %.4f and trough %.4f", hi, lo);
+
+	// Phase: in step with rgb_sync, apart without it.
+	double l1 = lum(at(20, 20)), l2 = lum(at(20, 41));
+	CHECK(fabs(l1 - l2) < 0.006, "synced lines match: %.4f vs %.4f", l1, l2);
+	c.v[SQ_RGB_SYNC] = 0;
+	render(&c, 103.0);
+	l1 = lum(at(20, 20));
+	l2 = lum(at(20, 41));
+	CHECK(fabs(l1 - l2) > 0.01, "unsynced lines differ: %.4f vs %.4f", l1, l2);
+	c.v[SQ_RGB_SYNC] = 1;
+
+	// Directions off, switch off, master off.
+	c.v[SQ_RGB_EFFECT] = 0;
+	c.v[SQ_RGB_VERTICAL] = 0;
+	render(&c, 104.0);
+	expect_px("vertical off leaves the vertical line", 200, 120, 100, 0);
+	CHECK(chroma(100, 20) > 40, "horizontal lines are still lit");
+	c.v[SQ_RGB_VERTICAL] = 1;
+	c.v[SQ_RGB] = 0;
+	render(&c, 104.1);
+	CHECK(memcmp(out, img, (size_t)W * H * 4) == 0, "rgb off changes nothing");
+	c.v[SQ_RGB] = 1;
+	c.v[SQ_ENABLED] = 0;
+	render(&c, 104.2);
+	CHECK(memcmp(out, img, (size_t)W * H * 4) == 0, "enabled off overrides rgb");
+	c.v[SQ_ENABLED] = 1;
+	render(&c, 104.3);
+	CHECK(chroma(100, 20) > 40, "rgb comes back");
+
+	// Active: moving effects keep the timer running, solid does not.
+	pl.last_input = 0;
+	c.v[SQ_RGB_EFFECT] = 0;
+	CHECK(!pl_active(&pl, &c, 500.0), "solid needs no timer ticks");
+	c.v[SQ_RGB_EFFECT] = 3;
+	CHECK(pl_active(&pl, &c, 500.0), "snake needs timer ticks");
+	teardown();
+
+	// The line is recolored after dimming and from the dimmed luminance.
+	struct pl_mon m3[] = {{0, 0, 120, 40}};
+	setup(120, 40, m3, 1);
+	put((struct pl_rect){0, 0, 120, 40}, 0, 0, 0);
+	put((struct pl_rect){10, 20, 110, 21}, 255, 255, 255);
+	capture_full(0);
+	struct sq_cfg w = rgb_cfg();
+	w.v[SQ_RGB_LUMA] = 1.0;
+	render(&w, 0);
+	CHECK(at(60, 20)[0] >= 252 && at(60, 20)[1] >= 252 && at(60, 20)[2] >= 252, "a white line stays white at luma 1 (%d,%d,%d)", at(60, 20)[0], at(60, 20)[1], at(60, 20)[2]);
+	w.v[SQ_BRIGHTNESS] = 1;
+	w.v[SQ_TARGET] = 0.3;
+	w.v[SQ_TARGET_LARGE] = 0.3;
+	w.v[SQ_MIN_GAIN] = 0.05;
+	w.v[SQ_FALLOFF_PX] = 0;
+	render(&w, 0.1);
+	expect_lum("a dimmed white line takes the dimmed luminance", 60, 20, 0.3, 0.012);
+	w.v[SQ_RGB_LUMA] = 2.0;
+	render(&w, 0.2);
+	expect_lum("rgb_luma 2 raises the dimmed luminance", 60, 20, 0.6, 0.015);
+	teardown();
+
+	// A saturated blue cannot be as bright as gray 200, so it turns paler and keeps the luminance.
+	setup(120, 40, m3, 1);
+	put((struct pl_rect){0, 0, 120, 40}, 0, 0, 0);
+	put((struct pl_rect){10, 20, 110, 21}, 200, 200, 200);
+	capture_full(0);
+	struct sq_cfg b = rgb_cfg();
+	b.v[SQ_RGB_HUE] = 240;
+	render(&b, 0);
+	expect_lum("blue at the luminance of gray 200", 60, 20, lum((uint8_t[]){200, 200, 200}), 0.01);
+	CHECK(at(60, 20)[2] > at(60, 20)[0] + 20, "it is still bluish (%d,%d,%d)", at(60, 20)[0], at(60, 20)[1], at(60, 20)[2]);
+	b.v[SQ_RGB_SATURATION] = 0.0;
+	render(&b, 0.1);
+	CHECK(chroma(60, 20) <= 2, "saturation 0 is gray");
+	expect_lum("and keeps the luminance", 60, 20, lum((uint8_t[]){200, 200, 200}), 0.01);
+	teardown();
+
+	// rgb_min_luma lets a black line light up.
+	setup(120, 40, m3, 1);
+	put((struct pl_rect){0, 0, 120, 40}, 255, 255, 255);
+	put((struct pl_rect){10, 20, 110, 21}, 0, 0, 0);
+	capture_full(0);
+	struct sq_cfg k = rgb_cfg();
+	render(&k, 0);
+	expect_px("a black line stays black by default", 60, 20, 0, 2);
+	k.v[SQ_RGB_MIN_LUMA] = 0.3;
+	render(&k, 0.1);
+	expect_lum("rgb_min_luma gives it a floor", 60, 20, 0.3, 0.01);
+	teardown();
+}
+
+static void test_rgb_config(void) {
+	printf("rgb settings\n");
+	struct sq_cfg c;
+	sq_defaults(&c);
+	CHECK(c.v[SQ_RGB] == 0, "rgb is off by default");
+	CHECK(sq_is_toggle(SQ_RGB) && sq_group(SQ_RGB) < 0 && sq_group(SQ_RGB_EFFECT) == SQ_RGB && sq_group(SQ_RGB_VERTICAL) == SQ_RGB &&
+	          sq_group(SQ_SHORTCUTS) < 0,
+	      "rgb is a toggle that owns the settings up to rgb_vertical");
+	CHECK(sq_params[SQ_RGB_EFFECT].type == SQ_ENUM && sq_params[SQ_RGB_DIRECTION].type == SQ_ENUM, "effect and direction are enums");
+	CHECK(sq_set(&c, "rgb_effect", "snake") && c.v[SQ_RGB_EFFECT] == 3, "an effect is set by name");
+	CHECK(sq_set(&c, "rgb_effect", "WAVE") && c.v[SQ_RGB_EFFECT] == 4, "names match in any case");
+	CHECK(sq_set(&c, "rgb_effect", "1") && c.v[SQ_RGB_EFFECT] == 1, "an index works too");
+	CHECK(sq_set(&c, "rgb_effect", "9") && c.v[SQ_RGB_EFFECT] == 4, "an index past the end is clamped");
+	CHECK(!sq_set(&c, "rgb_effect", "disco") && c.v[SQ_RGB_EFFECT] == 4, "an unknown name is rejected");
+	char v[SQ_STRLEN];
+	sq_format_cfg(&c, SQ_RGB_EFFECT, v, sizeof v);
+	CHECK(!strcmp(v, "wave"), "it is shown by name: %s", v);
+	sq_format_value(SQ_RGB_DIRECTION, 2, v, sizeof v);
+	CHECK(!strcmp(v, "alternate"), "the last direction is named: %s", v);
+	sq_format_value(SQ_RGB_EFFECT, sq_params[SQ_RGB_EFFECT].min, v, sizeof v);
+	CHECK(!strcmp(v, "solid"), "the range starts at solid: %s", v);
+	CHECK(sq_set(&c, "rgb", "true") && sq_set(&c, "rgb_direction", "alternate") && sq_set(&c, "rgb_line_thick_px", "9") &&
+	          c.v[SQ_RGB_LINE_THICK_PX] == 5,
+	      "thickness is limited to 5");
+	const char *path = "/tmp/squint-rgb-test.conf";
+	CHECK(sq_save(path, &c) == 0, "save");
+	FILE *f = fopen(path, "r");
+	char line[200], all[6000] = "";
+	while (fgets(line, sizeof line, f)) strncat(all, line, sizeof all - strlen(all) - 1);
+	fclose(f);
+	CHECK(strstr(all, "\nrgb = true\n  rgb_effect = wave\n  rgb_speed = ") && strstr(all, "  rgb_direction = alternate\n"),
+	      "the file holds the names, indented under rgb");
+	struct sq_cfg d;
+	sq_load(path, &d);
+	CHECK(d.v[SQ_RGB] == 1 && d.v[SQ_RGB_EFFECT] == 4 && d.v[SQ_RGB_DIRECTION] == 2, "the names load back");
+	unlink(path);
+	CHECK(!strcmp(sq_params[SQ_KEY_RGB].sdef, "Super+F5") && !strcmp(sq_params[SQ_KEY_RGB_EFFECT].sdef, "Super+F6"), "the default keys are Super+F5 and Super+F6");
+	CHECK(sq_key_target(SQ_KEY_RGB) == SQ_RGB && sq_params[SQ_RGB].type == SQ_BOOL, "key_rgb flips rgb");
+	CHECK(sq_key_target(SQ_KEY_RGB_EFFECT) == SQ_RGB_EFFECT && sq_params[SQ_RGB_EFFECT].type == SQ_ENUM, "key_rgb_effect steps the effect");
+	for (int i = 0; i < SQ_N; i++) {
+		if (sq_params[i].type == SQ_ENUM) {
+			char first[SQ_STRLEN], last[SQ_STRLEN];
+			sq_enum_name(i, (int)sq_params[i].min, first, sizeof first);
+			sq_enum_name(i, (int)sq_params[i].max, last, sizeof last);
+			CHECK(sq_enum_find(i, first) == (int)sq_params[i].min && sq_enum_find(i, last) == (int)sq_params[i].max &&
+			          sq_params[i].def >= sq_params[i].min && sq_params[i].def <= sq_params[i].max,
+			      "the names of %s match its range", sq_params[i].key);
+		}
+	}
+}
+
 int main(void) {
 	make_context();
 	test_cone();
@@ -1771,6 +2269,9 @@ int main(void) {
 	test_keys();
 	test_toggles();
 	test_damage_shapes();
+	test_rgb_config();
+	test_rgb_lines();
+	test_rgb_effects();
 	printf("\n%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }

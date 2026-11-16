@@ -52,16 +52,38 @@ enum {
 	SQ_STATIC_SCANLINES,
 	SQ_STATIC_SMEAR,
 	SQ_STATIC_JITTER_PX,
+	SQ_RGB,
+	SQ_RGB_EFFECT,
+	SQ_RGB_SPEED,
+	SQ_RGB_LUMA,
+	SQ_RGB_MIN_LUMA,
+	SQ_RGB_HUE,
+	SQ_RGB_HUE_SPAN,
+	SQ_RGB_SATURATION,
+	SQ_RGB_LENGTH_PX,
+	SQ_RGB_GAP_PX,
+	SQ_RGB_TAIL,
+	SQ_RGB_DIRECTION,
+	SQ_RGB_SYNC,
+	SQ_RGB_LINE_MIN_PX,
+	SQ_RGB_LINE_THICK_PX,
+	SQ_RGB_LINE_CONTRAST,
+	SQ_RGB_HORIZONTAL,
+	SQ_RGB_VERTICAL,
 	SQ_SHORTCUTS,
 	SQ_KEY_ENABLED,
 	SQ_KEY_BRIGHTNESS,
 	SQ_KEY_DIM_TINT,
 	SQ_KEY_STATIC,
+	SQ_KEY_RGB,
+	SQ_KEY_RGB_EFFECT,
 	SQ_N
 };
 
 
-enum sq_type { SQ_BOOL, SQ_FLOAT, SQ_INT, SQ_STR };
+// An SQ_ENUM setting holds the index of one of the names in sq_param.names, and the file
+// writes the name.
+enum sq_type { SQ_BOOL, SQ_FLOAT, SQ_INT, SQ_STR, SQ_ENUM };
 
 #define SQ_STRLEN 48  // longest text setting, including the terminator
 
@@ -77,23 +99,29 @@ static inline int sq_group(int i) {
 	if (i > SQ_STATIC && i <= SQ_STATIC_JITTER_PX) {
 		return SQ_STATIC;
 	}
-	if (i > SQ_SHORTCUTS && i <= SQ_KEY_STATIC) {
+	if (i > SQ_RGB && i <= SQ_RGB_VERTICAL) {
+		return SQ_RGB;
+	}
+	if (i > SQ_SHORTCUTS && i <= SQ_KEY_RGB_EFFECT) {
 		return SQ_SHORTCUTS;
 	}
 	return -1;
 }
 
 static inline bool sq_is_toggle(int i) {
-	return i == SQ_BRIGHTNESS || i == SQ_DIM_TINT || i == SQ_STATIC || i == SQ_SHORTCUTS;
+	return i == SQ_BRIGHTNESS || i == SQ_DIM_TINT || i == SQ_STATIC || i == SQ_RGB || i == SQ_SHORTCUTS;
 }
 
-// The toggle a shortcut key flips, or -1 if i is not a shortcut setting.
+// The setting a shortcut key changes, or -1 if i is not a shortcut setting. Keys flip an on/off
+// setting, except key_rgb_effect, which steps rgb_effect to the next effect.
 static inline int sq_key_target(int i) {
 	switch (i) {
 	case SQ_KEY_ENABLED: return SQ_ENABLED;
 	case SQ_KEY_BRIGHTNESS: return SQ_BRIGHTNESS;
 	case SQ_KEY_DIM_TINT: return SQ_DIM_TINT;
 	case SQ_KEY_STATIC: return SQ_STATIC;
+	case SQ_KEY_RGB: return SQ_RGB;
+	case SQ_KEY_RGB_EFFECT: return SQ_RGB_EFFECT;
 	default: return -1;
 	}
 }
@@ -103,7 +131,8 @@ struct sq_param {
 	enum sq_type type;
 	double def, min, max, step;
 	const char *help;
-	const char *sdef;  // default of a text setting, NULL for empty
+	const char *sdef;   // default of a text setting, NULL for empty
+	const char *names;  // the names of an SQ_ENUM setting, separated by commas
 };
 
 static const struct sq_param sq_params[SQ_N] = {
@@ -168,6 +197,42 @@ static const struct sq_param sq_params[SQ_N] = {
                          "Stretches speckles sideways. 1 is round."},
     [SQ_STATIC_JITTER_PX] = {"static_jitter_px", SQ_FLOAT, 0.5, 0.0, 4.0, 0.1,
                              "Random sideways shift of each row, in pixels, for a slight tracking wobble."},
+    [SQ_RGB] = {"rgb", SQ_BOOL, 0, 0, 1, 1,
+                "Light thin straight lines on screen with moving color. Off leaves them alone; the settings below only apply while on."},
+    [SQ_RGB_EFFECT] = {"rgb_effect", SQ_ENUM, 2, 0, 4, 1,
+                       "solid: one color. breathe: the color fades in and out. rainbow: hue travels along each line. snake: a lit segment travels along each line. wave: brightness ripples travel along each line.",
+                       NULL, "solid,breathe,rainbow,snake,wave"},
+    [SQ_RGB_SPEED] = {"rgb_speed", SQ_FLOAT, 0.5, 0.1, 5.0, 0.1,
+                      "Cycles per second for breathe, and for how fast rainbow, snake, and wave travel."},
+    [SQ_RGB_LUMA] = {"rgb_luma", SQ_FLOAT, 1.0, 0.1, 4.0, 0.05,
+                     "Brightness of the color as a multiple of the brightness of the pixel it replaces, after dimming. 1 keeps it, 2 doubles it up to white."},
+    [SQ_RGB_MIN_LUMA] = {"rgb_min_luma", SQ_FLOAT, 0.0, 0.0, 1.0, 0.01,
+                         "Lowest brightness a line starts from before rgb_luma applies, so dark lines can light up. 0 keeps dark lines dark."},
+    [SQ_RGB_HUE] = {"rgb_hue", SQ_INT, 200, 0, 359, 5,
+                    "Base hue in degrees: 0 red, 120 green, 240 blue. Rainbow starts here."},
+    [SQ_RGB_HUE_SPAN] = {"rgb_hue_span", SQ_INT, 360, 0, 360, 10,
+                         "Degrees of hue that rainbow and snake sweep through. 360 covers the whole wheel."},
+    [SQ_RGB_SATURATION] = {"rgb_saturation", SQ_FLOAT, 1.0, 0.0, 1.0, 0.05,
+                           "Color strength, up to 1. Bright colors that cannot reach the wanted brightness turn paler."},
+    [SQ_RGB_LENGTH_PX] = {"rgb_length_px", SQ_INT, 120, 10, 1000, 10,
+                          "Length in pixels of one rainbow or wave cycle, or of the lit snake segment."},
+    [SQ_RGB_GAP_PX] = {"rgb_gap_px", SQ_INT, 200, 0, 2000, 20,
+                       "Unlit pixels between snake segments."},
+    [SQ_RGB_TAIL] = {"rgb_tail", SQ_FLOAT, 0.6, 0.0, 1.0, 0.05,
+                     "How softly a snake fades toward its tail. 0 is a hard block, 1 fades evenly."},
+    [SQ_RGB_DIRECTION] = {"rgb_direction", SQ_ENUM, 0, 0, 2, 1,
+                          "Which way motion runs along a line. alternate reverses it on every other line.",
+                          NULL, "forward,backward,alternate"},
+    [SQ_RGB_SYNC] = {"rgb_sync", SQ_BOOL, 0, 0, 1, 1,
+                     "On: every line moves in step. Off: each line has its own phase."},
+    [SQ_RGB_LINE_MIN_PX] = {"rgb_line_min_px", SQ_INT, 48, 8, 256, 4,
+                            "Shortest run of same-colored pixels that counts as a line."},
+    [SQ_RGB_LINE_THICK_PX] = {"rgb_line_thick_px", SQ_INT, 3, 1, 5, 1,
+                              "Thickest line to light. A band thicker than this is not a line."},
+    [SQ_RGB_LINE_CONTRAST] = {"rgb_line_contrast", SQ_FLOAT, 0.15, 0.02, 1.0, 0.01,
+                              "How much brighter or darker than the pixels on both sides a line must be."},
+    [SQ_RGB_HORIZONTAL] = {"rgb_horizontal", SQ_BOOL, 1, 0, 1, 1, "Light horizontal lines."},
+    [SQ_RGB_VERTICAL] = {"rgb_vertical", SQ_BOOL, 1, 0, 1, 1, "Light vertical lines."},
     [SQ_SHORTCUTS] = {"shortcuts", SQ_BOOL, 0, 0, 1, 1,
                       "Turn on to listen for the shortcut keys below. Off releases every key."},
     [SQ_KEY_ENABLED] = {"key_enabled", SQ_STR, 0, 0, 0, 0,
@@ -178,6 +243,10 @@ static const struct sq_param sq_params[SQ_N] = {
                          "Key that flips dim_tint. Empty means none.", "Super+F3"},
     [SQ_KEY_STATIC] = {"key_static", SQ_STR, 0, 0, 0, 0,
                        "Key that flips static. Empty means none.", "Super+F4"},
+    [SQ_KEY_RGB] = {"key_rgb", SQ_STR, 0, 0, 0, 0,
+                    "Key that flips rgb. Empty means none.", "Super+F5"},
+    [SQ_KEY_RGB_EFFECT] = {"key_rgb_effect", SQ_STR, 0, 0, 0, 0,
+                           "Key that switches rgb_effect to the next effect. Empty means none.", "Super+F6"},
 };
 
 struct sq_cfg {
@@ -193,7 +262,7 @@ static inline double sq_clamp(int i, double x) {
 	if (x > p->max) {
 		x = p->max;
 	}
-	if (p->type == SQ_INT || p->type == SQ_BOOL) {
+	if (p->type == SQ_INT || p->type == SQ_BOOL || p->type == SQ_ENUM) {
 		x = floor(x + 0.5);
 	}
 	return x;
@@ -238,7 +307,43 @@ static inline int sq_find(const char *key) {
 	return -1;
 }
 
+// Index of the name s (any case) among the names of enum setting i, or -1.
+static inline int sq_enum_find(int i, const char *s) {
+	const char *n = sq_params[i].names;
+	for (int k = 0; n && *n; k++) {
+		const char *comma = strchr(n, ',');
+		size_t len = comma ? (size_t)(comma - n) : strlen(n);
+		if (strlen(s) == len && !strncasecmp(s, n, len)) {
+			return k;
+		}
+		n += len + (comma ? 1 : 0);
+	}
+	return -1;
+}
+
+// Writes the name of choice idx of enum setting i. An index out of range writes the number.
+static inline void sq_enum_name(int i, int idx, char *buf, size_t bufn) {
+	const char *n = sq_params[i].names;
+	for (int k = 0; n && *n; k++) {
+		const char *comma = strchr(n, ',');
+		size_t len = comma ? (size_t)(comma - n) : strlen(n);
+		if (k == idx) {
+			snprintf(buf, bufn, "%.*s", (int)len, n);
+			return;
+		}
+		n += len + (comma ? 1 : 0);
+	}
+	snprintf(buf, bufn, "%d", idx);
+}
+
 static inline bool sq_parse_value(int i, const char *s, double *out) {
+	if (sq_params[i].type == SQ_ENUM) {
+		int k = sq_enum_find(i, s);
+		if (k >= 0) {
+			*out = k;
+			return true;
+		}
+	}
 	if (sq_params[i].type == SQ_BOOL) {
 		if (!strcmp(s, "true") || !strcmp(s, "on") || !strcmp(s, "1")) {
 			*out = 1;
@@ -384,6 +489,7 @@ static inline void sq_format_value(int i, double x, char *buf, size_t n) {
 	switch (sq_params[i].type) {
 	case SQ_BOOL: snprintf(buf, n, "%s", x != 0 ? "true" : "false"); break;
 	case SQ_INT: snprintf(buf, n, "%d", (int)x); break;
+	case SQ_ENUM: sq_enum_name(i, (int)x, buf, n); break;
 	default: snprintf(buf, n, "%.2f", x); break;
 	}
 }

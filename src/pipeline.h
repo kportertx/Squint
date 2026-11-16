@@ -43,6 +43,7 @@
 
 #define PL_MAXMON 8
 #define PL_LR 4  // the size field is computed at 1/PL_LR resolution
+#define PL_NPROG 13
 
 struct pl_rect {
 	int x1, y1, x2, y2;  // half open
@@ -58,7 +59,7 @@ struct pl {
 	GLenum read_buf, draw_buf;
 
 	bool ready;
-	GLuint vao, fbo, prog[9];
+	GLuint vao, fbo, prog[PL_NPROG];
 	GLuint samp_nearest, samp_linear;
 
 	int W, H;
@@ -70,12 +71,15 @@ struct pl {
 	GLuint rlr_a, rlr_b;    // RG16F at 1/PL_LR resolution: blurred (brightness, gamma strength)
 	GLuint rs[2];           // RG16F at 1/PL_LR resolution: the ramp state, what was displayed
 	GLuint rlr_p;           // RG16F at 1/PL_LR resolution: the previous frame's means
+	GLuint line_tex;        // RG8: red marks horizontal line pixels, green vertical ones
 	GLuint scn[2];          // RG32F PL_MAXMON x 1: per monitor, until when (seconds since t0)
 	                        // darkening (red) and brightening (green) smoothing stay armed
 	int scur;
 	int lrW, lrH;
 	int cur, rcur;
 	bool s_valid, st_valid, rs_valid, dirty, prev_valid, means_valid;
+	bool ldirty, line_valid;  // line_tex must be recomputed; line_tex holds the current lines
+	double used_lmin, used_lthick, used_lcontrast, used_lh, used_lv;
 
 	struct pl_mon mon[PL_MAXMON];
 	float tint[3];  // whole-screen color multipliers, 1 = unchanged
@@ -89,7 +93,7 @@ struct pl {
 	double last_input, last_smooth, last_ramp, t0;
 };
 
-enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL, PL_DOWN, PL_BOX, PL_RDOWN, PL_RAMP, PL_SCENE };
+enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL, PL_DOWN, PL_BOX, PL_RDOWN, PL_RAMP, PL_SCENE, PL_LINEC, PL_LINER, PL_LSTEP, PL_LCLOSE };
 
 static void (*pl_logger)(const char *msg);
 
@@ -313,6 +317,106 @@ static const char *pl_fs_scene =
     "  o = hit ? vec2(dur_d > 0.0 ? t_rel + dur_d : prev.x, dur_b > 0.0 ? t_rel + dur_b : prev.y) : prev;\n"
     "}\n";
 
+// Line detection. A horizontal line is a band of at most `thick` rows of one color, at least
+// `min_px` pixels long, with a row on at least one side that differs from it in encoded luma
+// by at least `contrast`. One side is enough because a window border or a scroll bar often
+// touches a nearly matching color on one side. Vertical lines are the same with the axes
+// swapped. `along` is the axis of the
+// line, so the thickness is measured across it. Pixels are the same color when no channel
+// differs by more than 0.02. Taps outside the monitor box (x0, y0, x1, y1, end exclusive) never
+// count, so a line stops at the edge of its monitor.
+#define PL_LINE_COMMON                                                                     \
+	"uniform ivec4 box;\n"                                                             \
+	"bool inb(ivec2 p) { return p.x >= box.x && p.y >= box.y && p.x < box.z && p.y < box.w; }\n" \
+	"bool same(vec3 a, vec3 b) { return all(lessThanEqual(abs(a - b), vec3(0.02))); }\n"
+
+// Marks the pixels that could belong to a line because of their thickness and contrast.
+static const char *pl_fs_linec =
+    PL_COMMON
+    PL_LINE_COMMON
+    "uniform sampler2D S;\n"
+    "uniform ivec2 along;\n"
+    "uniform int thick;\n"
+    "uniform float contrast;\n"
+    "out float o;\n"
+    "void main() {\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "  ivec2 across = ivec2(along.y, along.x);\n"
+    "  vec3 c = texelFetch(S, p, 0).rgb;\n"
+    "  int a = 1, b = 1;\n"
+    "  for (; a <= thick; a++) {\n"
+    "    ivec2 q = p - across * a;\n"
+    "    if (!inb(q) || !same(texelFetch(S, q, 0).rgb, c)) break;\n"
+    "  }\n"
+    "  for (; b <= thick; b++) {\n"
+    "    ivec2 q = p + across * b;\n"
+    "    if (!inb(q) || !same(texelFetch(S, q, 0).rgb, c)) break;\n"
+    "  }\n"
+    "  ivec2 qa = p - across * a, qb = p + across * b;\n"
+    "  bool ok = a + b - 1 <= thick && inb(qa) && inb(qb);\n"
+    "  if (ok) {\n"
+    "    float l = dot(c, W709);\n"
+    "    ok = abs(dot(texelFetch(S, qa, 0).rgb, W709) - l) >= contrast ||\n"
+    "         abs(dot(texelFetch(S, qb, 0).rgb, W709) - l) >= contrast;\n"
+    "  }\n"
+    "  o = ok ? 1.0 : 0.0;\n"
+    "}\n";
+
+// A line crossed by another line of the same color is not a candidate at the crossing,
+// because the crossing line makes the band look thick there. A closing along the line, a
+// maximum then a minimum over radius pixels (mode 1, then mode 0), fills crossings up to
+// 2 * radius pixels wide. Taps outside the monitor box do not count either way.
+static const char *pl_fs_lclose =
+    PL_COMMON
+    PL_LINE_COMMON
+    "uniform sampler2D src;\n"
+    "uniform ivec2 along;\n"
+    "uniform int radius, mode;\n"
+    "out float o;\n"
+    "void main() {\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "  float acc = mode == 1 ? 0.0 : 1.0;\n"
+    "  for (int k = -radius; k <= radius; k++) {\n"
+    "    ivec2 q = p + along * k;\n"
+    "    float v = inb(q) ? texelFetch(src, q, 0).r : acc;\n"
+    "    acc = mode == 1 ? max(acc, v) : min(acc, v);\n"
+    "  }\n"
+    "  o = acc;\n"
+    "}\n";
+
+// 1 where this pixel and the next one along the line are both candidates of the same color.
+static const char *pl_fs_liner =
+    PL_COMMON
+    PL_LINE_COMMON
+    "uniform sampler2D S, C;\n"
+    "uniform ivec2 along;\n"
+    "out float o;\n"
+    "void main() {\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy), q = p + along;\n"
+    "  bool ok = inb(q) && texelFetch(C, p, 0).r > 0.5 && texelFetch(C, q, 0).r > 0.5 &&\n"
+    "            same(texelFetch(S, p, 0).rgb, texelFetch(S, q, 0).rgb);\n"
+    "  o = ok ? 1.0 : 0.0;\n"
+    "}\n";
+
+// min (mode 0) or max (mode 1) of the pixel and the pixel `off` steps along the line, with
+// taps outside the monitor box counting as 0. The result goes to both channels scaled by
+// `mask`, which lets the last pass write one channel of the line texture.
+static const char *pl_fs_lstep =
+    PL_COMMON
+    PL_LINE_COMMON
+    "uniform sampler2D src;\n"
+    "uniform ivec2 along;\n"
+    "uniform int off, mode;\n"
+    "uniform vec2 mask;\n"
+    "out vec4 o;\n"
+    "float tap(ivec2 p) { return inb(p) ? texelFetch(src, p, 0).r : 0.0; }\n"
+    "void main() {\n"
+    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "  float a = tap(p), b = tap(p + along * off);\n"
+    "  float v = mode == 1 ? max(a, b) : min(a, b);\n"
+    "  o = vec4(v * mask.x, v * mask.y, 0.0, 0.0);\n"
+    "}\n";
+
 // With use_ramp, new content is scaled by s = displayed / new brightness (at most 1) and
 // its gamma strength is shifted by the difference between the displayed and the new
 // strength. Both are blurred quantities and apply with weight w = d / 0.1 (at most 1), so
@@ -321,6 +425,16 @@ static const char *pl_fs_scene =
 // dimming strength, before any ramp shift. tint multiplies every pixel of the monitors and
 // is skipped, so pixels stay bit-exact, when it is 1 on all channels. enabled switches
 // off everything, tint and static included.
+//
+// RGB lines recolor the pixels that line_tex marks, after dimming and tint and before
+// static. The new color keeps the luminance of the pixel it replaces, raised to
+// max(L, rgb_minl) and multiplied by rgb_luma, at most 1. A hue and saturation set the
+// direction of the color. When that color cannot reach the luminance without a channel over 1
+// (blue tops out near 7%), it is mixed toward gray of the same luminance until it fits, so
+// the luminance is exact and only the saturation gives way. u is the position along the
+// line and v the position across it. Lines that do not share a phase are offset by 13 px
+// per pixel of v. rgb_cyc is the fraction of the current cycle, 0 to 1, computed on the CPU in
+// double precision so a long uptime does not blur the animation.
 //
 // Static is mixed in last, in encoded color: out = mix(color, noise, static_amt). Every
 // update (static_hz times a second) draws a fresh, independent pattern: the frame number
@@ -332,8 +446,10 @@ static const char *pl_fs_scene =
 // `scanlines`, and each row is shifted sideways by a random amount up to `jitter` pixels.
 static const char *pl_fs_final =
     PL_COMMON
-    "uniform sampler2D S, D, RM, RS;\n"
+    "uniform sampler2D S, D, RM, RS, LN;\n"
     "uniform float enabled, min_gain, gamma_dim, use_ramp, use_dim;\n"
+    "uniform float rgb_on, rgb_cyc, rgb_luma, rgb_minl, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_sync, scr_h;\n"
+    "uniform int rgb_fx, rgb_dir;\n"
     "uniform vec3 dim_gain, tint;\n"
     "uniform vec2 lr_size;\n"
     "uniform vec4 lr_box;\n"
@@ -376,6 +492,42 @@ static const char *pl_fs_final =
     "  vec3 n = clamp(vec3(level) + contrast * z, 0.0, 1.0);\n"
     "  return n * (1.0 - scanlines * float(row & 1));\n"
     "}\n"
+    "vec3 hue_rgb(float h, float s) {\n"
+    "  vec3 k = clamp(abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);\n"
+    "  return mix(vec3(1.0), k, s);\n"
+    "}\n"
+    "vec3 rgb_apply(vec3 enc, vec2 m, vec2 fc) {\n"
+    "  bool horiz = m.x > 0.5;\n"
+    "  float u = horiz ? fc.x : scr_h - fc.y, v = horiz ? fc.y : fc.x;\n"
+    "  float sgn = rgb_dir == 1 ? -1.0 : 1.0;\n"
+    "  if (rgb_dir == 2) sgn = (pcg(uint(v / 16.0)) & 1u) == 0u ? 1.0 : -1.0;\n"
+    "  float pos = sgn * (u + (rgb_sync > 0.5 ? 0.0 : 13.0 * v));\n"
+    "  float hue = rgb_hue / 360.0, span = rgb_span / 360.0;\n"
+    "  float mult = 1.0, w = 1.0;\n"
+    "  if (rgb_fx == 1) {\n"
+    "    mult = mix(0.1, 1.0, 0.5 + 0.5 * sin(6.2831853 * rgb_cyc));\n"
+    "  } else if (rgb_fx == 2) {\n"
+    "    float ph = fract(pos / rgb_len - rgb_cyc);\n"
+    "    hue += span * (span >= 0.999 ? ph : 1.0 - abs(2.0 * ph - 1.0));\n"
+    "  } else if (rgb_fx == 3) {\n"
+    "    float per = rgb_len + rgb_gap;\n"
+    "    float d = mod(rgb_cyc * per - pos, per);\n"
+    "    if (d >= rgb_len) return enc;\n"
+    "    w = mix(1.0, 1.0 - d / rgb_len, rgb_tail);\n"
+    "    hue += span * (d / rgb_len);\n"
+    "  } else if (rgb_fx == 4) {\n"
+    "    mult = mix(0.2, 1.0, 0.5 + 0.5 * sin(6.2831853 * (pos / rgb_len - rgb_cyc)));\n"
+    "  }\n"
+    "  vec3 lin = to_lin(enc);\n"
+    "  float lt = clamp(max(dot(lin, W709), rgb_minl) * rgb_luma * mult, 0.0, 1.0);\n"
+    "  vec3 col = to_lin(hue_rgb(hue, rgb_sat));\n"
+    "  col *= lt / dot(col, W709);\n"
+    "  float a = 0.0;\n"
+    "  for (int i = 0; i < 3; i++)\n"
+    "    if (col[i] > 1.0) a = max(a, (col[i] - 1.0) / (col[i] - lt));\n"
+    "  col = mix(col, vec3(lt), a);\n"
+    "  return to_enc(mix(lin, col, w));\n"
+    "}\n"
     "vec4 shade() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  vec4 s = texelFetch(S, p, 0);\n"
@@ -404,6 +556,10 @@ static const char *pl_fs_final =
     "  vec4 c = texelFetch(S, ivec2(gl_FragCoord.xy), 0);\n"
     "  if (enabled >= 0.5) {\n"
     "    c = shade();\n"
+    "    if (rgb_on > 0.5) {\n"
+    "      vec2 m = texelFetch(LN, ivec2(gl_FragCoord.xy), 0).rg;\n"
+    "      if (m.x > 0.5 || m.y > 0.5) c.rgb = rgb_apply(c.rgb, m, gl_FragCoord.xy);\n"
+    "    }\n"
     "    if (static_amt > 0.0) c.rgb = mix(c.rgb, static_rgb(gl_FragCoord.xy), static_amt);\n"
     "  }\n"
     "  color = c;\n"
@@ -453,7 +609,7 @@ static inline GLuint pl_program(GLuint vs, const char *fs_src) {
 
 struct pl_glsave {
 	GLint draw_fbo, read_fbo, prog, vao, active_tex, vp[4], sc[4];
-	GLint tex[4], samp[4];
+	GLint tex[5], samp[5];
 	GLint read_buf, draw_buf;
 	GLint bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a;
 	GLboolean blend, scissor, stencil, depth, cull, fb_srgb, mask[4];
@@ -465,7 +621,7 @@ static inline void pl_gl_save(struct pl_glsave *g) {
 	glGetIntegerv(GL_CURRENT_PROGRAM, &g->prog);
 	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &g->vao);
 	glGetIntegerv(GL_ACTIVE_TEXTURE, &g->active_tex);
-	for (int u = 0; u < 4; u++) {
+	for (int u = 0; u < 5; u++) {
 		glActiveTexture(GL_TEXTURE0 + (GLenum)u);
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &g->tex[u]);
 		glGetIntegerv(GL_SAMPLER_BINDING, &g->samp[u]);
@@ -506,7 +662,7 @@ static inline void pl_gl_restore(const struct pl_glsave *g) {
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)g->draw_fbo);
 	glReadBuffer((GLenum)g->read_buf);
 	glDrawBuffer((GLenum)g->draw_buf);
-	for (int u = 3; u >= 0; u--) {
+	for (int u = 4; u >= 0; u--) {
 		glActiveTexture(GL_TEXTURE0 + (GLenum)u);
 		glBindSampler((GLuint)u, (GLuint)g->samp[u]);
 		glBindTexture(GL_TEXTURE_2D, (GLuint)g->tex[u]);
@@ -523,10 +679,11 @@ static inline bool pl_init(struct pl *p) {
 	if (!vs) {
 		return false;
 	}
-	const char *fs[9] = {pl_fs_need, pl_fs_dilate, pl_fs_smooth, pl_fs_final, pl_fs_down,
-	                     pl_fs_box,  pl_fs_rdown,  pl_fs_ramp,   pl_fs_scene};
+	const char *fs[PL_NPROG] = {pl_fs_need, pl_fs_dilate, pl_fs_smooth, pl_fs_final, pl_fs_down,  pl_fs_box,
+	                            pl_fs_rdown, pl_fs_ramp,  pl_fs_scene,  pl_fs_linec, pl_fs_liner, pl_fs_lstep,
+                            pl_fs_lclose};
 	bool ok = true;
-	for (int i = 0; i < 9; i++) {
+	for (int i = 0; i < PL_NPROG; i++) {
 		p->prog[i] = pl_program(vs, fs[i]);
 		ok = ok && p->prog[i];
 	}
@@ -553,9 +710,9 @@ static inline bool pl_init(struct pl *p) {
 
 static inline void pl_free_screen(struct pl *p) {
 	if (p->s_tex) {
-		glDeleteTextures(15, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1],
+		glDeleteTextures(16, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1],
 		                                p->lr_a, p->lr_b, p->rlr_a, p->rlr_b, p->rs[0], p->rs[1],
-		                                p->rlr_p, p->scn[0], p->scn[1]});
+		                                p->rlr_p, p->scn[0], p->scn[1], p->line_tex});
 		p->s_tex = 0;
 	}
 }
@@ -565,7 +722,7 @@ static inline void pl_destroy(struct pl *p) {
 		return;
 	}
 	pl_free_screen(p);
-	for (int i = 0; i < 9; i++) {
+	for (int i = 0; i < PL_NPROG; i++) {
 		glDeleteProgram(p->prog[i]);
 	}
 	glDeleteVertexArrays(1, &p->vao);
@@ -580,7 +737,7 @@ static inline GLuint pl_tex(GLenum fmt, GLenum base, int w, int h) {
 	glGenTextures(1, &t);
 	glBindTexture(GL_TEXTURE_2D, t);
 	glTexImage2D(GL_TEXTURE_2D, 0, (GLint)fmt, w, h, 0, base,
-	             fmt == GL_RGBA8 ? GL_UNSIGNED_BYTE : GL_FLOAT, NULL);
+	             fmt == GL_RGBA8 || fmt == GL_RG8 ? GL_UNSIGNED_BYTE : GL_FLOAT, NULL);
 	glBindTexture(GL_TEXTURE_2D, 0);
 	return t;
 }
@@ -609,6 +766,9 @@ static inline bool pl_ensure_screen(struct pl *p, int W, int H) {
 	p->rs[0] = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
 	p->rs[1] = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
 	p->rlr_p = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
+	p->line_tex = pl_tex(GL_RG8, GL_RG, W, H);
+	p->ldirty = true;
+	p->line_valid = false;
 	float zeros[2 * PL_MAXMON] = {0};
 	for (int i = 0; i < 2; i++) {
 		p->scn[i] = pl_tex(GL_RG32F, GL_RG, PL_MAXMON, 1);
@@ -632,6 +792,7 @@ static inline bool pl_set_monitors(struct pl *p, const struct pl_mon *mons, int 
 	memcpy(p->mon, mons, (size_t)nmon * sizeof *mons);
 	p->nmon = nmon;
 	p->dirty = true;
+	p->ldirty = true;
 	p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
 	return true;
 }
@@ -657,6 +818,9 @@ static inline bool pl_active(const struct pl *p, const struct sq_cfg *cfg, doubl
 	if (p->s_valid && cfg->v[SQ_ENABLED] != 0 && cfg->v[SQ_STATIC] != 0 &&
 	    cfg->v[SQ_STATIC_AMOUNT] > 0) {
 		return true;  // static changes every 1 / static_hz seconds for as long as it is on
+	}
+	if (p->s_valid && cfg->v[SQ_ENABLED] != 0 && cfg->v[SQ_RGB] != 0 && cfg->v[SQ_RGB_EFFECT] != 0) {
+		return true;  // every effect except solid moves for as long as it is on
 	}
 	double slow = cfg->v[SQ_DARKENING_MS] > cfg->v[SQ_BRIGHTENING_MS] ? cfg->v[SQ_DARKENING_MS] : cfg->v[SQ_BRIGHTENING_MS];
 	if (cfg->v[SQ_BRIGHTNESS] == 0) {
@@ -699,6 +863,7 @@ static inline void pl_capture(struct pl *p, const struct pl_rect *r, int n, bool
 	glBindTexture(GL_TEXTURE_2D, 0);
 	p->s_valid = true;
 	p->dirty = true;
+	p->ldirty = true;
 	pl_touch(p, now);
 }
 
@@ -1032,6 +1197,140 @@ static inline void pl_ramp_state(struct pl *p, const struct sq_cfg *cfg, double 
 	p->have_ramp_time = true;
 }
 
+static inline void pl_lclose(struct pl *p, GLuint src, GLuint dst, int dx, int dy, int radius, int mode) {
+	GLuint pr = p->prog[PL_LCLOSE];
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "src"), 0);
+	glUniform2i(PL_U(pr, "along"), dx, dy);
+	glUniform1i(PL_U(pr, "radius"), radius);
+	glUniform1i(PL_U(pr, "mode"), mode);
+	pl_fbo_attach(p, dst);
+	pl_bind(0, src, p->samp_nearest);
+	for (int i = 0; i < p->nmon; i++) {
+		const struct pl_mon *m = &p->mon[i];
+		glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
+		pl_scissor_mon(p, m);
+		pl_draw();
+	}
+}
+
+static inline int pl_floor_log2(int n) {
+	int k = 0;
+	while ((2 << k) <= n) {
+		k++;
+	}
+	return k;
+}
+
+// One step of the line search: reads src, writes dst, per monitor. off is the tap distance
+// along the line, mode 0 is min and 1 is max. With blend, the result is merged into dst by
+// taking the larger value in each channel, and mask picks the channel.
+static inline void pl_lstep(struct pl *p, GLuint src, GLuint dst, int dx, int dy, int off, int mode,
+                            float mx, float my, bool blend) {
+	GLuint pr = p->prog[PL_LSTEP];
+	glUseProgram(pr);
+	glUniform1i(PL_U(pr, "src"), 0);
+	glUniform2i(PL_U(pr, "along"), dx, dy);
+	glUniform1i(PL_U(pr, "off"), off);
+	glUniform1i(PL_U(pr, "mode"), mode);
+	glUniform2f(PL_U(pr, "mask"), mx, my);
+	pl_fbo_attach(p, dst);
+	pl_bind(0, src, p->samp_nearest);
+	if (blend) {
+		glEnable(GL_BLEND);
+		glBlendEquation(GL_MAX);
+		glBlendFunc(GL_ONE, GL_ONE);
+	}
+	for (int i = 0; i < p->nmon; i++) {
+		const struct pl_mon *m = &p->mon[i];
+		glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
+		pl_scissor_mon(p, m);
+		pl_draw();
+	}
+	if (blend) {
+		glDisable(GL_BLEND);
+		glBlendEquation(GL_FUNC_ADD);
+	}
+}
+
+// Finds the lines in S and writes them to line_tex. For each direction: candidates (thin
+// enough, enough contrast), a closing across crossings, links between neighboring candidates of one color, then a window
+// test on the links. A pixel is on a line when some run of min_px consecutive pixels that
+// includes it is linked all the way. That is a sliding minimum over min_px - 1 links
+// followed by a sliding maximum over min_px start positions, each built from power of two
+// windows: F_k covers 2^k links, and a window of any length is two overlapping F_k taps.
+static inline void pl_lines(struct pl *p, const struct sq_cfg *cfg) {
+	int X = (int)cfg->v[SQ_RGB_LINE_MIN_PX];
+	int N = X - 1;
+	int k = pl_floor_log2(N), j = pl_floor_log2(X);
+	pl_base_state();
+	glBindVertexArray(p->vao);
+	glViewport(0, 0, p->W, p->H);
+	pl_fbo_attach(p, p->line_tex);
+	glDisable(GL_SCISSOR_TEST);
+	glClearColor(0, 0, 0, 0);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glEnable(GL_SCISSOR_TEST);
+	for (int dir = 0; dir < 2; dir++) {
+		if (cfg->v[dir == 0 ? SQ_RGB_HORIZONTAL : SQ_RGB_VERTICAL] == 0) {
+			continue;
+		}
+		int dx = dir == 0 ? 1 : 0, dy = dir == 0 ? 0 : 1;
+		GLuint pr = p->prog[PL_LINEC];
+		glUseProgram(pr);
+		glUniform1i(PL_U(pr, "S"), 0);
+		glUniform2i(PL_U(pr, "along"), dx, dy);
+		glUniform1i(PL_U(pr, "thick"), (int)cfg->v[SQ_RGB_LINE_THICK_PX]);
+		glUniform1f(PL_U(pr, "contrast"), (float)cfg->v[SQ_RGB_LINE_CONTRAST]);
+		pl_fbo_attach(p, p->tex_a);
+		pl_bind(0, p->s_tex, p->samp_nearest);
+		for (int i = 0; i < p->nmon; i++) {
+			const struct pl_mon *m = &p->mon[i];
+			glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
+			pl_scissor_mon(p, m);
+			pl_draw();
+		}
+		int radius = ((int)cfg->v[SQ_RGB_LINE_THICK_PX] + 1) / 2;
+		pl_lclose(p, p->tex_a, p->tex_b, dx, dy, radius, 1);
+		pl_lclose(p, p->tex_b, p->tex_a, dx, dy, radius, 0);
+		pr = p->prog[PL_LINER];
+		glUseProgram(pr);
+		glUniform1i(PL_U(pr, "S"), 0);
+		glUniform1i(PL_U(pr, "C"), 1);
+		glUniform2i(PL_U(pr, "along"), dx, dy);
+		pl_fbo_attach(p, p->tex_b);
+		pl_bind(0, p->s_tex, p->samp_nearest);
+		pl_bind(1, p->tex_a, p->samp_nearest);
+		for (int i = 0; i < p->nmon; i++) {
+			const struct pl_mon *m = &p->mon[i];
+			glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
+			pl_scissor_mon(p, m);
+			pl_draw();
+		}
+		GLuint cur = p->tex_b, oth = p->tex_a, t;
+		for (int i = 0; i < k; i++) {
+			pl_lstep(p, cur, oth, dx, dy, 1 << i, 0, 1, 0, false);
+			t = cur, cur = oth, oth = t;
+		}
+		pl_lstep(p, cur, oth, dx, dy, N - (1 << k), 0, 1, 0, false);
+		t = cur, cur = oth, oth = t;
+		for (int i = 0; i < j; i++) {
+			pl_lstep(p, cur, oth, dx, dy, -(1 << i), 1, 1, 0, false);
+			t = cur, cur = oth, oth = t;
+		}
+		pl_lstep(p, cur, p->line_tex, dx, dy, -(X - (1 << j)), 1, dir == 0 ? 1.0f : 0.0f,
+		         dir == 0 ? 0.0f : 1.0f, true);
+	}
+	glDisable(GL_SCISSOR_TEST);
+	p->used_lmin = cfg->v[SQ_RGB_LINE_MIN_PX];
+	p->used_lthick = cfg->v[SQ_RGB_LINE_THICK_PX];
+	p->used_lcontrast = cfg->v[SQ_RGB_LINE_CONTRAST];
+	p->used_lh = cfg->v[SQ_RGB_HORIZONTAL];
+	p->used_lv = cfg->v[SQ_RGB_VERTICAL];
+	p->ldirty = false;
+	p->line_valid = true;
+}
+
 static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex, bool use_ramp,
                             bool use_dim, double now) {
 	pl_base_state();
@@ -1067,12 +1366,30 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	glUniform1f(PL_U(pr, "scanlines"), (float)cfg->v[SQ_STATIC_SCANLINES]);
 	glUniform1f(PL_U(pr, "smear"), (float)cfg->v[SQ_STATIC_SMEAR]);
 	glUniform1f(PL_U(pr, "jitter"), (float)cfg->v[SQ_STATIC_JITTER_PX]);
+	bool rgb = cfg->v[SQ_RGB] != 0 && p->line_valid;
+	glUniform1i(PL_U(pr, "LN"), 4);
+	glUniform1f(PL_U(pr, "rgb_on"), rgb ? 1.0f : 0.0f);
+	glUniform1i(PL_U(pr, "rgb_fx"), (int)cfg->v[SQ_RGB_EFFECT]);
+	glUniform1i(PL_U(pr, "rgb_dir"), (int)cfg->v[SQ_RGB_DIRECTION]);
+	double cyc = pl_trel(p, now) * cfg->v[SQ_RGB_SPEED];
+	glUniform1f(PL_U(pr, "rgb_cyc"), (float)(cyc - floor(cyc)));
+	glUniform1f(PL_U(pr, "rgb_luma"), (float)cfg->v[SQ_RGB_LUMA]);
+	glUniform1f(PL_U(pr, "rgb_minl"), (float)cfg->v[SQ_RGB_MIN_LUMA]);
+	glUniform1f(PL_U(pr, "rgb_hue"), (float)cfg->v[SQ_RGB_HUE]);
+	glUniform1f(PL_U(pr, "rgb_span"), (float)cfg->v[SQ_RGB_HUE_SPAN]);
+	glUniform1f(PL_U(pr, "rgb_sat"), (float)cfg->v[SQ_RGB_SATURATION]);
+	glUniform1f(PL_U(pr, "rgb_len"), (float)cfg->v[SQ_RGB_LENGTH_PX]);
+	glUniform1f(PL_U(pr, "rgb_gap"), (float)cfg->v[SQ_RGB_GAP_PX]);
+	glUniform1f(PL_U(pr, "rgb_tail"), (float)cfg->v[SQ_RGB_TAIL]);
+	glUniform1f(PL_U(pr, "rgb_sync"), (float)cfg->v[SQ_RGB_SYNC]);
+	glUniform1f(PL_U(pr, "scr_h"), (float)p->H);
 	glUniform1ui(PL_U(pr, "frame"), (GLuint)(unsigned long long)floor(pl_trel(p, now) * hz));
 	glUniform2f(PL_U(pr, "lr_size"), (float)p->lrW, (float)p->lrH);
 	pl_bind(0, p->s_tex, p->samp_nearest);
 	pl_bind(1, dtex, p->samp_nearest);
 	pl_bind(2, p->rlr_a, p->samp_linear);
 	pl_bind(3, p->rs[p->rcur], p->samp_linear);
+	pl_bind(4, p->line_tex, p->samp_nearest);
 	glEnable(GL_SCISSOR_TEST);
 	for (int i = 0; i < p->nmon; i++) {
 		struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
@@ -1143,5 +1460,15 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
 	}
 	p->was_enabled = bright;
+	if (enabled && cfg->v[SQ_RGB] != 0) {
+		if (p->ldirty || !p->line_valid || p->used_lmin != cfg->v[SQ_RGB_LINE_MIN_PX] ||
+		    p->used_lthick != cfg->v[SQ_RGB_LINE_THICK_PX] ||
+		    p->used_lcontrast != cfg->v[SQ_RGB_LINE_CONTRAST] || p->used_lh != cfg->v[SQ_RGB_HORIZONTAL] ||
+		    p->used_lv != cfg->v[SQ_RGB_VERTICAL]) {
+			pl_lines(p, cfg);
+		}
+	} else {
+		p->ldirty = true;  // S may change while the lines are not being followed
+	}
 	pl_final(p, cfg, dtex, bright && ramp, bright, now);
 }

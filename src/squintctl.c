@@ -4,7 +4,7 @@
 //   squintctl                 interactive tuning screen
 //   squintctl show            print the config file location and the current settings (--show works too)
 //   squintctl set KEY VALUE   change one setting (a number is clamped to its range)
-//   squintctl toggle NAME     flip one on/off setting: enabled, brightness, dim_tint, static, or shortcuts
+//   squintctl toggle NAME     flip one on/off setting: enabled, brightness, dim_tint, static, rgb, or shortcuts
 //
 // Shortcut keys are settings too. Write a chord like Ctrl+Alt+s or Super+Shift+F5:
 //   squintctl set key_static Ctrl+Alt+s
@@ -14,6 +14,7 @@
 #include <X11/Xlib.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 
 #include "capture.h"
@@ -30,6 +31,10 @@ static void restore_terminal(void) {
 		fflush(stdout);
 		raw_on = false;
 	}
+}
+
+static void on_winch(int sig) {
+	(void)sig;  // only interrupts read, so the main loop draws again at the new size
 }
 
 static void on_signal(int sig) {
@@ -49,6 +54,10 @@ static void enter_raw(void) {
 	atexit(restore_terminal);
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = on_winch;  // no SA_RESTART: read must return with EINTR
+	sigaction(SIGWINCH, &sa, NULL);
 }
 
 // Checks that a chord names a key this keyboard has. An empty chord is fine. Fills why with a
@@ -76,11 +85,70 @@ static bool chord_ok(const char *chord, char *why, size_t whylen) {
 	return ok;
 }
 
+// Prints s word-wrapped to width columns on exactly nlines lines, so the screen layout does
+// not move when the text changes. Text that does not fit is cut off.
+static void print_wrapped(const char *s, int width, int nlines) {
+	for (int ln = 0; ln < nlines; ln++) {
+		while (*s == ' ') {
+			s++;
+		}
+		int len = (int)strlen(s);
+		if (len > width) {
+			len = width;
+			if (ln < nlines - 1) {
+				while (len > 0 && s[len] != ' ') {
+					len--;
+				}
+				if (len == 0) {
+					len = width;
+				}
+			}
+		}
+		printf(" %.*s\r\n", len, s);
+		s += len;
+	}
+}
+
+#define FOOTER_LINES 11  // blank, 3 help, blank, 3 keys, blank, status
+
+// The first setting shown. It moves only as far as needed to keep the selected row in view.
+static int view_top;
+
 static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct sq_cfg *start, int sel, const char *path, const char *status) {
+	struct winsize ws;
+	int rows = 24, cols = 80;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+		rows = ws.ws_row;
+		cols = ws.ws_col;
+	}
+	int avail = rows - 4 - FOOTER_LINES;
+	if (avail < 5) {
+		avail = 5;
+	}
+	if (avail > SQ_N) {
+		avail = SQ_N;
+	}
+	if (sel < view_top) {
+		view_top = sel;
+	}
+	if (sel >= view_top + avail) {
+		view_top = sel - avail + 1;
+	}
+	if (view_top > SQ_N - avail) {
+		view_top = SQ_N - avail;
+	}
+	if (view_top < 0) {
+		view_top = 0;
+	}
 	printf("\x1b[2J\x1b[H");
-	printf("squint tuning\r\nconfig: %s\r\n\r\n", path);
-	printf(" %-22s %-14s %-14s %s\r\n", "", "value", "default", "range");
-	for (int i = 0; i < SQ_N; i++) {
+	printf("squint tuning\r\n config: %.*s\r\n\r\n", cols - 10 > 0 ? cols - 10 : 1, path);
+	char pos[40] = "";
+	if (avail < SQ_N) {
+		snprintf(pos, sizeof pos, "%d-%d of %d%s%s", view_top + 1, view_top + avail, SQ_N, view_top > 0 ? "  \xe2\x86\x91" : "",
+		         view_top + avail < SQ_N ? "  \xe2\x86\x93" : "");
+	}
+	printf(" %-22s %-14s %-14s %s\r\n", "", "value", "default", *pos ? pos : "range");
+	for (int i = view_top; i < view_top + avail; i++) {
 		char v[SQ_STRLEN + 8], dv[SQ_STRLEN + 8], lo[32], hi[32];
 		sq_format_cfg(c, i, v, sizeof v);
 		sq_format_cfg(def, i, dv, sizeof dv);
@@ -114,9 +182,13 @@ static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct 
 		}
 		printf("\r\n");
 	}
-	printf("\r\n %s\r\n\r\n", sq_params[sel].help);
-	printf(" up/down select   left/right adjust   PgUp/PgDn adjust x10   space toggle\r\n");
-	printf(" Enter record a shortcut by pressing it   e type it   r reset to start   d reset to default   R/D all   q quit   * changed since start\r\n\r\n %s\r\n", status);
+	printf("\r\n");
+	print_wrapped(sq_params[sel].help, cols - 2, 3);
+	printf("\r\n");
+	print_wrapped("up/down select   left/right adjust   PgUp/PgDn adjust x10   space toggle   q quit", cols - 2, 1);
+	print_wrapped("r reset to start   d reset to default   R/D all   * changed since start", cols - 2, 1);
+	print_wrapped("Enter record a shortcut by pressing it   e type it", cols - 2, 1);
+	printf("\r\n %.*s", cols - 2 > 0 ? cols - 2 : 1, status);
 	fflush(stdout);
 }
 
@@ -223,7 +295,11 @@ static int interactive(const char *path) {
 	for (;;) {
 		draw(&c, &def, &start, sel, path, status);
 		unsigned char ch;
-		if (read(STDIN_FILENO, &ch, 1) != 1) {
+		ssize_t got = read(STDIN_FILENO, &ch, 1);
+		if (got < 0 && errno == EINTR) {
+			continue;  // the terminal was resized
+		}
+		if (got != 1) {
 			break;
 		}
 		bool changed = false;
