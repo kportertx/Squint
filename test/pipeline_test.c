@@ -1766,11 +1766,15 @@ static bool same_px(int x1, int y1, int x2, int y2) {
 		if (abs(px_at(x1, y1, ch) - px_at(x2, y2, ch)) > 5) return false;
 	return true;
 }
-static double eluma(int x, int y) {
-	return 0.2126 * px_at(x, y, 0) / 255.0 + 0.7152 * px_at(x, y, 1) / 255.0 + 0.0722 * px_at(x, y, 2) / 255.0;
+// The largest difference in any channel between two pixels, 0 to 1.
+static double cdiff(int x1, int y1, int x2, int y2) {
+	double d = 0;
+	for (int ch = 0; ch < 3; ch++) d = fmax(d, abs(px_at(x1, y1, ch) - px_at(x2, y2, ch)) / 255.0);
+	return d;
 }
 
-// Thin enough and different enough from at least one side, measured across the line.
+// Thin enough and different enough from at least one side that is on the monitor, measured
+// across the line.
 static bool cpu_cand(const struct pl_mon *m, int x, int y, int dir, int thick, double contrast) {
 	int ax = dir == 0 ? 0 : 1, ay = dir == 0 ? 1 : 0;  // across
 	int a = 1, b = 1;
@@ -1783,8 +1787,9 @@ static bool cpu_cand(const struct pl_mon *m, int x, int y, int dir, int thick, d
 		if (!inbox(m, qx, qy) || !same_px(qx, qy, x, y)) break;
 	}
 	int ax1 = x - ax * a, ay1 = y - ay * a, bx1 = x + ax * b, by1 = y + ay * b;
-	if (a + b - 1 > thick || !inbox(m, ax1, ay1) || !inbox(m, bx1, by1)) return false;
-	return fabs(eluma(ax1, ay1) - eluma(x, y)) >= contrast || fabs(eluma(bx1, by1) - eluma(x, y)) >= contrast;
+	bool in_a = inbox(m, ax1, ay1), in_b = inbox(m, bx1, by1);
+	if (a + b - 1 > thick || (!in_a && !in_b)) return false;
+	return (in_a && cdiff(ax1, ay1, x, y) >= contrast) || (in_b && cdiff(bx1, by1, x, y) >= contrast);
 }
 
 // Candidates after a closing along the line: a maximum then a minimum over radius pixels,
@@ -1962,6 +1967,80 @@ static void test_rgb_lines(void) {
 	compare_lines("neither direction", &e);
 	teardown();
 
+	// Lines on the edge of a monitor have one side only. Lines on all four edges of a monitor,
+	// and a line two pixels wide that runs along the seam between two monitors.
+	struct pl_mon m6[] = {{0, 0, 240, 160}};
+	setup(240, 160, m6, 1);
+	put((struct pl_rect){0, 0, 240, 160}, 255, 255, 255);
+	put((struct pl_rect){0, 20, 1, 140}, 100, 100, 100);
+	put((struct pl_rect){238, 20, 240, 140}, 100, 100, 100);
+	put((struct pl_rect){20, 0, 220, 1}, 100, 100, 100);
+	put((struct pl_rect){20, 158, 220, 160}, 100, 100, 100);
+	capture_full(0);
+	struct sq_cfg ed = rgb_cfg();
+	render(&ed, 0);
+	compare_lines("lines on the monitor edges", &ed);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(0, 80, 1) && MASK(238, 80, 1) && MASK(239, 80, 1), "vertical lines on the left and right edges are found");
+	CHECK(MASK(100, 0, 0) && MASK(100, 158, 0) && MASK(100, 159, 0), "horizontal lines on the top and bottom edges are found");
+	free(g);
+	#undef MASK
+	teardown();
+	struct pl_mon m7[] = {{0, 0, 120, 160}, {120, 0, 120, 160}};
+	setup(240, 160, m7, 2);
+	put((struct pl_rect){0, 0, 240, 160}, 255, 255, 255);
+	put((struct pl_rect){119, 20, 121, 140}, 100, 100, 100);
+	capture_full(0);
+	render(&ed, 0);
+	compare_lines("a line along the seam between monitors", &ed);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(119, 80, 1) && MASK(120, 80, 1), "both halves of the seam line are found");
+	free(g);
+	#undef MASK
+	teardown();
+
+	// A teal 2 px border on a dark gray window, as on a real screen. Its luma differs by about
+	// 0.1, below the limit, but its blue differs by 0.25. It is on the right edge of the monitor.
+	struct pl_mon m8[] = {{0, 0, 120, 200}};
+	setup(120, 200, m8, 1);
+	put((struct pl_rect){0, 0, 120, 200}, 46, 52, 54);
+	put((struct pl_rect){118, 0, 120, 200}, 40, 85, 119);
+	capture_full(0);
+	struct sq_cfg tl = rgb_cfg();
+	render(&tl, 0);
+	compare_lines("a teal border on the right edge", &tl);
+	g = malloc((size_t)W * H * 2);
+	read_lines(g);
+	#define MASK(x, y, d) (g[((size_t)(y) * W + (x)) * 2 + (d)] > 127)
+	CHECK(MASK(118, 100, 1) && MASK(119, 100, 1) && !MASK(100, 100, 1), "the teal border is a vertical line and the background is not");
+	free(g);
+	#undef MASK
+	teardown();
+
+	// The search reads the screen as picom drew it, before dimming, tint, and static. Strong
+	// versions of all three change nothing about which pixels are lines.
+	setup(240, 160, m1, 1);
+	draw_lines_scene();
+	capture_full(0);
+	struct sq_cfg fx = rgb_cfg();
+	fx.v[SQ_BRIGHTNESS] = 1;
+	fx.v[SQ_TARGET] = 0.15;
+	fx.v[SQ_TARGET_LARGE] = 0.15;
+	fx.v[SQ_MIN_GAIN] = 0.05;
+	fx.v[SQ_FALLOFF_PX] = 8;
+	fx.v[SQ_DIM_TINT] = 1;
+	fx.v[SQ_TINT_GREEN] = 0.6;
+	fx.v[SQ_TINT_BLUE] = 0.3;
+	fx.v[SQ_STATIC] = 1;
+	fx.v[SQ_STATIC_AMOUNT] = 60;
+	render(&fx, 0);
+	compare_lines("lines are found before dimming, tint, and static", &fx);
+	teardown();
+
 	// Contrast on one side is enough. These lines have a gray 110 region on one side and white
 	// on the other. The third line, gray 120 inside the gray 110 region, contrasts on neither side.
 	struct pl_mon m4[] = {{0, 0, 120, 100}};
@@ -2123,6 +2202,51 @@ static void test_rgb_effects(void) {
 	CHECK(fabs(l1 - l2) > 0.01, "unsynced lines differ: %.4f vs %.4f", l1, l2);
 	c.v[SQ_RGB_SYNC] = 1;
 
+	// Rain: green drops with trails, falling along the line at three speeds.
+	c.v[SQ_RGB_EFFECT] = 5;
+	c.v[SQ_RGB_LENGTH_PX] = 40;
+	c.v[SQ_RGB_GAP_PX] = 40;
+	double lmax = 0, lmin = 1;
+	int bad_hue = 0, bright = 0, whitish = 0, n = 0;
+	render(&c, 104.0);
+	for (int x = 12; x < 228; x++) {
+		const uint8_t *p = at(x, 20);
+		double l = lum(p);
+		lmax = fmax(lmax, l);
+		lmin = fmin(lmin, l);
+		if (p[1] < p[0] || p[1] < p[2]) bad_hue++;
+		if (l > 0.5 * L0) bright++;
+		if (p[0] > 40) whitish++;
+		n++;
+	}
+	CHECK(whitish >= 1 && whitish < 20, "drop heads are paler than the trails: %d pixels", whitish);
+	CHECK(bad_hue == 0, "rain is green on every pixel of the line (%d of %d are not)", bad_hue, n);
+	CHECK(lmax <= L0 + 0.01 && lmax > 0.8 * L0, "the brightest drop keeps the luminance of the line: %.4f of %.4f", lmax, L0);
+	CHECK(lmin < 0.2 * L0 && lmin > 0.02 * L0, "the bare line glows dimly: %.4f of %.4f", lmin, L0);
+	CHECK(bright > 8 && bright < n - 40, "some of the line is lit and some is not: %d of %d", bright, n);
+	CHECK(chroma(100, 41) < 3 || at(100, 41)[1] >= at(100, 41)[0], "other lines are green too");
+	uint8_t before[240 * 4];
+	memcpy(before, out + (size_t)20 * W * 4, sizeof before);
+	render(&c, 104.2);
+	int moved = 0;
+	for (int x = 12; x < 228; x++)
+		if (abs(at(x, 20)[1] - before[x * 4 + 1]) > 10) moved++;
+	CHECK(moved > 20, "the drops move: %d pixels changed in 0.2 cycles", moved);
+	// The pattern is continuous where the cycle count rolls over.
+	render(&c, 105.9999);
+	memcpy(before, out + (size_t)20 * W * 4, sizeof before);
+	render(&c, 106.0001);
+	int jumped = 0;
+	for (int x = 12; x < 228; x++)
+		if (abs(at(x, 20)[1] - before[x * 4 + 1]) > 10) jumped++;
+	CHECK(jumped <= 2, "no jump at the end of a cycle: %d pixels changed in 0.0002 cycles", jumped);
+	// The same time gives the same picture, so the pattern depends on time and not on history.
+	render(&c, 104.2);
+	memcpy(before, out + (size_t)20 * W * 4, sizeof before);
+	render(&c, 107.0);
+	render(&c, 104.2);
+	CHECK(memcmp(before, out + (size_t)20 * W * 4, sizeof before) == 0, "rain is a function of time");
+
 	// Directions off, switch off, master off.
 	c.v[SQ_RGB_EFFECT] = 0;
 	c.v[SQ_RGB_VERTICAL] = 0;
@@ -2201,6 +2325,113 @@ static void test_rgb_effects(void) {
 	teardown();
 }
 
+// rgb_direction alternate: lines are numbered from the top (horizontal) or the left (vertical),
+// separately, and again on every monitor. Odd numbers run forward, even ones backward. At cycle
+// 0 a snake of length 100 with a gap of 100 is lit where (position + 0.5) mod 200 is above 100
+// when it runs forward, and below 100 when it runs backward.
+static void expect_lit(const char *what, int x, int y, bool lit) {
+	if (lit)
+		CHECK(chroma(x, y) > 40, "%s: (%d,%d) should be lit, got %d,%d,%d", what, x, y, at(x, y)[0], at(x, y)[1], at(x, y)[2]);
+	else
+		CHECK(at(x, y)[0] == 100 && at(x, y)[1] == 100 && at(x, y)[2] == 100, "%s: (%d,%d) should be unlit, got %d,%d,%d", what, x, y, at(x, y)[0], at(x, y)[1], at(x, y)[2]);
+}
+
+static void test_rgb_alternate(void) {
+	printf("rgb direction alternate\n");
+	struct sq_cfg c = rgb_cfg();
+	c.v[SQ_RGB_EFFECT] = 3;
+	c.v[SQ_RGB_LENGTH_PX] = 100;
+	c.v[SQ_RGB_GAP_PX] = 100;
+	c.v[SQ_RGB_DIRECTION] = 2;
+	c.v[SQ_RGB_LINE_THICK_PX] = 1;
+
+	// Three horizontal and three vertical lines on one monitor.
+	struct pl_mon m1[] = {{0, 0, 240, 200}};
+	setup(240, 200, m1, 1);
+	put((struct pl_rect){0, 0, 240, 200}, 255, 255, 255);
+	for (int y = 10; y <= 40; y += 15) put((struct pl_rect){10, y, 230, y + 1}, 100, 100, 100);
+	for (int x = 30; x <= 90; x += 30) put((struct pl_rect){x, 60, x + 1, 200}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	// Horizontal: lit at x = 150 running forward, at x = 50 running backward.
+	expect_lit("first horizontal runs forward", 150, 10, true);
+	expect_lit("first horizontal runs forward", 50, 10, false);
+	expect_lit("second horizontal runs backward", 150, 25, false);
+	expect_lit("second horizontal runs backward", 50, 25, true);
+	expect_lit("third horizontal runs forward", 150, 40, true);
+	expect_lit("third horizontal runs forward", 50, 40, false);
+	// Vertical: lit at y = 150 running forward, at y = 80 running backward. They count from 1
+	// again, not after the horizontal lines.
+	expect_lit("first vertical runs forward", 30, 150, true);
+	expect_lit("first vertical runs forward", 30, 80, false);
+	expect_lit("second vertical runs backward", 60, 150, false);
+	expect_lit("second vertical runs backward", 60, 80, true);
+	expect_lit("third vertical runs forward", 90, 150, true);
+	expect_lit("third vertical runs forward", 90, 80, false);
+	// Forward and backward elsewhere in the cycle: the segment moves 100 px in half a cycle.
+	render(&c, 101.5);
+	expect_lit("first horizontal after half a cycle", 150, 10, false);
+	expect_lit("first horizontal after half a cycle", 50, 10, true);
+	teardown();
+
+	// Two monitors with different lines: each starts at 1.
+	struct pl_mon m2[] = {{0, 0, 120, 100}, {120, 0, 120, 100}};
+	setup(240, 100, m2, 2);
+	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
+	put((struct pl_rect){5, 20, 115, 21}, 100, 100, 100);
+	put((struct pl_rect){5, 60, 115, 61}, 100, 100, 100);
+	put((struct pl_rect){125, 40, 235, 41}, 100, 100, 100);
+	put((struct pl_rect){125, 80, 235, 81}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	expect_lit("left monitor, line 1 forward", 110, 20, true);
+	expect_lit("left monitor, line 1 forward", 50, 20, false);
+	expect_lit("left monitor, line 2 backward", 110, 60, false);
+	expect_lit("left monitor, line 2 backward", 50, 60, true);
+	expect_lit("right monitor starts again: line 1 forward", 150, 40, true);
+	expect_lit("right monitor starts again: line 1 forward", 225, 40, false);
+	expect_lit("right monitor, line 2 backward", 150, 80, false);
+	expect_lit("right monitor, line 2 backward", 225, 80, true);
+	// Switching to alternate after the lines were found recomputes the numbers without new damage.
+	c.v[SQ_RGB_DIRECTION] = 0;
+	render(&c, 101.0);
+	expect_lit("forward: the second line runs forward too", 110, 60, true);
+	c.v[SQ_RGB_DIRECTION] = 2;
+	render(&c, 101.0);
+	expect_lit("alternate again", 110, 60, false);
+	teardown();
+
+	// Vertical lines restart on each monitor too. Forward, nothing is lit above y = 100, and
+	// backward, all of it is.
+	c.v[SQ_RGB_DIRECTION] = 2;
+	setup(240, 100, m2, 2);
+	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
+	put((struct pl_rect){30, 5, 31, 96}, 100, 100, 100);
+	put((struct pl_rect){60, 5, 61, 96}, 100, 100, 100);
+	put((struct pl_rect){130, 5, 131, 96}, 100, 100, 100);
+	put((struct pl_rect){170, 5, 171, 96}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	expect_lit("left monitor, vertical 1 forward", 30, 50, false);
+	expect_lit("left monitor, vertical 2 backward", 60, 50, true);
+	expect_lit("right monitor starts again: vertical 1 forward", 130, 50, false);
+	expect_lit("right monitor, vertical 2 backward", 170, 50, true);
+	teardown();
+
+	// A band of three rows is one line.
+	c.v[SQ_RGB_LINE_THICK_PX] = 3;
+	struct pl_mon m3[] = {{0, 0, 240, 100}};
+	setup(240, 100, m3, 1);
+	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
+	put((struct pl_rect){10, 20, 230, 23}, 100, 100, 100);
+	put((struct pl_rect){10, 60, 230, 63}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	for (int y = 20; y < 23; y++) expect_lit("every row of the first band runs forward", 150, y, true);
+	for (int y = 60; y < 63; y++) expect_lit("every row of the second band runs backward", 150, y, false);
+	teardown();
+}
+
 static void test_rgb_config(void) {
 	printf("rgb settings\n");
 	struct sq_cfg c;
@@ -2213,7 +2444,9 @@ static void test_rgb_config(void) {
 	CHECK(sq_set(&c, "rgb_effect", "snake") && c.v[SQ_RGB_EFFECT] == 3, "an effect is set by name");
 	CHECK(sq_set(&c, "rgb_effect", "WAVE") && c.v[SQ_RGB_EFFECT] == 4, "names match in any case");
 	CHECK(sq_set(&c, "rgb_effect", "1") && c.v[SQ_RGB_EFFECT] == 1, "an index works too");
-	CHECK(sq_set(&c, "rgb_effect", "9") && c.v[SQ_RGB_EFFECT] == 4, "an index past the end is clamped");
+	CHECK(sq_set(&c, "rgb_effect", "9") && c.v[SQ_RGB_EFFECT] == 5, "an index past the end is clamped");
+	CHECK(sq_set(&c, "rgb_effect", "rain") && c.v[SQ_RGB_EFFECT] == 5, "rain is the last effect");
+	CHECK(sq_set(&c, "rgb_effect", "wave") && c.v[SQ_RGB_EFFECT] == 4, "back to wave");
 	CHECK(!sq_set(&c, "rgb_effect", "disco") && c.v[SQ_RGB_EFFECT] == 4, "an unknown name is rejected");
 	char v[SQ_STRLEN];
 	sq_format_cfg(&c, SQ_RGB_EFFECT, v, sizeof v);
@@ -2272,6 +2505,7 @@ int main(void) {
 	test_rgb_config();
 	test_rgb_lines();
 	test_rgb_effects();
+	test_rgb_alternate();
 	printf("\n%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }

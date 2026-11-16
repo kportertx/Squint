@@ -43,7 +43,7 @@
 
 #define PL_MAXMON 8
 #define PL_LR 4  // the size field is computed at 1/PL_LR resolution
-#define PL_NPROG 13
+#define PL_NPROG 15
 
 struct pl_rect {
 	int x1, y1, x2, y2;  // half open
@@ -72,13 +72,16 @@ struct pl {
 	GLuint rs[2];           // RG16F at 1/PL_LR resolution: the ramp state, what was displayed
 	GLuint rlr_p;           // RG16F at 1/PL_LR resolution: the previous frame's means
 	GLuint line_tex;        // RG8: red marks horizontal line pixels, green vertical ones
+	GLuint lhas, lidx;      // R32F, 2 * PL_MAXMON columns: per monitor, which rows (columns 0 to
+	                        // PL_MAXMON - 1) and which screen columns (the rest) hold line pixels,
+	                        // and the number of the line each belongs to
 	GLuint scn[2];          // RG32F PL_MAXMON x 1: per monitor, until when (seconds since t0)
 	                        // darkening (red) and brightening (green) smoothing stay armed
 	int scur;
 	int lrW, lrH;
 	int cur, rcur;
 	bool s_valid, st_valid, rs_valid, dirty, prev_valid, means_valid;
-	bool ldirty, line_valid;  // line_tex must be recomputed; line_tex holds the current lines
+	bool ldirty, line_valid, lidx_valid;  // line_tex must be recomputed; it holds the current lines; lidx holds their numbers
 	double used_lmin, used_lthick, used_lcontrast, used_lh, used_lv;
 
 	struct pl_mon mon[PL_MAXMON];
@@ -93,7 +96,7 @@ struct pl {
 	double last_input, last_smooth, last_ramp, t0;
 };
 
-enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL, PL_DOWN, PL_BOX, PL_RDOWN, PL_RAMP, PL_SCENE, PL_LINEC, PL_LINER, PL_LSTEP, PL_LCLOSE };
+enum { PL_NEED, PL_DILATE, PL_SMOOTH, PL_FINAL, PL_DOWN, PL_BOX, PL_RDOWN, PL_RAMP, PL_SCENE, PL_LINEC, PL_LINER, PL_LSTEP, PL_LCLOSE, PL_LHAS, PL_LSCAN };
 
 static void (*pl_logger)(const char *msg);
 
@@ -318,9 +321,11 @@ static const char *pl_fs_scene =
     "}\n";
 
 // Line detection. A horizontal line is a band of at most `thick` rows of one color, at least
-// `min_px` pixels long, with a row on at least one side that differs from it in encoded luma
-// by at least `contrast`. One side is enough because a window border or a scroll bar often
-// touches a nearly matching color on one side. Vertical lines are the same with the axes
+// `min_px` pixels long, with a row on at least one side that differs from it in color
+// by at least `contrast`, the largest difference in any encoded red, green, or blue value. A
+// teal border on a dark gray background differs little in luma but a lot in blue. One side is enough because a window border or a scroll bar often
+// touches a nearly matching color on one side, and a line on the edge of a monitor has only
+// one side. Vertical lines are the same with the axes
 // swapped. `along` is the axis of the
 // line, so the thickness is measured across it. Pixels are the same color when no channel
 // differs by more than 0.02. Taps outside the monitor box (x0, y0, x1, y1, end exclusive) never
@@ -328,7 +333,8 @@ static const char *pl_fs_scene =
 #define PL_LINE_COMMON                                                                     \
 	"uniform ivec4 box;\n"                                                             \
 	"bool inb(ivec2 p) { return p.x >= box.x && p.y >= box.y && p.x < box.z && p.y < box.w; }\n" \
-	"bool same(vec3 a, vec3 b) { return all(lessThanEqual(abs(a - b), vec3(0.02))); }\n"
+	"bool same(vec3 a, vec3 b) { return all(lessThanEqual(abs(a - b), vec3(0.02))); }\n"                \
+	"float color_diff(vec3 a, vec3 b) { vec3 d = abs(a - b); return max(d.r, max(d.g, d.b)); }\n"
 
 // Marks the pixels that could belong to a line because of their thickness and contrast.
 static const char *pl_fs_linec =
@@ -353,11 +359,11 @@ static const char *pl_fs_linec =
     "    if (!inb(q) || !same(texelFetch(S, q, 0).rgb, c)) break;\n"
     "  }\n"
     "  ivec2 qa = p - across * a, qb = p + across * b;\n"
-    "  bool ok = a + b - 1 <= thick && inb(qa) && inb(qb);\n"
+    "  bool in_a = inb(qa), in_b = inb(qb);\n"
+    "  bool ok = a + b - 1 <= thick && (in_a || in_b);\n"
     "  if (ok) {\n"
-    "    float l = dot(c, W709);\n"
-    "    ok = abs(dot(texelFetch(S, qa, 0).rgb, W709) - l) >= contrast ||\n"
-    "         abs(dot(texelFetch(S, qb, 0).rgb, W709) - l) >= contrast;\n"
+    "    ok = (in_a && color_diff(texelFetch(S, qa, 0).rgb, c) >= contrast) ||\n"
+    "         (in_b && color_diff(texelFetch(S, qb, 0).rgb, c) >= contrast);\n"
     "  }\n"
     "  o = ok ? 1.0 : 0.0;\n"
     "}\n";
@@ -382,6 +388,53 @@ static const char *pl_fs_lclose =
     "    acc = mode == 1 ? max(acc, v) : min(acc, v);\n"
     "  }\n"
     "  o = acc;\n"
+    "}\n";
+
+// Line numbers, for rgb_direction alternate. The texture has one column per monitor and
+// orientation (the first PL_MAXMON columns for horizontal lines, indexed by GL row, the next
+// PL_MAXMON for vertical lines, indexed by screen column). `lhas` marks the rows (or
+// columns) of a monitor that hold any line pixel. `lscan` numbers the lines: a line is a
+// group of consecutive marked rows, horizontal lines are counted from the top of the
+// monitor, and vertical lines from the left, starting at 1.
+static const char *pl_fs_lhas =
+    PL_COMMON
+    "uniform sampler2D LN;\n"
+    "uniform int dir;\n"
+    "uniform ivec4 box;\n"
+    "out float o;\n"
+    "void main() {\n"
+    "  int r = int(gl_FragCoord.y);\n"
+    "  bool any_px = false;\n"
+    "  if (dir == 0) {\n"
+    "    for (int x = box.x; x < box.z && !any_px; x++) any_px = texelFetch(LN, ivec2(x, r), 0).r > 0.5;\n"
+    "  } else {\n"
+    "    for (int y = box.y; y < box.w && !any_px; y++) any_px = texelFetch(LN, ivec2(r, y), 0).g > 0.5;\n"
+    "  }\n"
+    "  o = any_px ? 1.0 : 0.0;\n"
+    "}\n";
+
+static const char *pl_fs_lscan =
+    PL_COMMON
+    "uniform sampler2D HAS;\n"
+    "uniform int dir;\n"
+    "uniform ivec4 box;\n"
+    "out float o;\n"
+    "float has(int c, int r) { return texelFetch(HAS, ivec2(c, r), 0).r; }\n"
+    "void main() {\n"
+    "  int c = int(gl_FragCoord.x), r = int(gl_FragCoord.y);\n"
+    "  float n = 0.0;\n"
+    "  if (dir == 0) {\n"
+    "    for (int y = r; y < box.w; y++) {\n"
+    "      bool above = y + 1 < box.w && has(c, y + 1) > 0.5;\n"
+    "      if (has(c, y) > 0.5 && !above) n += 1.0;\n"
+    "    }\n"
+    "  } else {\n"
+    "    for (int x = box.x; x <= r; x++) {\n"
+    "      bool left = x > box.x && has(c, x - 1) > 0.5;\n"
+    "      if (has(c, x) > 0.5 && !left) n += 1.0;\n"
+    "    }\n"
+    "  }\n"
+    "  o = n;\n"
     "}\n";
 
 // 1 where this pixel and the next one along the line are both candidates of the same color.
@@ -433,7 +486,13 @@ static const char *pl_fs_lstep =
 // (blue tops out near 7%), it is mixed toward gray of the same luminance until it fits, so
 // the luminance is exact and only the saturation gives way. u is the position along the
 // line and v the position across it. Lines that do not share a phase are offset by 13 px
-// per pixel of v. rgb_cyc is the fraction of the current cycle, 0 to 1, computed on the CPU in
+// per pixel of v. Rain is three layers of falling drops, each a lattice of cells that moves
+// along the line by one cell per cycle. A cell holds one drop with probability 0.7, whose head
+// sits at a random place in the cell with a trail of up to rgb_len behind it. Cells are
+// numbered minus the whole cycle count, so the pattern does not jump when the cycle fraction
+// wraps. The head is whiter (saturation 0.35), the trail fades with the square of the
+// distance from the head, a glyph-like flicker changes it every 6 px of the drop, and the bare line glows
+// at 0.1. rgb_cyc is the fraction of the current cycle, 0 to 1, computed on the CPU in
 // double precision so a long uptime does not blur the animation.
 //
 // Static is mixed in last, in encoded color: out = mix(color, noise, static_amt). Every
@@ -446,10 +505,11 @@ static const char *pl_fs_lstep =
 // `scanlines`, and each row is shifted sideways by a random amount up to `jitter` pixels.
 static const char *pl_fs_final =
     PL_COMMON
-    "uniform sampler2D S, D, RM, RS, LN;\n"
+    "uniform sampler2D S, D, RM, RS, LN, LI;\n"
+    "uniform ivec2 mon_col;\n"
     "uniform float enabled, min_gain, gamma_dim, use_ramp, use_dim;\n"
     "uniform float rgb_on, rgb_cyc, rgb_luma, rgb_minl, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_sync, scr_h;\n"
-    "uniform int rgb_fx, rgb_dir;\n"
+    "uniform int rgb_fx, rgb_dir, rgb_cycn;\n"
     "uniform vec3 dim_gain, tint;\n"
     "uniform vec2 lr_size;\n"
     "uniform vec4 lr_box;\n"
@@ -500,10 +560,13 @@ static const char *pl_fs_final =
     "  bool horiz = m.x > 0.5;\n"
     "  float u = horiz ? fc.x : scr_h - fc.y, v = horiz ? fc.y : fc.x;\n"
     "  float sgn = rgb_dir == 1 ? -1.0 : 1.0;\n"
-    "  if (rgb_dir == 2) sgn = (pcg(uint(v / 16.0)) & 1u) == 0u ? 1.0 : -1.0;\n"
+    "  if (rgb_dir == 2) {\n"
+    "    float n = texelFetch(LI, ivec2(horiz ? mon_col.x : mon_col.y, horiz ? int(fc.y) : int(fc.x)), 0).r;\n"
+    "    sgn = mod(n, 2.0) > 0.5 ? 1.0 : -1.0;\n"
+    "  }\n"
     "  float pos = sgn * (u + (rgb_sync > 0.5 ? 0.0 : 13.0 * v));\n"
     "  float hue = rgb_hue / 360.0, span = rgb_span / 360.0;\n"
-    "  float mult = 1.0, w = 1.0;\n"
+    "  float mult = 1.0, w = 1.0, sat_scale = 1.0;\n"
     "  if (rgb_fx == 1) {\n"
     "    mult = mix(0.1, 1.0, 0.5 + 0.5 * sin(6.2831853 * rgb_cyc));\n"
     "  } else if (rgb_fx == 2) {\n"
@@ -517,10 +580,33 @@ static const char *pl_fs_final =
     "    hue += span * (d / rgb_len);\n"
     "  } else if (rgb_fx == 4) {\n"
     "    mult = mix(0.2, 1.0, 0.5 + 0.5 * sin(6.2831853 * (pos / rgb_len - rgb_cyc)));\n"
+    "  } else if (rgb_fx == 5) {\n"
+    "    hue = 0.375;\n"
+    "    float best = 0.1;\n"
+    "    bool head = false;\n"
+    "    for (int l = 0; l < 3; l++) {\n"
+    "      float f = l == 0 ? 1.0 : (l == 1 ? 1.5 : 2.0);\n"
+    "      float ln = rgb_len * (l == 0 ? 1.0 : (l == 1 ? 0.8 : 0.6));\n"
+    "      float per = (ln + rgb_gap) * f;\n"
+    "      float q = pos - rgb_cyc * per;\n"
+    "      float cell = floor(q / per);\n"
+    "      int id = int(cell) - rgb_cycn;\n"
+    "      if (hash2(ivec2(id, l), 17u) < 0.7) {\n"
+    "        float d = ln + hash2(ivec2(id, l + 3), 29u) * (per - ln) - (q - cell * per);\n"
+    "        if (d >= 0.0 && d < ln) {\n"
+    "          float t = 1.0 - d / ln;\n"
+    "          float flick = mix(0.6, 1.0, hash2(ivec2(id * 7 + int(floor(d / 6.0)), l), 41u));\n"
+    "          float v = (0.1 + 0.9 * t * t) * (d < 3.0 ? 1.0 : flick);\n"
+    "          if (v > best) { best = v; head = d < 3.0; }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    mult = best;\n"
+    "    if (head) sat_scale = 0.35;\n"
     "  }\n"
     "  vec3 lin = to_lin(enc);\n"
     "  float lt = clamp(max(dot(lin, W709), rgb_minl) * rgb_luma * mult, 0.0, 1.0);\n"
-    "  vec3 col = to_lin(hue_rgb(hue, rgb_sat));\n"
+    "  vec3 col = to_lin(hue_rgb(hue, rgb_sat * sat_scale));\n"
     "  col *= lt / dot(col, W709);\n"
     "  float a = 0.0;\n"
     "  for (int i = 0; i < 3; i++)\n"
@@ -609,7 +695,7 @@ static inline GLuint pl_program(GLuint vs, const char *fs_src) {
 
 struct pl_glsave {
 	GLint draw_fbo, read_fbo, prog, vao, active_tex, vp[4], sc[4];
-	GLint tex[5], samp[5];
+	GLint tex[6], samp[6];
 	GLint read_buf, draw_buf;
 	GLint bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a;
 	GLboolean blend, scissor, stencil, depth, cull, fb_srgb, mask[4];
@@ -621,7 +707,7 @@ static inline void pl_gl_save(struct pl_glsave *g) {
 	glGetIntegerv(GL_CURRENT_PROGRAM, &g->prog);
 	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &g->vao);
 	glGetIntegerv(GL_ACTIVE_TEXTURE, &g->active_tex);
-	for (int u = 0; u < 5; u++) {
+	for (int u = 0; u < 6; u++) {
 		glActiveTexture(GL_TEXTURE0 + (GLenum)u);
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &g->tex[u]);
 		glGetIntegerv(GL_SAMPLER_BINDING, &g->samp[u]);
@@ -662,7 +748,7 @@ static inline void pl_gl_restore(const struct pl_glsave *g) {
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)g->draw_fbo);
 	glReadBuffer((GLenum)g->read_buf);
 	glDrawBuffer((GLenum)g->draw_buf);
-	for (int u = 4; u >= 0; u--) {
+	for (int u = 5; u >= 0; u--) {
 		glActiveTexture(GL_TEXTURE0 + (GLenum)u);
 		glBindSampler((GLuint)u, (GLuint)g->samp[u]);
 		glBindTexture(GL_TEXTURE_2D, (GLuint)g->tex[u]);
@@ -681,7 +767,7 @@ static inline bool pl_init(struct pl *p) {
 	}
 	const char *fs[PL_NPROG] = {pl_fs_need, pl_fs_dilate, pl_fs_smooth, pl_fs_final, pl_fs_down,  pl_fs_box,
 	                            pl_fs_rdown, pl_fs_ramp,  pl_fs_scene,  pl_fs_linec, pl_fs_liner, pl_fs_lstep,
-                            pl_fs_lclose};
+                            pl_fs_lclose, pl_fs_lhas, pl_fs_lscan};
 	bool ok = true;
 	for (int i = 0; i < PL_NPROG; i++) {
 		p->prog[i] = pl_program(vs, fs[i]);
@@ -710,9 +796,9 @@ static inline bool pl_init(struct pl *p) {
 
 static inline void pl_free_screen(struct pl *p) {
 	if (p->s_tex) {
-		glDeleteTextures(16, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1],
+		glDeleteTextures(18, (GLuint[]){p->s_tex, p->tex_a, p->tex_b, p->dnow, p->st[0], p->st[1],
 		                                p->lr_a, p->lr_b, p->rlr_a, p->rlr_b, p->rs[0], p->rs[1],
-		                                p->rlr_p, p->scn[0], p->scn[1], p->line_tex});
+		                                p->rlr_p, p->scn[0], p->scn[1], p->line_tex, p->lhas, p->lidx});
 		p->s_tex = 0;
 	}
 }
@@ -767,6 +853,9 @@ static inline bool pl_ensure_screen(struct pl *p, int W, int H) {
 	p->rs[1] = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
 	p->rlr_p = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
 	p->line_tex = pl_tex(GL_RG8, GL_RG, W, H);
+	p->lhas = pl_tex(GL_R32F, GL_RED, 2 * PL_MAXMON, W > H ? W : H);
+	p->lidx = pl_tex(GL_R32F, GL_RED, 2 * PL_MAXMON, W > H ? W : H);
+	p->lidx_valid = false;
 	p->ldirty = true;
 	p->line_valid = false;
 	float zeros[2 * PL_MAXMON] = {0};
@@ -1329,6 +1418,37 @@ static inline void pl_lines(struct pl *p, const struct sq_cfg *cfg) {
 	p->used_lv = cfg->v[SQ_RGB_VERTICAL];
 	p->ldirty = false;
 	p->line_valid = true;
+	p->lidx_valid = false;
+}
+
+// Numbers the lines on each monitor for rgb_direction alternate. Horizontal lines and
+// vertical lines are numbered separately, and each monitor starts again at 1.
+static inline void pl_line_index(struct pl *p) {
+	int th = p->W > p->H ? p->W : p->H;
+	pl_base_state();
+	glBindVertexArray(p->vao);
+	glViewport(0, 0, 2 * PL_MAXMON, th);
+	glEnable(GL_SCISSOR_TEST);
+	for (int pass = 0; pass < 2; pass++) {
+		GLuint pr = p->prog[pass == 0 ? PL_LHAS : PL_LSCAN];
+		glUseProgram(pr);
+		glUniform1i(PL_U(pr, pass == 0 ? "LN" : "HAS"), 0);
+		pl_fbo_attach(p, pass == 0 ? p->lhas : p->lidx);
+		pl_bind(0, pass == 0 ? p->line_tex : p->lhas, p->samp_nearest);
+		for (int dir = 0; dir < 2; dir++) {
+			glUniform1i(PL_U(pr, "dir"), dir);
+			for (int i = 0; i < p->nmon; i++) {
+				const struct pl_mon *m = &p->mon[i];
+				int x0 = m->x, y0 = p->H - (m->y + m->h), x1 = m->x + m->w, y1 = p->H - m->y;
+				glUniform4i(PL_U(pr, "box"), x0, y0, x1, y1);
+				int lo = dir == 0 ? y0 : x0, hi = dir == 0 ? y1 : x1;
+				glScissor(dir * PL_MAXMON + i, lo, 1, hi - lo);
+				pl_draw();
+			}
+		}
+	}
+	glDisable(GL_SCISSOR_TEST);
+	p->lidx_valid = true;
 }
 
 static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex, bool use_ramp,
@@ -1373,6 +1493,7 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	glUniform1i(PL_U(pr, "rgb_dir"), (int)cfg->v[SQ_RGB_DIRECTION]);
 	double cyc = pl_trel(p, now) * cfg->v[SQ_RGB_SPEED];
 	glUniform1f(PL_U(pr, "rgb_cyc"), (float)(cyc - floor(cyc)));
+	glUniform1i(PL_U(pr, "rgb_cycn"), (int)fmod(floor(cyc), 1048576.0));
 	glUniform1f(PL_U(pr, "rgb_luma"), (float)cfg->v[SQ_RGB_LUMA]);
 	glUniform1f(PL_U(pr, "rgb_minl"), (float)cfg->v[SQ_RGB_MIN_LUMA]);
 	glUniform1f(PL_U(pr, "rgb_hue"), (float)cfg->v[SQ_RGB_HUE]);
@@ -1390,10 +1511,13 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	pl_bind(2, p->rlr_a, p->samp_linear);
 	pl_bind(3, p->rs[p->rcur], p->samp_linear);
 	pl_bind(4, p->line_tex, p->samp_nearest);
+	pl_bind(5, p->lidx, p->samp_nearest);
+	glUniform1i(PL_U(pr, "LI"), 5);
 	glEnable(GL_SCISSOR_TEST);
 	for (int i = 0; i < p->nmon; i++) {
 		struct pl_lrbox b = pl_lr_box(p, &p->mon[i]);
 		glUniform4f(PL_U(pr, "lr_box"), (float)b.x0, (float)b.y0, (float)b.x1, (float)b.y1);
+		glUniform2i(PL_U(pr, "mon_col"), i, PL_MAXMON + i);
 		pl_scissor_mon(p, &p->mon[i]);
 		pl_draw();
 	}
@@ -1466,6 +1590,9 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		    p->used_lcontrast != cfg->v[SQ_RGB_LINE_CONTRAST] || p->used_lh != cfg->v[SQ_RGB_HORIZONTAL] ||
 		    p->used_lv != cfg->v[SQ_RGB_VERTICAL]) {
 			pl_lines(p, cfg);
+		}
+		if (cfg->v[SQ_RGB_DIRECTION] == 2 && p->line_valid && !p->lidx_valid) {
+			pl_line_index(p);
 		}
 	} else {
 		p->ldirty = true;  // S may change while the lines are not being followed
