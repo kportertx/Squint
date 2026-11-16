@@ -55,14 +55,16 @@ enum {
 	SQ_RGB,
 	SQ_RGB_EFFECT,
 	SQ_RGB_SPEED,
-	SQ_RGB_LUMA,
-	SQ_RGB_MIN_LUMA,
+	SQ_RGB_LUMA_MIN,
+	SQ_RGB_LUMA_MAX,
+	SQ_RGB_FLOOR_LUMA,
 	SQ_RGB_HUE,
 	SQ_RGB_HUE_SPAN,
 	SQ_RGB_SATURATION,
 	SQ_RGB_LENGTH_PX,
 	SQ_RGB_GAP_PX,
 	SQ_RGB_TAIL,
+	SQ_RGB_RAIN_LINE,
 	SQ_RGB_DIRECTION,
 	SQ_RGB_SYNC,
 	SQ_RGB_LINE_MIN_PX,
@@ -204,10 +206,12 @@ static const struct sq_param sq_params[SQ_N] = {
                        NULL, "solid,breathe,rainbow,snake,wave,rain"},
     [SQ_RGB_SPEED] = {"rgb_speed", SQ_FLOAT, 0.5, 0.1, 5.0, 0.1,
                       "Cycles per second for breathe, and for how fast rainbow, snake, and wave travel."},
-    [SQ_RGB_LUMA] = {"rgb_luma", SQ_FLOAT, 1.0, 0.1, 4.0, 0.05,
-                     "Brightness of the color as a multiple of the brightness of the pixel it replaces, after dimming. 1 keeps it, 2 doubles it up to white."},
-    [SQ_RGB_MIN_LUMA] = {"rgb_min_luma", SQ_FLOAT, 0.0, 0.0, 1.0, 0.01,
-                         "Lowest brightness a line starts from before rgb_luma applies, so dark lines can light up. 0 keeps dark lines dark."},
+    [SQ_RGB_LUMA_MIN] = {"rgb_luma_min", SQ_FLOAT, 0.5, 0.1, 4.0, 0.05,
+                         "Lowest brightness multiplier. Each rain drop, snake, rainbow cycle, or line gets a multiplier between this and rgb_luma_max, picked at random. Equal limits give every one the same."},
+    [SQ_RGB_LUMA_MAX] = {"rgb_luma_max", SQ_FLOAT, 1.0, 0.1, 4.0, 0.05,
+                     "Highest brightness multiplier, relative to the brightness of the pixel being replaced, after dimming. 1 keeps it, 2 doubles it up to white."},
+    [SQ_RGB_FLOOR_LUMA] = {"rgb_floor_luma", SQ_FLOAT, 0.0, 0.0, 1.0, 0.01,
+                           "Lowest brightness a line starts from before the multiplier applies, so dark lines can light up. 0 keeps dark lines dark."},
     [SQ_RGB_HUE] = {"rgb_hue", SQ_INT, 200, 0, 359, 5,
                     "Base hue in degrees: 0 red, 120 green, 240 blue. Rainbow starts here."},
     [SQ_RGB_HUE_SPAN] = {"rgb_hue_span", SQ_INT, 360, 0, 360, 10,
@@ -220,6 +224,8 @@ static const struct sq_param sq_params[SQ_N] = {
                        "Unlit pixels between snake segments, or the spacing between rain drops."},
     [SQ_RGB_TAIL] = {"rgb_tail", SQ_FLOAT, 0.6, 0.0, 1.0, 0.05,
                      "How softly a snake fades toward its tail. 0 is a hard block, 1 fades evenly."},
+    [SQ_RGB_RAIN_LINE] = {"rgb_rain_line", SQ_FLOAT, 0.4, 0.0, 1.0, 0.05,
+                          "How much of the original line shows through rain. 0 hides it, 1 shows it everywhere except under the drop heads."},
     [SQ_RGB_DIRECTION] = {"rgb_direction", SQ_ENUM, 0, 0, 2, 1,
                           "Which way motion runs along a line. alternate reverses it on every other line: horizontal lines count from the top and vertical lines from the left, separately, and each screen starts again.",
                           NULL, "forward,backward,alternate"},
@@ -303,6 +309,12 @@ static inline int sq_find(const char *key) {
 	}
 	if (strcmp(key, "rise_ms") == 0) {
 		return SQ_BRIGHTENING_MS;
+	}
+	if (strcmp(key, "rgb_luma") == 0) {
+		return SQ_RGB_LUMA_MAX;
+	}
+	if (strcmp(key, "rgb_min_luma") == 0) {
+		return SQ_RGB_FLOOR_LUMA;
 	}
 	return -1;
 }

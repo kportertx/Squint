@@ -108,7 +108,7 @@ In the tuning screen, which scrolls when the settings do not fit the terminal (t
 
 Settings come in groups. Each group has a toggle, and its settings are indented under it in the file and in the tuning screen. The tuning screen dims a group's settings while its toggle is off. The leading spaces are only layout, so the parser ignores them.
 
-The old names `tau_ms` and `rise_ms` still load as `darkening_ms` and `brightening_ms`.
+The old names `tau_ms` and `rise_ms` still load as `darkening_ms` and `brightening_ms`, and `rgb_luma` and `rgb_min_luma` still load as `rgb_luma_max` and `rgb_floor_luma`.
 
 To flip a toggle from i3 instead of squint's own shortcut keys (see below):
 
@@ -159,14 +159,16 @@ static = false
 rgb = false
   rgb_effect = rainbow
   rgb_speed = 0.50
-  rgb_luma = 1.00
-  rgb_min_luma = 0.00
+  rgb_luma_min = 0.50
+  rgb_luma_max = 1.00
+  rgb_floor_luma = 0.00
   rgb_hue = 200
   rgb_hue_span = 360
   rgb_saturation = 1.00
   rgb_length_px = 120
   rgb_gap_px = 200
   rgb_tail = 0.60
+  rgb_rain_line = 0.40
   rgb_direction = forward
   rgb_sync = false
   rgb_line_min_px = 48
@@ -248,20 +250,22 @@ While static is on, squint presents `static_hz` frames a second, even when nothi
 
 **What counts as a line.** A horizontal line is a band of at most `rgb_line_thick_px` rows of one color, at least `rgb_line_min_px` pixels long. The row on at least one side of the band must differ from it in color by at least `rgb_line_contrast`, the largest difference in any red, green, or blue value as a fraction of 255. A colored line with little brightness contrast, such as a teal border on dark gray, still counts. One side is enough, because a window border or scroll bar often touches a nearly matching color on the other side, and a line on the edge of a monitor has only one side. The search reads the screen as picom drew it, before dimming, tint, static, and the RGB recoloring, so none of those change which pixels are lines. Vertical lines work the same with columns. Where another line of the same color crosses a line, as in a grid, the crossing does not break it: squint bridges crossings up to `rgb_line_thick_px` pixels wide. Two pixels are the same color when no channel differs by more than 5 out of 255. A line stops at the edge of its monitor. A line that crosses two monitors counts on each one separately, so it must be long enough on each.
 
-**What color it gets.** The new color keeps the luminance of the pixel it replaces, measured after dimming and tint, multiplied by `rgb_luma` and capped at white. The hue comes from the effect. When a saturated color cannot be that bright (pure blue tops out near 7 percent luminance), squint mixes it toward gray of the same luminance until it fits, so the luminance is exact and the color gives way. A black line has no luminance to inherit and stays black, unless `rgb_min_luma` sets a floor.
+**What color it gets.** The new color keeps the luminance of the pixel it replaces, measured after dimming and tint, multiplied by a factor and capped at white. The factor is picked at random between `rgb_luma_min` and `rgb_luma_max`: one per rain drop, one per snake, one per full rainbow cycle (`rgb_length_px` long), and one per line for `solid`, `breathe`, and `wave`. The same drop, segment, or line keeps its factor while it moves, and the pick depends only on its position in the pattern, so it does not change from frame to frame. Set the two equal to give everything the same factor. The hue comes from the effect. When a saturated color cannot be that bright (pure blue tops out near 7 percent luminance), squint mixes it toward gray of the same luminance until it fits, so the luminance is exact and the color gives way. A black line has no luminance to inherit and stays black, unless `rgb_floor_luma` sets a floor.
 
 | Setting | Default | Range | Meaning |
 |---|---|---|---|
-| `rgb_effect` | rainbow | solid, breathe, rainbow, snake, wave, rain | `solid` is one color. `breathe` fades it in and out. `rainbow` moves the hue along each line. `snake` moves a lit segment along each line and leaves the rest alone. `wave` moves ripples of brightness along each line. `rain` is green digital rain, in the style of The Matrix: drops with a pale head and a fading trail fall along each line at three speeds, over a dim green glow. |
+| `rgb_effect` | rainbow | solid, breathe, rainbow, snake, wave, rain | `solid` is one color. `breathe` fades it in and out. `rainbow` moves the hue along each line. `snake` moves a lit segment along each line and leaves the rest alone. `wave` moves ripples of brightness along each line. `rain` is green digital rain, in the style of The Matrix: drops with a pale head and a fading trail fall along each line at three speeds, over a dim green glow, with the original line showing through by `rgb_rain_line`. |
 | `rgb_speed` | 0.5 | 0.1 to 5 | Cycles per second for `breathe`. For the others, how many lengths (`rainbow`, `wave`) or segment periods (`snake`) pass per second. |
-| `rgb_luma` | 1.0 | 0.1 to 4 | Brightness multiplier on the brightness of the pixel being replaced. |
-| `rgb_min_luma` | 0 | 0 to 1 | Floor for that brightness before the multiplier, so dark lines can light up. |
+| `rgb_luma_min` | 0.5 | 0.1 to 4 | Lowest brightness multiplier, relative to the brightness of the pixel being replaced. If it is above `rgb_luma_max`, the two swap. |
+| `rgb_luma_max` | 1.0 | 0.1 to 4 | Highest brightness multiplier. 2 doubles the brightness, up to white. |
+| `rgb_floor_luma` | 0 | 0 to 1 | Floor for that brightness before the multiplier, so dark lines can light up. |
 | `rgb_hue` | 200 | 0 to 359 | Base hue in degrees: 0 red, 120 green, 240 blue. `rain` is always green and ignores it. |
 | `rgb_hue_span` | 360 | 0 to 360 | Degrees of hue that `rainbow` and `snake` sweep. |
 | `rgb_saturation` | 1.0 | 0 to 1 | Color strength, up to 1. |
 | `rgb_length_px` | 120 | 10 to 1000 | Length of one `rainbow` or `wave` cycle, of the `snake` segment, or of the longest `rain` trail. |
 | `rgb_gap_px` | 200 | 0 to 2000 | Unlit pixels between `snake` segments, or the spacing between `rain` drops. |
 | `rgb_tail` | 0.6 | 0 to 1 | How softly a `snake` fades toward its tail. 0 is a hard block. |
+| `rgb_rain_line` | 0.4 | 0 to 1 | How much of the original line shows through `rain`. 0 hides it. 1 shows it everywhere except under the drop heads. The trail fades back toward the line. |
 | `rgb_direction` | forward | forward, backward, alternate | Which way motion runs along a line: right or down, left or up, or reversed on every other line. `alternate` numbers the lines on each monitor separately: horizontal lines from the top, vertical lines from the left, each counted on its own. Odd lines run forward and even lines backward, and every monitor starts again at 1. Rows that touch each other count as one line, so a 3 px band is one line. |
 | `rgb_sync` | false | false to true | On, every line moves in step. Off, each line has its own phase. |
 | `rgb_line_min_px` | 48 | 8 to 256 | Shortest run that counts as a line. |
@@ -315,7 +319,7 @@ squint writes a log to `/tmp/squint.log`, or to the file named by `SQUINT_LOG`. 
 - the config file format, clamping, and the grouped layout;
 - all eight combinations of the brightness, dim_tint, and static toggles;
 - the RGB line search against a brute-force model, with thickness, length, color contrast on one side or neither, crossing lines, lines on monitor edges and along the seam between monitors, and a check that dimming, tint, and static do not change which pixels are lines;
-- the RGB effects: luminance inheritance, the gamut fallback, the minimum luminance, the timing of each effect, the green and pale heads of `rain` and its continuity at the end of a cycle, and `alternate` numbering per monitor and per orientation;
+- the RGB effects: luminance inheritance, the brightness range (per rain drop, per snake, per rainbow cycle, and per line, and that none of them jumps at the end of an animation cycle), the `rgb_rain_line` blend, the gamut fallback, the minimum luminance, the timing of each effect, the green and pale heads of `rain` and its continuity at the end of a cycle, and `alternate` numbering per monitor and per orientation;
 - the shortcut chord parser, the text settings that hold chords, and the enum settings (names, ranges, and the file round trip).
 
 `make test` also runs `test/hotkey_test.c`, which grabs a chord on the running X server and sends key presses with the XTest extension. It checks that a chord fires once, that a repeat inside 0.3 s is ignored, that the wrong modifiers do not fire, that a chord another connection already holds is refused, and that released keys are free to grab again. The chord is Ctrl+Alt plus a spare key (F24, or one of the XF86Launch keys), which the test grabs before sending it. It also checks that key names match without regard to case, and that recording a chord from real key presses gets Super+F1, modifiers in a fixed order, and Ctrl+Escape right, ignores modifiers pressed alone, cancels on Escape, and times out. If the keyboard has none of them, or the server has no XTest extension, the test says so and passes.
@@ -339,7 +343,7 @@ The pipeline test needs a display and a GPU driver with OpenGL 3.3. The CPU mode
 - **Memory.** squint keeps several full-screen textures, about 16 bytes per pixel of the root window, or about 160 MB for a 3760x2640 root.
 - **RGB cost.** The search for lines is full-screen and runs whenever picom draws anything, even a blinking cursor. On the benchmark setup (3840x2640, three monitors) it took 8.3 ms with `rgb_line_min_px` 16, 11.4 ms with 64, and 12.5 ms with 256. The animation itself added about 0.15 ms a frame. Searching only the damaged part of the screen would cut this, and is not done.
 - **RGB false positives.** Anything flat and thin that contrasts with one side counts, such as a 2 px colored header bar, a divider, or a progress bar. Text underlines are usually too short. Raise `rgb_line_min_px` or `rgb_line_contrast` to drop weaker matches. A line that is anti-aliased, a gradient, or a different color in each pixel is not found.
-- **Line numbers for `alternate`.** Lines are numbered by the rows (or columns) they occupy on a monitor, not one by one. Two horizontal lines side by side in the same rows, such as the top borders of two panes, share a number. The numbering costs about 0.7 ms a frame and runs only while `rgb_direction` is `alternate`.
+- **Line numbers.** `alternate` and the per-line brightness pick number the lines by the rows (or columns) they occupy on a monitor, not one by one. Two horizontal lines side by side in the same rows, such as the top borders of two panes, share a number, and so share a brightness factor. The numbering costs about 0.7 ms a frame and runs while `rgb_direction` is `alternate` or `rgb_luma_min` differs from `rgb_luma_max`, which is the default.
 - **RGB speed unit.** `rgb_speed` is a cycle rate, so changing it while an effect runs makes the animation jump to a new phase.
 - **Fixed thresholds.** The scene-change thresholds (0.03 or 25 percent per sample point), the size measure's range (0.2 to 0.5), and the same-color tolerance of the line search (5 out of 255) are constants in `src/pipeline.h`, not settings.
 - **No test window.** The original plan included a test window that alternates between black and white. It has not been written.

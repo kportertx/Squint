@@ -481,7 +481,10 @@ static const char *pl_fs_lstep =
 //
 // RGB lines recolor the pixels that line_tex marks, after dimming and tint and before
 // static. The new color keeps the luminance of the pixel it replaces, raised to
-// max(L, rgb_minl) and multiplied by rgb_luma, at most 1. A hue and saturation set the
+// max(L, rgb_floor) and multiplied by a factor between rgb_lmin and rgb_lmax, at most 1.
+// The factor is picked by a hash, per drop for rain, per snake for snake, per full hue cycle for
+// rainbow, and per line (by its number, from the line index texture) for the other effects, so lines and drops differ
+// in brightness when the two limits differ. A hue and saturation set the
 // direction of the color. When that color cannot reach the luminance without a channel over 1
 // (blue tops out near 7%), it is mixed toward gray of the same luminance until it fits, so
 // the luminance is exact and only the saturation gives way. u is the position along the
@@ -492,7 +495,8 @@ static const char *pl_fs_lstep =
 // numbered minus the whole cycle count, so the pattern does not jump when the cycle fraction
 // wraps. The head is whiter (saturation 0.35), the trail fades with the square of the
 // distance from the head, a glyph-like flicker changes it every 6 px of the drop, and the bare line glows
-// at 0.1. rgb_cyc is the fraction of the current cycle, 0 to 1, computed on the CPU in
+// at 0.1. The rain color is mixed over the original pixel with weight 1 - keep * (1 - s),
+// where s is the strength of the drop, 0 off a drop and 1 at the head and keep is rgb_rain_line. rgb_cyc is the fraction of the current cycle, 0 to 1, computed on the CPU in
 // double precision so a long uptime does not blur the animation.
 //
 // Static is mixed in last, in encoded color: out = mix(color, noise, static_amt). Every
@@ -508,7 +512,7 @@ static const char *pl_fs_final =
     "uniform sampler2D S, D, RM, RS, LN, LI;\n"
     "uniform ivec2 mon_col;\n"
     "uniform float enabled, min_gain, gamma_dim, use_ramp, use_dim;\n"
-    "uniform float rgb_on, rgb_cyc, rgb_luma, rgb_minl, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_sync, scr_h;\n"
+    "uniform float rgb_on, rgb_cyc, rgb_lmin, rgb_lmax, rgb_floor, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_keep, rgb_sync, scr_h;\n"
     "uniform int rgb_fx, rgb_dir, rgb_cycn;\n"
     "uniform vec3 dim_gain, tint;\n"
     "uniform vec2 lr_size;\n"
@@ -559,11 +563,12 @@ static const char *pl_fs_final =
     "vec3 rgb_apply(vec3 enc, vec2 m, vec2 fc) {\n"
     "  bool horiz = m.x > 0.5;\n"
     "  float u = horiz ? fc.x : scr_h - fc.y, v = horiz ? fc.y : fc.x;\n"
+    "  int mcol = horiz ? mon_col.x : mon_col.y;\n"
+    "  float lnum = texelFetch(LI, ivec2(mcol, horiz ? int(fc.y) : int(fc.x)), 0).r;\n"
+    "  int lid = int(lnum) * 64 + mcol;\n"
+    "  float r = hash2(ivec2(lid, 5), 53u);\n"
     "  float sgn = rgb_dir == 1 ? -1.0 : 1.0;\n"
-    "  if (rgb_dir == 2) {\n"
-    "    float n = texelFetch(LI, ivec2(horiz ? mon_col.x : mon_col.y, horiz ? int(fc.y) : int(fc.x)), 0).r;\n"
-    "    sgn = mod(n, 2.0) > 0.5 ? 1.0 : -1.0;\n"
-    "  }\n"
+    "  if (rgb_dir == 2) sgn = mod(lnum, 2.0) > 0.5 ? 1.0 : -1.0;\n"
     "  float pos = sgn * (u + (rgb_sync > 0.5 ? 0.0 : 13.0 * v));\n"
     "  float hue = rgb_hue / 360.0, span = rgb_span / 360.0;\n"
     "  float mult = 1.0, w = 1.0, sat_scale = 1.0;\n"
@@ -571,11 +576,13 @@ static const char *pl_fs_final =
     "    mult = mix(0.1, 1.0, 0.5 + 0.5 * sin(6.2831853 * rgb_cyc));\n"
     "  } else if (rgb_fx == 2) {\n"
     "    float ph = fract(pos / rgb_len - rgb_cyc);\n"
+    "    r = hash2(ivec2(int(floor(pos / rgb_len - rgb_cyc)) - rgb_cycn, lid), 71u);\n"
     "    hue += span * (span >= 0.999 ? ph : 1.0 - abs(2.0 * ph - 1.0));\n"
     "  } else if (rgb_fx == 3) {\n"
     "    float per = rgb_len + rgb_gap;\n"
     "    float d = mod(rgb_cyc * per - pos, per);\n"
     "    if (d >= rgb_len) return enc;\n"
+    "    r = hash2(ivec2(int(floor((rgb_cyc * per - pos) / per)) + rgb_cycn, lid), 61u);\n"
     "    w = mix(1.0, 1.0 - d / rgb_len, rgb_tail);\n"
     "    hue += span * (d / rgb_len);\n"
     "  } else if (rgb_fx == 4) {\n"
@@ -597,15 +604,17 @@ static const char *pl_fs_final =
     "          float t = 1.0 - d / ln;\n"
     "          float flick = mix(0.6, 1.0, hash2(ivec2(id * 7 + int(floor(d / 6.0)), l), 41u));\n"
     "          float v = (0.1 + 0.9 * t * t) * (d < 3.0 ? 1.0 : flick);\n"
-    "          if (v > best) { best = v; head = d < 3.0; }\n"
+    "          if (v > best) { best = v; head = d < 3.0; r = hash2(ivec2(id, l + 9), 67u); }\n"
     "        }\n"
     "      }\n"
     "    }\n"
     "    mult = best;\n"
+    "    w = 1.0 - rgb_keep * (1.0 - (best - 0.1) / 0.9);\n"
     "    if (head) sat_scale = 0.35;\n"
     "  }\n"
     "  vec3 lin = to_lin(enc);\n"
-    "  float lt = clamp(max(dot(lin, W709), rgb_minl) * rgb_luma * mult, 0.0, 1.0);\n"
+    "  float lf = mix(min(rgb_lmin, rgb_lmax), max(rgb_lmin, rgb_lmax), r);\n"
+    "  float lt = clamp(max(dot(lin, W709), rgb_floor) * lf * mult, 0.0, 1.0);\n"
     "  vec3 col = to_lin(hue_rgb(hue, rgb_sat * sat_scale));\n"
     "  col *= lt / dot(col, W709);\n"
     "  float a = 0.0;\n"
@@ -1494,14 +1503,16 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	double cyc = pl_trel(p, now) * cfg->v[SQ_RGB_SPEED];
 	glUniform1f(PL_U(pr, "rgb_cyc"), (float)(cyc - floor(cyc)));
 	glUniform1i(PL_U(pr, "rgb_cycn"), (int)fmod(floor(cyc), 1048576.0));
-	glUniform1f(PL_U(pr, "rgb_luma"), (float)cfg->v[SQ_RGB_LUMA]);
-	glUniform1f(PL_U(pr, "rgb_minl"), (float)cfg->v[SQ_RGB_MIN_LUMA]);
+	glUniform1f(PL_U(pr, "rgb_lmin"), (float)cfg->v[SQ_RGB_LUMA_MIN]);
+	glUniform1f(PL_U(pr, "rgb_lmax"), (float)cfg->v[SQ_RGB_LUMA_MAX]);
+	glUniform1f(PL_U(pr, "rgb_floor"), (float)cfg->v[SQ_RGB_FLOOR_LUMA]);
 	glUniform1f(PL_U(pr, "rgb_hue"), (float)cfg->v[SQ_RGB_HUE]);
 	glUniform1f(PL_U(pr, "rgb_span"), (float)cfg->v[SQ_RGB_HUE_SPAN]);
 	glUniform1f(PL_U(pr, "rgb_sat"), (float)cfg->v[SQ_RGB_SATURATION]);
 	glUniform1f(PL_U(pr, "rgb_len"), (float)cfg->v[SQ_RGB_LENGTH_PX]);
 	glUniform1f(PL_U(pr, "rgb_gap"), (float)cfg->v[SQ_RGB_GAP_PX]);
 	glUniform1f(PL_U(pr, "rgb_tail"), (float)cfg->v[SQ_RGB_TAIL]);
+	glUniform1f(PL_U(pr, "rgb_keep"), (float)cfg->v[SQ_RGB_RAIN_LINE]);
 	glUniform1f(PL_U(pr, "rgb_sync"), (float)cfg->v[SQ_RGB_SYNC]);
 	glUniform1f(PL_U(pr, "scr_h"), (float)p->H);
 	glUniform1ui(PL_U(pr, "frame"), (GLuint)(unsigned long long)floor(pl_trel(p, now) * hz));
@@ -1591,7 +1602,8 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		    p->used_lv != cfg->v[SQ_RGB_VERTICAL]) {
 			pl_lines(p, cfg);
 		}
-		if (cfg->v[SQ_RGB_DIRECTION] == 2 && p->line_valid && !p->lidx_valid) {
+		if ((cfg->v[SQ_RGB_DIRECTION] == 2 || cfg->v[SQ_RGB_LUMA_MIN] != cfg->v[SQ_RGB_LUMA_MAX]) &&
+		    p->line_valid && !p->lidx_valid) {
 			pl_line_index(p);
 		}
 	} else {

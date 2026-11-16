@@ -1859,6 +1859,10 @@ static void read_lines(uint8_t *g) {
 	free(tmp);
 }
 
+static void set_luma(struct sq_cfg *c, double v) {
+	c->v[SQ_RGB_LUMA_MIN] = c->v[SQ_RGB_LUMA_MAX] = v;
+}
+
 static struct sq_cfg rgb_cfg(void) {
 	struct sq_cfg c = base_cfg();
 	c.v[SQ_BRIGHTNESS] = 0;
@@ -1866,14 +1870,15 @@ static struct sq_cfg rgb_cfg(void) {
 	c.v[SQ_RGB] = 1;
 	c.v[SQ_RGB_EFFECT] = 0;
 	c.v[SQ_RGB_SPEED] = 1.0;
-	c.v[SQ_RGB_LUMA] = 1.0;
-	c.v[SQ_RGB_MIN_LUMA] = 0.0;
+	set_luma(&c, 1.0);
+	c.v[SQ_RGB_FLOOR_LUMA] = 0.0;
 	c.v[SQ_RGB_HUE] = 200;
 	c.v[SQ_RGB_HUE_SPAN] = 360;
 	c.v[SQ_RGB_SATURATION] = 1.0;
 	c.v[SQ_RGB_LENGTH_PX] = 60;
 	c.v[SQ_RGB_GAP_PX] = 60;
 	c.v[SQ_RGB_TAIL] = 0.0;
+	c.v[SQ_RGB_RAIN_LINE] = 0.0;
 	c.v[SQ_RGB_DIRECTION] = 0;
 	c.v[SQ_RGB_SYNC] = 1;
 	c.v[SQ_RGB_LINE_MIN_PX] = 48;
@@ -2137,13 +2142,13 @@ static void test_rgb_effects(void) {
 	CHECK(chroma(100, 20) > 40, "solid is colored (chroma %d)", chroma(100, 20));
 	expect_px("pixels that are not on a line are untouched", 120, 5, 255, 0);
 	expect_px("a short line is untouched", 20, 80, 100, 0);
-	c.v[SQ_RGB_LUMA] = 2.0;
+	set_luma(&c, 2.0);
 	render(&c, 100.1);
 	expect_lum("rgb_luma 2 doubles it", 100, 20, 2 * L0, 0.008);
-	c.v[SQ_RGB_LUMA] = 4.0;
+	set_luma(&c, 4.0);
 	render(&c, 100.2);
 	expect_lum("rgb_luma 4 keeps the exact luminance although blue runs out", 100, 20, 4 * L0, 0.01);
-	c.v[SQ_RGB_LUMA] = 1.0;
+	set_luma(&c, 1.0);
 
 	// Breathe: 0.1 + 0.9 * (0.5 + 0.5 sin(2 pi cycle)). The first render fixed cycle 0 at t = 100.
 	c.v[SQ_RGB_EFFECT] = 1;
@@ -2240,6 +2245,39 @@ static void test_rgb_effects(void) {
 	for (int x = 12; x < 228; x++)
 		if (abs(at(x, 20)[1] - before[x * 4 + 1]) > 10) jumped++;
 	CHECK(jumped <= 2, "no jump at the end of a cycle: %d pixels changed in 0.0002 cycles", jumped);
+	// rgb_rain_line: how much of the original line shows through. 0 is what the checks above saw.
+	render(&c, 104.0);
+	uint8_t hide[240 * 4];
+	memcpy(hide, out + (size_t)20 * W * 4, sizeof hide);
+	c.v[SQ_RGB_RAIN_LINE] = 1.0;
+	render(&c, 104.0);
+	int gaps = 0, gaps_kept = 0, heads_ok = 0, heads = 0;
+	for (int x = 12; x < 228; x++) {
+		double l0 = lum(hide + x * 4);
+		const uint8_t *p = at(x, 20);
+		if (l0 < 0.105 * L0) {  // the bare glow, off every drop
+			gaps++;
+			if (abs(p[0] - 100) <= 1 && abs(p[1] - 100) <= 1 && abs(p[2] - 100) <= 1) gaps_kept++;
+		}
+		if (l0 > 0.95 * L0) {
+			heads++;
+			if (fabs(lum(p) - l0) < 0.01 && p[1] >= p[0]) heads_ok++;
+		}
+	}
+	CHECK(gaps > 20 && gaps_kept == gaps, "at 1 the bare line is the original line: %d of %d gap pixels", gaps_kept, gaps);
+	CHECK(heads > 0 && heads_ok == heads, "at 1 the drop heads are still rain: %d of %d", heads_ok, heads);
+	c.v[SQ_RGB_RAIN_LINE] = 0.5;
+	render(&c, 104.0);
+	int between = 0, gaps2 = 0;
+	for (int x = 12; x < 228; x++) {
+		double l0 = lum(hide + x * 4), l5 = lum(at(x, 20));
+		if (l0 < 0.2 * L0) {
+			gaps2++;
+			if (l5 > l0 + 0.01 && l5 < L0 - 0.01) between++;
+		}
+	}
+	CHECK(between == gaps2, "at 0.5 the bare line is part way: %d of %d gap pixels", between, gaps2);
+	c.v[SQ_RGB_RAIN_LINE] = 0.0;
 	// The same time gives the same picture, so the pattern depends on time and not on history.
 	render(&c, 104.2);
 	memcpy(before, out + (size_t)20 * W * 4, sizeof before);
@@ -2280,7 +2318,7 @@ static void test_rgb_effects(void) {
 	put((struct pl_rect){10, 20, 110, 21}, 255, 255, 255);
 	capture_full(0);
 	struct sq_cfg w = rgb_cfg();
-	w.v[SQ_RGB_LUMA] = 1.0;
+	set_luma(&w, 1.0);
 	render(&w, 0);
 	CHECK(at(60, 20)[0] >= 252 && at(60, 20)[1] >= 252 && at(60, 20)[2] >= 252, "a white line stays white at luma 1 (%d,%d,%d)", at(60, 20)[0], at(60, 20)[1], at(60, 20)[2]);
 	w.v[SQ_BRIGHTNESS] = 1;
@@ -2290,7 +2328,7 @@ static void test_rgb_effects(void) {
 	w.v[SQ_FALLOFF_PX] = 0;
 	render(&w, 0.1);
 	expect_lum("a dimmed white line takes the dimmed luminance", 60, 20, 0.3, 0.012);
-	w.v[SQ_RGB_LUMA] = 2.0;
+	set_luma(&w, 2.0);
 	render(&w, 0.2);
 	expect_lum("rgb_luma 2 raises the dimmed luminance", 60, 20, 0.6, 0.015);
 	teardown();
@@ -2319,7 +2357,7 @@ static void test_rgb_effects(void) {
 	struct sq_cfg k = rgb_cfg();
 	render(&k, 0);
 	expect_px("a black line stays black by default", 60, 20, 0, 2);
-	k.v[SQ_RGB_MIN_LUMA] = 0.3;
+	k.v[SQ_RGB_FLOOR_LUMA] = 0.3;
 	render(&k, 0.1);
 	expect_lum("rgb_min_luma gives it a floor", 60, 20, 0.3, 0.01);
 	teardown();
@@ -2432,6 +2470,146 @@ static void test_rgb_alternate(void) {
 	teardown();
 }
 
+// rgb_luma_min and rgb_luma_max: every rain drop, snake segment, or line gets a brightness
+// multiplier between them. Equal limits give all of them the same one.
+static void test_rgb_luma_range(void) {
+	printf("rgb luma range\n");
+	double L0 = lum((uint8_t[]){100, 100, 100});
+	struct sq_cfg c = rgb_cfg();
+	struct pl_mon mw[] = {{0, 0, 1200, 40}};
+
+	// Rain: the pale head pixels show each drop's multiplier.
+	setup(1200, 40, mw, 1);
+	put((struct pl_rect){0, 0, 1200, 40}, 255, 255, 255);
+	put((struct pl_rect){10, 20, 1190, 21}, 100, 100, 100);
+	capture_full(0);
+	c.v[SQ_RGB_EFFECT] = 5;
+	c.v[SQ_RGB_LENGTH_PX] = 40;
+	c.v[SQ_RGB_GAP_PX] = 40;
+	double spread[2];
+	double lo_seen = 1, hi_seen = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		c.v[SQ_RGB_LUMA_MIN] = pass == 0 ? 1.0 : 0.3;
+		c.v[SQ_RGB_LUMA_MAX] = 1.0;
+		render(&c, 104.0);
+		double mn = 1, mx = 0;
+		int heads = 0;
+		for (int x = 12; x < 1188; x++) {
+			const uint8_t *p = at(x, 20);
+			if (p[1] > 20 && p[0] > 0.4 * p[1]) {
+				double l = lum(p);
+				mn = fmin(mn, l);
+				mx = fmax(mx, l);
+				heads++;
+			}
+		}
+		spread[pass] = (mx - mn) / L0;
+		if (pass == 1) {
+			lo_seen = mn;
+			hi_seen = mx;
+		}
+		CHECK(heads > 40, "enough drop heads to measure: %d", heads);
+	}
+	CHECK(spread[0] < 0.3, "equal limits: heads differ only by where in the head they sit (spread %.2f)", spread[0]);
+	CHECK(spread[1] > 0.55, "0.3 to 1: heads differ a lot (spread %.2f)", spread[1]);
+	CHECK(hi_seen <= L0 + 0.01 && lo_seen >= 0.2 * L0, "every head is between the limits: %.4f to %.4f of %.4f", lo_seen, hi_seen, L0);
+	// The limits may be given in either order.
+	c.v[SQ_RGB_LUMA_MIN] = 0.3;
+	c.v[SQ_RGB_LUMA_MAX] = 1.0;
+	render(&c, 104.0);
+	uint8_t first[1200 * 4];
+	memcpy(first, out + (size_t)20 * W * 4, sizeof first);
+	c.v[SQ_RGB_LUMA_MIN] = 1.0;
+	c.v[SQ_RGB_LUMA_MAX] = 0.3;
+	render(&c, 104.0);
+	CHECK(memcmp(first, out + (size_t)20 * W * 4, sizeof first) == 0, "swapped limits give the same picture");
+
+	// Snake: one multiplier per segment, constant along it.
+	c.v[SQ_RGB_EFFECT] = 3;
+	c.v[SQ_RGB_LENGTH_PX] = 100;
+	c.v[SQ_RGB_GAP_PX] = 100;
+	c.v[SQ_RGB_SYNC] = 1;
+	c.v[SQ_RGB_LUMA_MIN] = 0.2;
+	c.v[SQ_RGB_LUMA_MAX] = 3.0;
+	render(&c, 105.0);
+	double seg[5];
+	int distinct = 0;
+	for (int k = 0; k < 5; k++) seg[k] = lum(at(150 + 200 * k, 20));
+	for (int k = 1; k < 5; k++)
+		if (fabs(seg[k] - seg[0]) > 0.03) distinct++;
+	CHECK(distinct >= 2, "snake segments differ in brightness: %.3f %.3f %.3f %.3f %.3f", seg[0], seg[1], seg[2], seg[3], seg[4]);
+	for (int k = 0; k < 5; k++) CHECK(seg[k] > 0.15 * L0 && seg[k] < 3.1 * L0, "segment %d is within the limits: %.4f", k, seg[k]);
+	CHECK(fabs(lum(at(120, 20)) - lum(at(190, 20))) < 0.004, "a segment is one brightness from end to end: %.4f and %.4f", lum(at(120, 20)), lum(at(190, 20)));
+	c.v[SQ_RGB_LUMA_MIN] = c.v[SQ_RGB_LUMA_MAX] = 1.0;
+	render(&c, 105.0);
+	for (int k = 0; k < 5; k++) CHECK(fabs(lum(at(150 + 200 * k, 20)) - lum(at(150, 20))) < 0.004, "equal limits: segment %d matches the first", k);
+
+	// No change of a snake's brightness where the cycle count rolls over: it keeps its multiplier.
+	c.v[SQ_RGB_LUMA_MIN] = 0.2;
+	c.v[SQ_RGB_LUMA_MAX] = 3.0;
+	render(&c, 109.9999);
+	double snake_before[5];
+	for (int k = 0; k < 5; k++) snake_before[k] = lum(at(150 + 200 * k, 20));
+	render(&c, 110.0001);
+	for (int k = 0; k < 5; k++)
+		CHECK(fabs(lum(at(150 + 200 * k, 20)) - snake_before[k]) < 0.004, "snake %d keeps its brightness across the end of an animation cycle: %.4f then %.4f", k, snake_before[k], lum(at(150 + 200 * k, 20)));
+	c.v[SQ_RGB_LUMA_MIN] = c.v[SQ_RGB_LUMA_MAX] = 1.0;
+
+	// Rainbow: one multiplier per full hue cycle. At cycle 0 a cycle starts where (x + 0.5) is a
+	// multiple of 60, so pixels 60 k + 10 and 60 k + 50 share one.
+	c.v[SQ_RGB_EFFECT] = 2;
+	c.v[SQ_RGB_LENGTH_PX] = 60;
+	c.v[SQ_RGB_LUMA_MIN] = 0.2;
+	c.v[SQ_RGB_LUMA_MAX] = 3.0;
+	render(&c, 106.0);
+	double cyc_l[12];
+	int same_in = 0, differ = 0;
+	for (int k = 0; k < 12; k++) {
+		double a = lum(at(60 * k + 10, 20)), b = lum(at(60 * k + 50, 20));
+		cyc_l[k] = a;
+		if (fabs(a - b) < 0.004) same_in++;
+		CHECK(a > 0.15 * L0 && a < 3.1 * L0, "rainbow cycle %d is within the limits: %.4f", k, a);
+	}
+	for (int k = 1; k < 12; k++)
+		if (fabs(cyc_l[k] - cyc_l[0]) > 0.03) differ++;
+	CHECK(same_in == 12, "a rainbow cycle has one brightness from start to end: %d of 12", same_in);
+	CHECK(differ >= 5, "rainbow cycles differ in brightness: %d of 11 differ from the first", differ);
+	CHECK(chroma(70, 20) > 40 && chroma(100, 20) > 40, "it is still a rainbow");
+	// No jump where the cycle count rolls over.
+	render(&c, 107.9999);
+	uint8_t before_rb[1200 * 4];
+	memcpy(before_rb, out + (size_t)20 * W * 4, sizeof before_rb);
+	render(&c, 108.0001);
+	int jumped_rb = 0;
+	for (int x = 12; x < 1188; x++) {
+		const uint8_t *p = out + ((size_t)20 * W + x) * 4;
+		if (fabs(lum(p) - lum(before_rb + x * 4)) > 0.02) jumped_rb++;
+	}
+	CHECK(jumped_rb <= 2, "no brightness jump at the end of an animation cycle: %d pixels", jumped_rb);
+	c.v[SQ_RGB_LUMA_MIN] = c.v[SQ_RGB_LUMA_MAX] = 1.0;
+	render(&c, 106.0);
+	for (int k = 0; k < 12; k++) CHECK(fabs(lum(at(60 * k + 30, 20)) - lum(at(40, 20))) < 0.004, "equal limits: rainbow cycle %d matches the first", k);
+	teardown();
+
+	// Solid: one multiplier per line.
+	struct pl_mon m1[] = {{0, 0, 240, 160}};
+	setup(240, 160, m1, 1);
+	draw_lines_scene();
+	capture_full(0);
+	c = rgb_cfg();
+	c.v[SQ_RGB_LUMA_MIN] = 0.2;
+	c.v[SQ_RGB_LUMA_MAX] = 3.0;
+	render(&c, 100.0);
+	double h1 = lum(at(100, 20)), h2 = lum(at(100, 41)), v1 = lum(at(200, 120));
+	CHECK(fabs(h1 - h2) > 0.03 || fabs(h1 - v1) > 0.03 || fabs(h2 - v1) > 0.03, "lines differ: %.3f %.3f %.3f", h1, h2, v1);
+	CHECK(h1 >= 0.2 * L0 - 0.01 && h1 <= 3 * L0 + 0.01 && h2 >= 0.2 * L0 - 0.01 && h2 <= 3 * L0 + 0.01 && v1 >= 0.2 * L0 - 0.01 && v1 <= 3 * L0 + 0.01,
+	      "each line is within the limits");
+	CHECK(fabs(lum(at(30, 20)) - lum(at(210, 20))) < 0.004 && fabs(lum(at(200, 100)) - lum(at(200, 140))) < 0.004, "a line has one brightness along its length");
+	render(&c, 100.0);  // the same again, from the same line numbers
+	CHECK(fabs(lum(at(100, 20)) - h1) < 0.001, "the multiplier of a line is stable");
+	teardown();
+}
+
 static void test_rgb_config(void) {
 	printf("rgb settings\n");
 	struct sq_cfg c;
@@ -2455,6 +2633,19 @@ static void test_rgb_config(void) {
 	CHECK(!strcmp(v, "alternate"), "the last direction is named: %s", v);
 	sq_format_value(SQ_RGB_EFFECT, sq_params[SQ_RGB_EFFECT].min, v, sizeof v);
 	CHECK(!strcmp(v, "solid"), "the range starts at solid: %s", v);
+	{
+		const char *old = "/tmp/squint-rgb-old.conf";
+		FILE *o = fopen(old, "w");
+		fputs("rgb_luma = 2\nrgb_min_luma = 0.3\n", o);
+		fclose(o);
+		struct sq_cfg oc;
+		sq_load(old, &oc);
+		CHECK(oc.v[SQ_RGB_LUMA_MAX] == 2 && oc.v[SQ_RGB_FLOOR_LUMA] == 0.3 && oc.v[SQ_RGB_LUMA_MIN] == 0.5,
+		      "the old names rgb_luma and rgb_min_luma still load, as rgb_luma_max and rgb_floor_luma");
+		unlink(old);
+	}
+	CHECK(sq_params[SQ_RGB_LUMA_MIN].def == 0.5 && sq_params[SQ_RGB_LUMA_MAX].def == 1.0, "the luma range defaults to 0.5 to 1");
+	CHECK(sq_params[SQ_RGB_RAIN_LINE].def == 0.4 && sq_group(SQ_RGB_RAIN_LINE) == SQ_RGB, "rgb_rain_line defaults to 0.4, inside the rgb group");
 	CHECK(sq_set(&c, "rgb", "true") && sq_set(&c, "rgb_direction", "alternate") && sq_set(&c, "rgb_line_thick_px", "9") &&
 	          c.v[SQ_RGB_LINE_THICK_PX] == 5,
 	      "thickness is limited to 5");
@@ -2506,6 +2697,7 @@ int main(void) {
 	test_rgb_lines();
 	test_rgb_effects();
 	test_rgb_alternate();
+	test_rgb_luma_range();
 	printf("\n%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }
