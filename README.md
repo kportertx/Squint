@@ -159,6 +159,7 @@ static = false
 rgb = false
   rgb_effect = rainbow
   rgb_speed = 0.50
+  rgb_hz = 60
   rgb_luma_min = 0.50
   rgb_luma_max = 1.00
   rgb_floor_luma = 0.00
@@ -169,7 +170,12 @@ rgb = false
   rgb_gap_px = 200
   rgb_tail = 0.60
   rgb_rain_line = 0.40
+  rgb_rain_flash = 0.30
+  rgb_rain_flash_gain = 2.50
+  rgb_rain_flash_ms = 250
+  rgb_rain_flash_speed = 300
   rgb_direction = forward
+  rgb_alt_pitch_px = 20
   rgb_sync = false
   rgb_line_min_px = 48
   rgb_line_thick_px = 3
@@ -234,7 +240,7 @@ Each update draws a fresh, independent pattern with no blending between updates.
 | `static_amount` | 4 | 0 to 100 | How much of the screen is static. 100 is pure static, and lower values mix it over the content. |
 | `static_grain_px` | 16.0 | 1 to 16 | Size of one speckle in pixels. |
 | `static_color` | 0.5 | 0 to 1 | 0 is gray static. 1 is independent noise in each color channel. |
-| `static_hz` | 60 | 1 to 60 | Updates per second. |
+| `static_hz` | 60 | 1 to 120 | Updates per second. |
 | `static_level` | 0.5 | 0 to 1 | Average brightness of the static. 0.5 is middle gray. |
 | `static_contrast` | 0.10 | 0 to 0.5 | How far speckles stray from the average. |
 | `static_clusters` | 0.3 | 0 to 1 | How much coarse clustering, speckles grouped 3 to 6 pixels wide, is mixed in. |
@@ -254,8 +260,9 @@ While static is on, squint presents `static_hz` frames a second, even when nothi
 
 | Setting | Default | Range | Meaning |
 |---|---|---|---|
-| `rgb_effect` | rainbow | solid, breathe, rainbow, snake, wave, rain | `solid` is one color. `breathe` fades it in and out. `rainbow` moves the hue along each line. `snake` moves a lit segment along each line and leaves the rest alone. `wave` moves ripples of brightness along each line. `rain` is green digital rain, in the style of The Matrix: drops with a pale head and a fading trail fall along each line at three speeds, over a dim green glow, with the original line showing through by `rgb_rain_line`. |
-| `rgb_speed` | 0.5 | 0.1 to 5 | Cycles per second for `breathe`. For the others, how many lengths (`rainbow`, `wave`) or segment periods (`snake`) pass per second. |
+| `rgb_effect` | rainbow | solid, breathe, rainbow, snake, wave, rain | `solid` is one color. `breathe` fades it in and out. `rainbow` moves the hue along each line. `snake` moves a lit segment along each line and leaves the rest alone. `wave` moves ripples of brightness along each line. `rain` is green digital rain, in the style of The Matrix: drops with a pale head and a fading trail fall along each line at three speeds, over a dim green glow, with the original line showing through by `rgb_rain_line`. Where drops overlap their luminosities add, up to white (a pixel that is bright enough turns pale, as the gamut rule above describes). Every line has a rain pattern of its own: the drops are hashed with the identity of the line (where it starts, and its monitor), so even lines in step (`rgb_sync`) do not show the same drops. The pixels of a drop head flash at random (see `rgb_rain_flash`). |
+| `rgb_speed` | 0.5 | 0.1 to 5 | Cycles per second for `breathe`. For the others, how many lengths (`rainbow`, `wave`) or segment periods (`snake`) pass per second. For `rain`, how many cycles of drops start and finish per second. |
+| `rgb_hz` | 60 | 10 to 120 | How many times a second the moving effects redraw. Each redraw costs a frame of GPU work. `solid` never redraws. |
 | `rgb_luma_min` | 0.5 | 0.1 to 4 | Lowest brightness multiplier, relative to the brightness of the pixel being replaced. If it is above `rgb_luma_max`, the two swap. |
 | `rgb_luma_max` | 1.0 | 0.1 to 4 | Highest brightness multiplier. 2 doubles the brightness, up to white. |
 | `rgb_floor_luma` | 0 | 0 to 1 | Floor for that brightness before the multiplier, so dark lines can light up. |
@@ -266,16 +273,23 @@ While static is on, squint presents `static_hz` frames a second, even when nothi
 | `rgb_gap_px` | 200 | 0 to 2000 | Unlit pixels between `snake` segments, or the spacing between `rain` drops. |
 | `rgb_tail` | 0.6 | 0 to 1 | How softly a `snake` fades toward its tail. 0 is a hard block. |
 | `rgb_rain_line` | 0.4 | 0 to 1 | How much of the original line shows through `rain`. 0 hides it. 1 shows it everywhere except under the drop heads. The trail fades back toward the line. |
-| `rgb_direction` | forward | forward, backward, alternate | Which way motion runs along a line: right or down, left or up, or reversed on every other line. `alternate` numbers the lines on each monitor separately: horizontal lines from the top, vertical lines from the left, each counted on its own. Odd lines run forward and even lines backward, and every monitor starts again at 1. Rows that touch each other count as one line, so a 3 px band is one line. |
+| `rgb_rain_flash` | 0.3 | 0 to 10 | Chance, in percent per 1/60 s, that each of the 3 pale pixels of a `rain` drop head flashes. Every head pixel of every drop on every line draws its own flashes, and the chance counts frames of a 60 Hz clock whatever `rgb_hz` is. At the default about a tenth of the head pixels are brightened at any moment. 0 turns flashes off. |
+| `rgb_rain_flash_gain` | 2.5 | 1 to 5 | Brightness of a flash at its peak, as a multiple of the brightness before it. 1 makes flashes invisible. |
+| `rgb_rain_flash_ms` | 250 | 50 to 1000 | Time constant of the fade back to the original brightness. The extra brightness is multiplied by 0.37 after this long, and is under 1 percent of its peak after five times this. |
+| `rgb_rain_flash_speed` | 300 | 20 to 3000 | How fast a flash travels down the trail behind the head, in pixels per second. |
+| `rgb_direction` | forward | forward, backward, alternate | Which way motion runs along a line: right or down, left or up, or by the position where the line starts. `alternate` takes the pixel row where a horizontal line starts, or the pixel column where a vertical line starts, counted from the top or the left of its monitor, and `rgb_alt_pitch_px` turns that into a direction. A band of several rows is one line and its top row decides. The direction depends only on the line, so it does not change when other lines appear or disappear. |
+| `rgb_alt_pitch_px` | 20 | 0 to 200 | For `alternate`: the monitor is cut into slots this many pixels tall (wide for vertical lines), counted from the top (or left). A line runs forward when its start falls in an even slot and backward in an odd one. Set it to the spacing of your lines: lines one pitch apart fall in consecutive slots, so they alternate whatever row the first one is on. Lines closer together than the pitch share a slot and a direction. 1 is the parity of the pixel row, which fails for lines an even number of pixels apart. 0 picks a direction for each line with a hash of its start: always the same for a given line, but not alternating in any pattern. |
 | `rgb_sync` | false | false to true | On, every line moves in step. Off, each line has its own phase. |
 | `rgb_line_min_px` | 48 | 8 to 256 | Shortest run that counts as a line. |
 | `rgb_line_thick_px` | 3 | 1 to 5 | Thickest line. |
 | `rgb_line_contrast` | 0.15 | 0.02 to 1 | Color difference a line needs from the pixels on at least one side: the largest difference in any red, green, or blue value, as a fraction of 255. Light gray grid lines on white differ by about 0.1, so lower this to catch them. |
 | `rgb_horizontal`, `rgb_vertical` | true | false to true | Which directions to search. |
 
+A flash travels down the trail. It starts at the head pixel that flashed, with `rgb_rain_flash_gain` times that pixel's brightness. It then runs back along the drop at `rgb_rain_flash_speed` pixels a second, brightening each trail pixel when it arrives, and behind it every pixel fades back to its original brightness along 1 + (gain - 1) exp(-age / time constant), where the age counts from the moment the flash reached that pixel. The trail pixels take the strongest flash of the three head pixels, scaled by the trail's gradient, so the flash gets weaker as it travels toward the end of the trail. The trail does not pulse as a whole: it brightens in order from the head to the end, and the ends reach their peak last. The flash can travel for up to five seconds, so with a very long trail and a very low speed the far end is not reached.
+
 `rgb_effect` and `rgb_direction` are names in the file (`rgb_effect = snake`), and the tuning screen steps through them with left and right.
 
-While `rgb` is on with any effect but `solid`, squint presents a frame about every 15 ms, even when nothing else on screen changes, so the GPU cannot idle. The search for lines runs on every frame that picom draws something, and takes 8 to 13 ms on the benchmark setup (see Known limitations).
+While `rgb` is on with any effect but `solid`, squint presents `rgb_hz` frames a second, even when nothing else on screen changes, so the GPU cannot idle. The search for lines runs on every frame that picom draws something, and takes 8 to 13 ms on the benchmark setup (see Known limitations).
 
 ### Shortcut keys
 
@@ -319,7 +333,7 @@ squint writes a log to `/tmp/squint.log`, or to the file named by `SQUINT_LOG`. 
 - the config file format, clamping, and the grouped layout;
 - all eight combinations of the brightness, dim_tint, and static toggles;
 - the RGB line search against a brute-force model, with thickness, length, color contrast on one side or neither, crossing lines, lines on monitor edges and along the seam between monitors, and a check that dimming, tint, and static do not change which pixels are lines;
-- the RGB effects: luminance inheritance, the brightness range (per rain drop, per snake, per rainbow cycle, and per line, and that none of them jumps at the end of an animation cycle), the `rgb_rain_line` blend, the gamut fallback, the minimum luminance, the timing of each effect, the green and pale heads of `rain` and its continuity at the end of a cycle, and `alternate` numbering per monitor and per orientation;
+- the RGB effects: luminance inheritance, the brightness range (per rain drop, per snake, per rainbow cycle, and per line, and that none of them jumps at the end of an animation cycle), the rain against a CPU copy of the shader, including overlapping drops adding their luminosity and each drop having its own brightness factor, the `rgb_rain_line` blend, that every line, also in step and also the same column of two monitors, has its own drops, rain flashes (their chance, that each head pixel flashes on its own and each line on its own, that a flash travels down the trail (when it reaches each part, set by the speed), that it weakens with the trail gradient, that every part fades back gradually along 1 + (gain - 1) exp(-age / time constant) from the moment the flash reaches it, and that the gain, the time constant, and the speed are settings), the refresh-rate settings and the timer period, the direction `alternate` (by the slot, set by `rgb_alt_pitch_px`, that the row or column where a line starts falls into, counted from the top or left of its monitor, unchanged when other lines come and go, and the hash mode at pitch 0), the gamut fallback, the minimum luminance, the timing of each effect, the green and pale heads of `rain` and its continuity at the end of a cycle, and `alternate` by the row or column where a line starts, counted from the top or left of its monitor, and that adding or removing other lines changes nothing;
 - the shortcut chord parser, the text settings that hold chords, and the enum settings (names, ranges, and the file round trip).
 
 `make test` also runs `test/hotkey_test.c`, which grabs a chord on the running X server and sends key presses with the XTest extension. It checks that a chord fires once, that a repeat inside 0.3 s is ignored, that the wrong modifiers do not fire, that a chord another connection already holds is refused, and that released keys are free to grab again. The chord is Ctrl+Alt plus a spare key (F24, or one of the XF86Launch keys), which the test grabs before sending it. It also checks that key names match without regard to case, and that recording a chord from real key presses gets Super+F1, modifiers in a fixed order, and Ctrl+Escape right, ignores modifiers pressed alone, cancels on Escape, and times out. If the keyboard has none of them, or the server has no XTest extension, the test says so and passes.
@@ -338,12 +352,13 @@ The pipeline test needs a display and a GPU driver with OpenGL 3.3. The CPU mode
 - **Bright shades flatten.** Pixels above `target` all land near the same level, so white and light grays end up close together. `knee` only rounds the corner. A lower `target_large` makes this stronger.
 - **Shortcut keys.** They flip a toggle, and `key_rgb_effect` steps through the RGB effects. There is no key for any other setting, and no chord can include a mouse button. The Num Lock and Caps Lock variants of a chord are grabbed but were not tested live, because the test would change your lock state.
 - **No per-application rules.** Dimming applies to the screen. There is no list of windows to skip, and there is one tint for all monitors.
-- **No vsync.** picom runs without vsync by default. Animated static may tear unless you start picom with `--vsync`. This has not been tested on this setup.
+- **No vsync.** picom runs without vsync by default. Animated static and RGB effects may tear unless you start picom with `--vsync`. This has not been tested on this setup.
+- **Refresh rates above 60.** `static_hz` and `rgb_hz` go up to 120, and the plugin's timer then ticks once per frame. squint can only draw what the monitors can show: on a 60 Hz monitor, a rate above 60 draws frames that are never displayed. At 120 Hz each frame costs the animation cost shown above, so the GPU load roughly doubles. A tick is measured from its own start and a frame is drawn when 80 percent of a frame period has passed, so the rate holds if the timer jitters. The achieved rate depends on picom and the driver, and was not measured live.
 - **GPU cost.** Measured in a standalone benchmark on the RTX A1000 at full clock, with a 3760x2640 root over three monitors, a frame that changes part of the screen takes about 3 to 6 ms, depending on the settings. A frame with nothing new takes under 1 ms. Static takes about 0.8 ms per update in gray and 2 ms in color. Real use with the GPU at a lower clock reads two to four times higher. Power and fan use are not measured.
 - **Memory.** squint keeps several full-screen textures, about 16 bytes per pixel of the root window, or about 160 MB for a 3760x2640 root.
 - **RGB cost.** The search for lines is full-screen and runs whenever picom draws anything, even a blinking cursor. On the benchmark setup (3840x2640, three monitors) it took 8.3 ms with `rgb_line_min_px` 16, 11.4 ms with 64, and 12.5 ms with 256. The animation itself added about 0.15 ms a frame. Searching only the damaged part of the screen would cut this, and is not done.
 - **RGB false positives.** Anything flat and thin that contrasts with one side counts, such as a 2 px colored header bar, a divider, or a progress bar. Text underlines are usually too short. Raise `rgb_line_min_px` or `rgb_line_contrast` to drop weaker matches. A line that is anti-aliased, a gradient, or a different color in each pixel is not found.
-- **Line numbers.** `alternate` and the per-line brightness pick number the lines by the rows (or columns) they occupy on a monitor, not one by one. Two horizontal lines side by side in the same rows, such as the top borders of two panes, share a number, and so share a brightness factor. The numbering costs about 0.7 ms a frame and runs while `rgb_direction` is `alternate` or `rgb_luma_min` differs from `rgb_luma_max`, which is the default.
+- **Line identity.** `alternate` and the per-line brightness pick find each line by the rows (or columns) it occupies on a monitor, not one by one. Two horizontal lines side by side in the same rows, such as the top borders of two panes, are one line to them: they share a direction and a brightness factor. Two lines that touch, or that sit on neighboring rows, are one band. A line whose top row moves, for example a window that is dragged, changes direction when it moves into a slot of the other parity (see `rgb_alt_pitch_px`). The index costs about 0.7 ms a frame and runs while `rgb_direction` is `alternate`, `rgb_luma_min` differs from `rgb_luma_max`, or the effect is `rain`.
 - **RGB speed unit.** `rgb_speed` is a cycle rate, so changing it while an effect runs makes the animation jump to a new phase.
 - **Fixed thresholds.** The scene-change thresholds (0.03 or 25 percent per sample point), the size measure's range (0.2 to 0.5), and the same-color tolerance of the line search (5 out of 255) are constants in `src/pipeline.h`, not settings.
 - **No test window.** The original plan included a test window that alternates between black and white. It has not been written.

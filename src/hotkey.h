@@ -35,6 +35,11 @@ struct hk {
 	xcb_window_t root;
 	struct hk_bind b[HK_MAX];
 	int n;
+	// The last key press event seen, for the log: how many there were, and the keycode and the
+	// modifier state of the latest. A press that matches no chord (or arrives inside the
+	// debounce time) shows up here without an action.
+	long seen;
+	unsigned last_code, last_state;
 };
 
 static const uint16_t hk_lock_variants[4] = {0, XCB_MOD_MASK_LOCK, XCB_MOD_MASK_2,
@@ -129,6 +134,9 @@ static inline int hk_poll(struct hk *h, double now, int *out, int max) {
 	while ((ev = xcb_poll_for_event(h->c))) {
 		if ((ev->response_type & 0x7f) == XCB_KEY_PRESS) {
 			xcb_key_press_event_t *k = (xcb_key_press_event_t *)ev;
+			h->seen++;
+			h->last_code = k->detail;
+			h->last_state = k->state;
 			uint16_t st = (uint16_t)(k->state & 0xff & ~(XCB_MOD_MASK_LOCK | XCB_MOD_MASK_2));
 			for (int i = 0; i < h->n; i++) {
 				if (h->b[i].code == k->detail && h->b[i].mods == st && now - h->b[i].last > HK_DEBOUNCE) {

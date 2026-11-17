@@ -390,12 +390,14 @@ static const char *pl_fs_lclose =
     "  o = acc;\n"
     "}\n";
 
-// Line numbers, for rgb_direction alternate. The texture has one column per monitor and
-// orientation (the first PL_MAXMON columns for horizontal lines, indexed by GL row, the next
-// PL_MAXMON for vertical lines, indexed by screen column). `lhas` marks the rows (or
-// columns) of a monitor that hold any line pixel. `lscan` numbers the lines: a line is a
-// group of consecutive marked rows, horizontal lines are counted from the top of the
-// monitor, and vertical lines from the left, starting at 1.
+// Line identities, for rgb_direction alternate and the per-line brightness. The texture has
+// one column per monitor and orientation (the first PL_MAXMON columns for horizontal lines,
+// indexed by GL row, the next PL_MAXMON for vertical lines, indexed by screen column). `lhas`
+// marks the rows (or columns) of a monitor that hold any line pixel. `lscan` gives each row
+// (or column) of a line the position where the line starts: a line is a group of consecutive
+// marked rows, and its start is its top row, counted in pixels from the top of the monitor,
+// or for a vertical line its left column counted from the left of the monitor. The start
+// depends on nothing but the line itself, so it does not change when other lines come and go.
 static const char *pl_fs_lhas =
     PL_COMMON
     "uniform sampler2D LN;\n"
@@ -422,19 +424,14 @@ static const char *pl_fs_lscan =
     "float has(int c, int r) { return texelFetch(HAS, ivec2(c, r), 0).r; }\n"
     "void main() {\n"
     "  int c = int(gl_FragCoord.x), r = int(gl_FragCoord.y);\n"
-    "  float n = 0.0;\n"
+    "  int start = r;\n"
     "  if (dir == 0) {\n"
-    "    for (int y = r; y < box.w; y++) {\n"
-    "      bool above = y + 1 < box.w && has(c, y + 1) > 0.5;\n"
-    "      if (has(c, y) > 0.5 && !above) n += 1.0;\n"
-    "    }\n"
+    "    for (int y = r + 1; y < box.w && has(c, y) > 0.5; y++) start = y;\n"
+    "    o = float(box.w - 1 - start);\n"
     "  } else {\n"
-    "    for (int x = box.x; x <= r; x++) {\n"
-    "      bool left = x > box.x && has(c, x - 1) > 0.5;\n"
-    "      if (has(c, x) > 0.5 && !left) n += 1.0;\n"
-    "    }\n"
+    "    for (int x = r - 1; x >= box.x && has(c, x) > 0.5; x--) start = x;\n"
+    "    o = float(start - box.x);\n"
     "  }\n"
-    "  o = n;\n"
     "}\n";
 
 // 1 where this pixel and the next one along the line are both candidates of the same color.
@@ -489,15 +486,35 @@ static const char *pl_fs_lstep =
 // (blue tops out near 7%), it is mixed toward gray of the same luminance until it fits, so
 // the luminance is exact and only the saturation gives way. u is the position along the
 // line and v the position across it. Lines that do not share a phase are offset by 13 px
-// per pixel of v. Rain is three layers of falling drops, each a lattice of cells that moves
-// along the line by one cell per cycle. A cell holds one drop with probability 0.7, whose head
-// sits at a random place in the cell with a trail of up to rgb_len behind it. Cells are
-// numbered minus the whole cycle count, so the pattern does not jump when the cycle fraction
-// wraps. The head is whiter (saturation 0.35), the trail fades with the square of the
-// distance from the head, a glyph-like flicker changes it every 6 px of the drop, and the bare line glows
-// at 0.1. The rain color is mixed over the original pixel with weight 1 - keep * (1 - s),
-// where s is the strength of the drop, 0 off a drop and 1 at the head and keep is rgb_rain_line. rgb_cyc is the fraction of the current cycle, 0 to 1, computed on the CPU in
-// double precision so a long uptime does not blur the animation.
+// per pixel of v. rgb_cyc is the fraction of the current cycle, 0 to 1, and rgb_cycn the
+// whole cycles so far, both computed on the CPU in double precision so a long uptime does not
+// blur the animation.
+//
+// Rain is three layers of falling drops, each a lattice of cells that moves along the line by
+// one cell per cycle. Every random pick is hashed with the identity of the line (where it
+// starts, and its monitor), so each line has a pattern of its own, also when the lines are
+// in step. A cell holds one drop with probability 0.7, whose head sits at a random
+// place in the cell with a trail of up to rgb_len behind it. Cells are numbered minus the whole
+// cycle count, so the pattern does not jump when the cycle fraction wraps. The head (the first
+// 3 px) is whiter (saturation 0.35), the trail fades with the square of the distance from the
+// head, a glyph-like flicker changes it every 6 px of the drop, and the bare line glows at 0.1.
+// Where drops overlap their luminosities add: each drop contributes its strength v (from 0.1 up
+// to 1 at the head), times its flash, times its own brightness factor from the luma range, and
+// the pixel gets the sum, at least the glow, capped at 1 in the end. The rain color is mixed
+// over the original pixel with weight 1 - keep * (1 - s), where s is the summed strength of
+// the drops, 0 off a drop and 1 at a head, and keep is rgb_rain_line.
+//
+// Flashes: each head pixel of each drop (the drop, the pixel's distance from the head, the
+// line, and the frame of a 60 Hz clock all go into a hash) flashes with probability rgb_flash
+// per frame. A flash adds (gain - 1) times the brightness of the pixel at once, and the extra
+// fades with exp(-age / tau). The shader looks back five time constants for flashes and takes
+// the strongest, so the flashes of different pixels, drops, and lines are independent, and the
+// same time always gives the same picture. A flash travels down the trail: it reaches a trail
+// pixel dist / rgb_fspeed seconds after it started, where dist is the distance along the drop
+// from the head pixel that flashed, and from then it fades by the same law. The trail pixel
+// takes the strongest of the three head pixels' flashes, scaled by its place in the gradient
+// (1 at the head, 0 at the end of the trail). So a bright front runs down the trail, and
+// behind it the trail fades back to its original brightness.
 //
 // Static is mixed in last, in encoded color: out = mix(color, noise, static_amt). Every
 // update (static_hz times a second) draws a fresh, independent pattern: the frame number
@@ -512,8 +529,8 @@ static const char *pl_fs_final =
     "uniform sampler2D S, D, RM, RS, LN, LI;\n"
     "uniform ivec2 mon_col;\n"
     "uniform float enabled, min_gain, gamma_dim, use_ramp, use_dim;\n"
-    "uniform float rgb_on, rgb_cyc, rgb_lmin, rgb_lmax, rgb_floor, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_keep, rgb_sync, scr_h;\n"
-    "uniform int rgb_fx, rgb_dir, rgb_cycn;\n"
+    "uniform float rgb_on, rgb_cyc, rgb_lmin, rgb_lmax, rgb_floor, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_keep, rgb_flash, rgb_ffrac, rgb_fgain, rgb_ftau, rgb_fspeed, rgb_pitch, rgb_sync, scr_h;\n"
+    "uniform int rgb_fx, rgb_dir, rgb_cycn, rgb_frame, rgb_fn;\n"
     "uniform vec3 dim_gain, tint;\n"
     "uniform vec2 lr_size;\n"
     "uniform vec4 lr_box;\n"
@@ -560,6 +577,20 @@ static const char *pl_fs_final =
     "  vec3 k = clamp(abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);\n"
     "  return mix(vec3(1.0), k, s);\n"
     "}\n"
+    "float flash_excess(int id, int l, int j, int salt, float dist) {\n"
+    "  float ex = 0.0;\n"
+    "  if (rgb_flash <= 0.0) return ex;\n"
+    "  float delay = dist / rgb_fspeed;\n"
+    "  int k0 = max(0, int(ceil(delay * 60.0 - rgb_ffrac)));\n"
+    "  for (int m = 0; m < rgb_fn; m++) {\n"
+    "    int k = k0 + m;\n"
+    "    if (hash2(ivec2(id * 8 + j + salt * 4099, (rgb_frame - k) * 4 + l), 47u) < rgb_flash) {\n"
+    "      float age = (float(k) + rgb_ffrac) / 60.0 - delay;\n"
+    "      ex = max(ex, rgb_fgain * exp(-age / rgb_ftau));\n"
+    "    }\n"
+    "  }\n"
+    "  return ex;\n"
+    "}\n"
     "vec3 rgb_apply(vec3 enc, vec2 m, vec2 fc) {\n"
     "  bool horiz = m.x > 0.5;\n"
     "  float u = horiz ? fc.x : scr_h - fc.y, v = horiz ? fc.y : fc.x;\n"
@@ -568,10 +599,13 @@ static const char *pl_fs_final =
     "  int lid = int(lnum) * 64 + mcol;\n"
     "  float r = hash2(ivec2(lid, 5), 53u);\n"
     "  float sgn = rgb_dir == 1 ? -1.0 : 1.0;\n"
-    "  if (rgb_dir == 2) sgn = mod(lnum, 2.0) > 0.5 ? 1.0 : -1.0;\n"
+    "  if (rgb_dir == 2) {\n"
+    "    float bit = rgb_pitch > 0.5 ? mod(floor(lnum / rgb_pitch), 2.0) : step(0.5, hash2(ivec2(int(lnum), mcol), 77u));\n"
+    "    sgn = bit < 0.5 ? 1.0 : -1.0;\n"
+    "  }\n"
     "  float pos = sgn * (u + (rgb_sync > 0.5 ? 0.0 : 13.0 * v));\n"
     "  float hue = rgb_hue / 360.0, span = rgb_span / 360.0;\n"
-    "  float mult = 1.0, w = 1.0, sat_scale = 1.0;\n"
+    "  float mult = 1.0, w = 1.0, sat_scale = 1.0, fac = -1.0;\n"
     "  if (rgb_fx == 1) {\n"
     "    mult = mix(0.1, 1.0, 0.5 + 0.5 * sin(6.2831853 * rgb_cyc));\n"
     "  } else if (rgb_fx == 2) {\n"
@@ -589,32 +623,38 @@ static const char *pl_fs_final =
     "    mult = mix(0.2, 1.0, 0.5 + 0.5 * sin(6.2831853 * (pos / rgb_len - rgb_cyc)));\n"
     "  } else if (rgb_fx == 5) {\n"
     "    hue = 0.375;\n"
-    "    float best = 0.1;\n"
-    "    bool head = false;\n"
+    "    float lo = min(rgb_lmin, rgb_lmax), hi = max(rgb_lmin, rgb_lmax);\n"
+    "    float total = 0.0, sumv = 0.0, headv = 0.0, headboost = 1.0;\n"
     "    for (int l = 0; l < 3; l++) {\n"
     "      float f = l == 0 ? 1.0 : (l == 1 ? 1.5 : 2.0);\n"
     "      float ln = rgb_len * (l == 0 ? 1.0 : (l == 1 ? 0.8 : 0.6));\n"
     "      float per = (ln + rgb_gap) * f;\n"
     "      float q = pos - rgb_cyc * per;\n"
     "      float cell = floor(q / per);\n"
-    "      int id = int(cell) - rgb_cycn;\n"
+    "      int id = int(cell) - rgb_cycn + lid * 7919;\n"
     "      if (hash2(ivec2(id, l), 17u) < 0.7) {\n"
     "        float d = ln + hash2(ivec2(id, l + 3), 29u) * (per - ln) - (q - cell * per);\n"
     "        if (d >= 0.0 && d < ln) {\n"
     "          float t = 1.0 - d / ln;\n"
     "          float flick = mix(0.6, 1.0, hash2(ivec2(id * 7 + int(floor(d / 6.0)), l), 41u));\n"
     "          float v = (0.1 + 0.9 * t * t) * (d < 3.0 ? 1.0 : flick);\n"
-    "          if (v > best) { best = v; head = d < 3.0; r = hash2(ivec2(id, l + 9), 67u); }\n"
+    "          float ex = 0.0;\n"
+    "          if (d < 3.0) ex = flash_excess(id, l, int(d), lid, 0.0);\n"
+    "          else ex = max(max(flash_excess(id, l, 0, lid, d), flash_excess(id, l, 1, lid, d - 1.0)),\n"
+    "                        flash_excess(id, l, 2, lid, d - 2.0)) * t;\n"
+    "          total += v * (1.0 + ex) * mix(lo, hi, hash2(ivec2(id, l + 9), 67u));\n"
+    "          sumv += v;\n"
+    "          if (d < 3.0 && v > headv) { headv = v; headboost = 1.0 + ex; }\n"
     "        }\n"
     "      }\n"
     "    }\n"
-    "    mult = best;\n"
-    "    w = 1.0 - rgb_keep * (1.0 - (best - 0.1) / 0.9);\n"
-    "    if (head) sat_scale = 0.35;\n"
+    "    fac = max(total, 0.1 * mix(lo, hi, r));\n"
+    "    w = 1.0 - rgb_keep * (1.0 - clamp((sumv - 0.1) / 0.9, 0.0, 1.0));\n"
+    "    if (headv > 0.0) sat_scale = mix(0.35, 0.15, clamp((headboost - 1.0) / max(rgb_fgain, 0.1), 0.0, 1.0));\n"
     "  }\n"
     "  vec3 lin = to_lin(enc);\n"
     "  float lf = mix(min(rgb_lmin, rgb_lmax), max(rgb_lmin, rgb_lmax), r);\n"
-    "  float lt = clamp(max(dot(lin, W709), rgb_floor) * lf * mult, 0.0, 1.0);\n"
+    "  float lt = clamp(max(dot(lin, W709), rgb_floor) * (fac >= 0.0 ? fac : lf * mult), 0.0, 1.0);\n"
     "  vec3 col = to_lin(hue_rgb(hue, rgb_sat * sat_scale));\n"
     "  col *= lt / dot(col, W709);\n"
     "  float a = 0.0;\n"
@@ -1430,8 +1470,10 @@ static inline void pl_lines(struct pl *p, const struct sq_cfg *cfg) {
 	p->lidx_valid = false;
 }
 
-// Numbers the lines on each monitor for rgb_direction alternate. Horizontal lines and
-// vertical lines are numbered separately, and each monitor starts again at 1.
+// Finds where each line on each monitor starts, for rgb_direction alternate: the pixel row of
+// a horizontal line and the pixel column of a vertical one, counted from the top or the left
+// of its monitor. The direction is the parity of floor(start / rgb_pitch): lines one pitch
+// apart alternate, wherever they sit. A pitch of 0 takes one bit of a hash of the start.
 static inline void pl_line_index(struct pl *p) {
 	int th = p->W > p->H ? p->W : p->H;
 	pl_base_state();
@@ -1513,6 +1555,21 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	glUniform1f(PL_U(pr, "rgb_gap"), (float)cfg->v[SQ_RGB_GAP_PX]);
 	glUniform1f(PL_U(pr, "rgb_tail"), (float)cfg->v[SQ_RGB_TAIL]);
 	glUniform1f(PL_U(pr, "rgb_keep"), (float)cfg->v[SQ_RGB_RAIN_LINE]);
+	// Flashes are drawn per 1/60 s frame of the clock, whatever the refresh rate: the chance is
+	// per frame of that clock, and the frame number and its fraction go to the shader.
+	double ft = pl_trel(p, now) * 60.0;
+	glUniform1f(PL_U(pr, "rgb_flash"), (float)(cfg->v[SQ_RGB_RAIN_FLASH] / 100.0));
+	glUniform1i(PL_U(pr, "rgb_frame"), (int)fmod(floor(ft), 1048576.0));
+	glUniform1f(PL_U(pr, "rgb_ffrac"), (float)(ft - floor(ft)));
+	// A flash is gain times the brightness on top of the pixel, fading by exp(-age / tau). Frames
+	// older than five time constants add under 1 percent, so the shader looks back that far.
+	double tau = cfg->v[SQ_RGB_RAIN_FLASH_MS] / 1000.0;
+	int nback = (int)ceil(5.0 * tau * 60.0);
+	glUniform1f(PL_U(pr, "rgb_fgain"), (float)(cfg->v[SQ_RGB_RAIN_FLASH_GAIN] - 1.0));
+	glUniform1f(PL_U(pr, "rgb_ftau"), (float)tau);
+	glUniform1f(PL_U(pr, "rgb_fspeed"), (float)cfg->v[SQ_RGB_RAIN_FLASH_SPEED]);
+	glUniform1f(PL_U(pr, "rgb_pitch"), (float)cfg->v[SQ_RGB_ALT_PITCH_PX]);
+	glUniform1i(PL_U(pr, "rgb_fn"), nback < 1 ? 1 : nback);
 	glUniform1f(PL_U(pr, "rgb_sync"), (float)cfg->v[SQ_RGB_SYNC]);
 	glUniform1f(PL_U(pr, "scr_h"), (float)p->H);
 	glUniform1ui(PL_U(pr, "frame"), (GLuint)(unsigned long long)floor(pl_trel(p, now) * hz));
@@ -1602,8 +1659,9 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		    p->used_lv != cfg->v[SQ_RGB_VERTICAL]) {
 			pl_lines(p, cfg);
 		}
-		if ((cfg->v[SQ_RGB_DIRECTION] == 2 || cfg->v[SQ_RGB_LUMA_MIN] != cfg->v[SQ_RGB_LUMA_MAX]) &&
-		    p->line_valid && !p->lidx_valid) {
+		bool numbered = cfg->v[SQ_RGB_DIRECTION] == 2 || cfg->v[SQ_RGB_LUMA_MIN] != cfg->v[SQ_RGB_LUMA_MAX] ||
+		                cfg->v[SQ_RGB_EFFECT] == 5;  // rain hashes every drop with the identity of its line
+		if (numbered && p->line_valid && !p->lidx_valid) {
 			pl_line_index(p);
 		}
 	} else {

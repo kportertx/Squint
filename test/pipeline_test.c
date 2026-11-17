@@ -1879,7 +1879,13 @@ static struct sq_cfg rgb_cfg(void) {
 	c.v[SQ_RGB_GAP_PX] = 60;
 	c.v[SQ_RGB_TAIL] = 0.0;
 	c.v[SQ_RGB_RAIN_LINE] = 0.0;
+	c.v[SQ_RGB_RAIN_FLASH] = 0.0;
+	c.v[SQ_RGB_RAIN_FLASH_GAIN] = 2.5;
+	c.v[SQ_RGB_RAIN_FLASH_MS] = 250;
+	c.v[SQ_RGB_RAIN_FLASH_SPEED] = 300;
+	c.v[SQ_RGB_HZ] = 60;
 	c.v[SQ_RGB_DIRECTION] = 0;
+	c.v[SQ_RGB_ALT_PITCH_PX] = 20;
 	c.v[SQ_RGB_SYNC] = 1;
 	c.v[SQ_RGB_LINE_MIN_PX] = 48;
 	c.v[SQ_RGB_LINE_THICK_PX] = 3;
@@ -2213,7 +2219,7 @@ static void test_rgb_effects(void) {
 	c.v[SQ_RGB_GAP_PX] = 40;
 	double lmax = 0, lmin = 1;
 	int bad_hue = 0, bright = 0, whitish = 0, n = 0;
-	render(&c, 104.0);
+	render(&c, 104.5);
 	for (int x = 12; x < 228; x++) {
 		const uint8_t *p = at(x, 20);
 		double l = lum(p);
@@ -2226,13 +2232,13 @@ static void test_rgb_effects(void) {
 	}
 	CHECK(whitish >= 1 && whitish < 20, "drop heads are paler than the trails: %d pixels", whitish);
 	CHECK(bad_hue == 0, "rain is green on every pixel of the line (%d of %d are not)", bad_hue, n);
-	CHECK(lmax <= L0 + 0.01 && lmax > 0.8 * L0, "the brightest drop keeps the luminance of the line: %.4f of %.4f", lmax, L0);
+	CHECK(lmax > 0.8 * L0 && lmax <= 3 * L0 + 0.01, "the brightest drop is about the luminance of the line, or the sum of overlapping drops: %.4f of %.4f", lmax, L0);
 	CHECK(lmin < 0.2 * L0 && lmin > 0.02 * L0, "the bare line glows dimly: %.4f of %.4f", lmin, L0);
 	CHECK(bright > 8 && bright < n - 40, "some of the line is lit and some is not: %d of %d", bright, n);
 	CHECK(chroma(100, 41) < 3 || at(100, 41)[1] >= at(100, 41)[0], "other lines are green too");
 	uint8_t before[240 * 4];
 	memcpy(before, out + (size_t)20 * W * 4, sizeof before);
-	render(&c, 104.2);
+	render(&c, 104.6);
 	int moved = 0;
 	for (int x = 12; x < 228; x++)
 		if (abs(at(x, 20)[1] - before[x * 4 + 1]) > 10) moved++;
@@ -2246,11 +2252,11 @@ static void test_rgb_effects(void) {
 		if (abs(at(x, 20)[1] - before[x * 4 + 1]) > 10) jumped++;
 	CHECK(jumped <= 2, "no jump at the end of a cycle: %d pixels changed in 0.0002 cycles", jumped);
 	// rgb_rain_line: how much of the original line shows through. 0 is what the checks above saw.
-	render(&c, 104.0);
+	render(&c, 104.5);
 	uint8_t hide[240 * 4];
 	memcpy(hide, out + (size_t)20 * W * 4, sizeof hide);
 	c.v[SQ_RGB_RAIN_LINE] = 1.0;
-	render(&c, 104.0);
+	render(&c, 104.5);
 	int gaps = 0, gaps_kept = 0, heads_ok = 0, heads = 0;
 	for (int x = 12; x < 228; x++) {
 		double l0 = lum(hide + x * 4);
@@ -2267,7 +2273,7 @@ static void test_rgb_effects(void) {
 	CHECK(gaps > 20 && gaps_kept == gaps, "at 1 the bare line is the original line: %d of %d gap pixels", gaps_kept, gaps);
 	CHECK(heads > 0 && heads_ok == heads, "at 1 the drop heads are still rain: %d of %d", heads_ok, heads);
 	c.v[SQ_RGB_RAIN_LINE] = 0.5;
-	render(&c, 104.0);
+	render(&c, 104.5);
 	int between = 0, gaps2 = 0;
 	for (int x = 12; x < 228; x++) {
 		double l0 = lum(hide + x * 4), l5 = lum(at(x, 20));
@@ -2279,10 +2285,10 @@ static void test_rgb_effects(void) {
 	CHECK(between == gaps2, "at 0.5 the bare line is part way: %d of %d gap pixels", between, gaps2);
 	c.v[SQ_RGB_RAIN_LINE] = 0.0;
 	// The same time gives the same picture, so the pattern depends on time and not on history.
-	render(&c, 104.2);
+	render(&c, 104.6);
 	memcpy(before, out + (size_t)20 * W * 4, sizeof before);
 	render(&c, 107.0);
-	render(&c, 104.2);
+	render(&c, 104.6);
 	CHECK(memcmp(before, out + (size_t)20 * W * 4, sizeof before) == 0, "rain is a function of time");
 
 	// Directions off, switch off, master off.
@@ -2381,92 +2387,333 @@ static void test_rgb_alternate(void) {
 	c.v[SQ_RGB_LENGTH_PX] = 100;
 	c.v[SQ_RGB_GAP_PX] = 100;
 	c.v[SQ_RGB_DIRECTION] = 2;
+	c.v[SQ_RGB_ALT_PITCH_PX] = 1;  // slots of one pixel: the parity of the row or column
 	c.v[SQ_RGB_LINE_THICK_PX] = 1;
 
-	// Three horizontal and three vertical lines on one monitor.
+	// The direction comes from the pixel row where a horizontal line starts, or the pixel
+	// column where a vertical one starts: even runs forward and odd runs backward. Three
+	// horizontal lines (rows 10, 25, 40) and three vertical ones (columns 30, 61, 90).
 	struct pl_mon m1[] = {{0, 0, 240, 200}};
 	setup(240, 200, m1, 1);
 	put((struct pl_rect){0, 0, 240, 200}, 255, 255, 255);
 	for (int y = 10; y <= 40; y += 15) put((struct pl_rect){10, y, 230, y + 1}, 100, 100, 100);
-	for (int x = 30; x <= 90; x += 30) put((struct pl_rect){x, 60, x + 1, 200}, 100, 100, 100);
+	put((struct pl_rect){30, 60, 31, 200}, 100, 100, 100);
+	put((struct pl_rect){61, 60, 62, 200}, 100, 100, 100);
+	put((struct pl_rect){90, 60, 91, 200}, 100, 100, 100);
 	capture_full(0);
 	render(&c, 101.0);
 	// Horizontal: lit at x = 150 running forward, at x = 50 running backward.
-	expect_lit("first horizontal runs forward", 150, 10, true);
-	expect_lit("first horizontal runs forward", 50, 10, false);
-	expect_lit("second horizontal runs backward", 150, 25, false);
-	expect_lit("second horizontal runs backward", 50, 25, true);
-	expect_lit("third horizontal runs forward", 150, 40, true);
-	expect_lit("third horizontal runs forward", 50, 40, false);
-	// Vertical: lit at y = 150 running forward, at y = 80 running backward. They count from 1
-	// again, not after the horizontal lines.
-	expect_lit("first vertical runs forward", 30, 150, true);
-	expect_lit("first vertical runs forward", 30, 80, false);
-	expect_lit("second vertical runs backward", 60, 150, false);
-	expect_lit("second vertical runs backward", 60, 80, true);
-	expect_lit("third vertical runs forward", 90, 150, true);
-	expect_lit("third vertical runs forward", 90, 80, false);
+	expect_lit("row 10 is even: forward", 150, 10, true);
+	expect_lit("row 10 is even: forward", 50, 10, false);
+	expect_lit("row 25 is odd: backward", 150, 25, false);
+	expect_lit("row 25 is odd: backward", 50, 25, true);
+	expect_lit("row 40 is even: forward", 150, 40, true);
+	expect_lit("row 40 is even: forward", 50, 40, false);
+	// Vertical: lit at y = 150 running forward, at y = 80 running backward.
+	expect_lit("column 30 is even: forward", 30, 150, true);
+	expect_lit("column 30 is even: forward", 30, 80, false);
+	expect_lit("column 61 is odd: backward", 61, 150, false);
+	expect_lit("column 61 is odd: backward", 61, 80, true);
+	expect_lit("column 90 is even: forward", 90, 150, true);
+	expect_lit("column 90 is even: forward", 90, 80, false);
 	// Forward and backward elsewhere in the cycle: the segment moves 100 px in half a cycle.
 	render(&c, 101.5);
-	expect_lit("first horizontal after half a cycle", 150, 10, false);
-	expect_lit("first horizontal after half a cycle", 50, 10, true);
+	expect_lit("row 10 after half a cycle", 150, 10, false);
+	expect_lit("row 10 after half a cycle", 50, 10, true);
 	teardown();
 
-	// Two monitors with different lines: each starts at 1.
+	// Stable: other lines coming and going change nothing. Rows 20 (forward) and 61 (backward),
+	// then lines are added above, between, and below them.
+	struct pl_mon m9[] = {{0, 0, 240, 120}};
+	setup(240, 120, m9, 1);
+	put((struct pl_rect){0, 0, 240, 120}, 255, 255, 255);
+	put((struct pl_rect){10, 20, 230, 21}, 100, 100, 100);
+	put((struct pl_rect){10, 61, 230, 62}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	expect_lit("alone, row 20 forward", 150, 20, true);
+	expect_lit("alone, row 61 backward", 150, 61, false);
+	expect_lit("alone, row 61 backward", 50, 61, true);
+	put((struct pl_rect){10, 8, 230, 9}, 100, 100, 100);
+	put((struct pl_rect){10, 40, 230, 41}, 100, 100, 100);
+	put((struct pl_rect){10, 99, 230, 100}, 100, 100, 100);
+	pl_capture(&pl, (struct pl_rect[]){{10, 8, 230, 9}, {10, 40, 230, 41}, {10, 99, 230, 100}}, 3, false, 0.1);
+	render(&c, 101.0);
+	expect_lit("with lines above and between, row 20 is still forward", 150, 20, true);
+	expect_lit("with lines above and between, row 20 is still forward", 50, 20, false);
+	expect_lit("with lines above and between, row 61 is still backward", 150, 61, false);
+	expect_lit("with lines above and between, row 61 is still backward", 50, 61, true);
+	expect_lit("a new line on row 8 is even: forward", 150, 8, true);
+	expect_lit("a new line on row 99 is odd: backward", 150, 99, false);
+	teardown();
+
+	// Two monitors side by side: the lines are the same on both, the parity of the row decides.
 	struct pl_mon m2[] = {{0, 0, 120, 100}, {120, 0, 120, 100}};
 	setup(240, 100, m2, 2);
 	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
 	put((struct pl_rect){5, 20, 115, 21}, 100, 100, 100);
-	put((struct pl_rect){5, 60, 115, 61}, 100, 100, 100);
+	put((struct pl_rect){5, 61, 115, 62}, 100, 100, 100);
 	put((struct pl_rect){125, 40, 235, 41}, 100, 100, 100);
-	put((struct pl_rect){125, 80, 235, 81}, 100, 100, 100);
+	put((struct pl_rect){125, 81, 235, 82}, 100, 100, 100);
 	capture_full(0);
 	render(&c, 101.0);
-	expect_lit("left monitor, line 1 forward", 110, 20, true);
-	expect_lit("left monitor, line 1 forward", 50, 20, false);
-	expect_lit("left monitor, line 2 backward", 110, 60, false);
-	expect_lit("left monitor, line 2 backward", 50, 60, true);
-	expect_lit("right monitor starts again: line 1 forward", 150, 40, true);
-	expect_lit("right monitor starts again: line 1 forward", 225, 40, false);
-	expect_lit("right monitor, line 2 backward", 150, 80, false);
-	expect_lit("right monitor, line 2 backward", 225, 80, true);
-	// Switching to alternate after the lines were found recomputes the numbers without new damage.
+	expect_lit("left monitor, row 20 forward", 110, 20, true);
+	expect_lit("left monitor, row 20 forward", 50, 20, false);
+	expect_lit("left monitor, row 61 backward", 110, 61, false);
+	expect_lit("left monitor, row 61 backward", 50, 61, true);
+	expect_lit("right monitor, row 40 forward", 150, 40, true);
+	expect_lit("right monitor, row 40 forward", 225, 40, false);
+	expect_lit("right monitor, row 81 backward", 150, 81, false);
+	expect_lit("right monitor, row 81 backward", 225, 81, true);
+	// Switching to alternate after the lines were found recomputes the starts without new damage.
 	c.v[SQ_RGB_DIRECTION] = 0;
 	render(&c, 101.0);
-	expect_lit("forward: the second line runs forward too", 110, 60, true);
+	expect_lit("forward: the odd row runs forward too", 110, 61, true);
 	c.v[SQ_RGB_DIRECTION] = 2;
 	render(&c, 101.0);
-	expect_lit("alternate again", 110, 60, false);
+	expect_lit("alternate again", 110, 61, false);
 	teardown();
 
-	// Vertical lines restart on each monitor too. Forward, nothing is lit above y = 100, and
-	// backward, all of it is.
+	// The row is counted from the top of its monitor, not from the top of the screen. Two
+	// stacked monitors, the second starting at the odd row 51: its row 61 is row 10 of it, so
+	// even, and its row 96 is row 45 of it, so odd.
+	struct pl_mon ms[] = {{0, 0, 240, 51}, {0, 51, 240, 50}};
+	setup(240, 101, ms, 2);
+	put((struct pl_rect){0, 0, 240, 101}, 255, 255, 255);
+	put((struct pl_rect){10, 20, 230, 21}, 100, 100, 100);
+	put((struct pl_rect){10, 61, 230, 62}, 100, 100, 100);
+	put((struct pl_rect){10, 96, 230, 97}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	expect_lit("first monitor, row 20 is even: forward", 150, 20, true);
+	expect_lit("second monitor, screen row 61 is its row 10: forward", 150, 61, true);
+	expect_lit("second monitor, screen row 61 is its row 10: forward", 50, 61, false);
+	expect_lit("second monitor, screen row 96 is its row 45: backward", 150, 96, false);
+	expect_lit("second monitor, screen row 96 is its row 45: backward", 50, 96, true);
+	teardown();
+
+	// Vertical lines are counted from the left of their monitor. Forward, nothing is lit above
+	// y = 100, and backward, all of it is.
 	c.v[SQ_RGB_DIRECTION] = 2;
 	setup(240, 100, m2, 2);
 	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
 	put((struct pl_rect){30, 5, 31, 96}, 100, 100, 100);
-	put((struct pl_rect){60, 5, 61, 96}, 100, 100, 100);
+	put((struct pl_rect){61, 5, 62, 96}, 100, 100, 100);
 	put((struct pl_rect){130, 5, 131, 96}, 100, 100, 100);
-	put((struct pl_rect){170, 5, 171, 96}, 100, 100, 100);
+	put((struct pl_rect){171, 5, 172, 96}, 100, 100, 100);
 	capture_full(0);
 	render(&c, 101.0);
-	expect_lit("left monitor, vertical 1 forward", 30, 50, false);
-	expect_lit("left monitor, vertical 2 backward", 60, 50, true);
-	expect_lit("right monitor starts again: vertical 1 forward", 130, 50, false);
-	expect_lit("right monitor, vertical 2 backward", 170, 50, true);
+	expect_lit("left monitor, column 30 forward", 30, 50, false);
+	expect_lit("left monitor, column 61 backward", 61, 50, true);
+	expect_lit("right monitor, column 130 is its column 10: forward", 130, 50, false);
+	expect_lit("right monitor, column 171 is its column 51: backward", 171, 50, true);
 	teardown();
 
-	// A band of three rows is one line.
+	// The same for columns: the second monitor starts at the odd column 121, so its column 130
+	// is column 9 of it (odd, backward) and its column 131 is column 10 of it (even, forward).
+	struct pl_mon mo[] = {{0, 0, 121, 100}, {121, 0, 119, 100}};
+	setup(240, 100, mo, 2);
+	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
+	put((struct pl_rect){130, 5, 131, 96}, 100, 100, 100);
+	put((struct pl_rect){131 + 20, 5, 132 + 20, 96}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	expect_lit("column 130 is column 9 of the second monitor: backward", 130, 50, true);
+	expect_lit("column 151 is column 30 of the second monitor: forward", 151, 50, false);
+	teardown();
+
+	// A band of three rows is one line, and its first row decides: rows 20 to 22 start on the
+	// even row 20, and rows 61 to 63 on the odd row 61.
 	c.v[SQ_RGB_LINE_THICK_PX] = 3;
 	struct pl_mon m3[] = {{0, 0, 240, 100}};
 	setup(240, 100, m3, 1);
 	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
 	put((struct pl_rect){10, 20, 230, 23}, 100, 100, 100);
-	put((struct pl_rect){10, 60, 230, 63}, 100, 100, 100);
+	put((struct pl_rect){10, 61, 230, 64}, 100, 100, 100);
 	capture_full(0);
 	render(&c, 101.0);
-	for (int y = 20; y < 23; y++) expect_lit("every row of the first band runs forward", 150, y, true);
-	for (int y = 60; y < 63; y++) expect_lit("every row of the second band runs backward", 150, y, false);
+	for (int y = 20; y < 23; y++) expect_lit("every row of the band that starts on row 20 runs forward", 150, y, true);
+	for (int y = 61; y < 64; y++) expect_lit("every row of the band that starts on row 61 runs backward", 150, y, false);
+	teardown();
+}
+
+// ---- a CPU copy of the rain shader (without flashes) ----------------------------------------
+
+static uint32_t pcg_c(uint32_t v) {
+	uint32_t s = v * 747796405u + 2891336453u;
+	uint32_t w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+	return (w >> 22u) ^ w;
+}
+static float hash_c(int px, int py, uint32_t seed) {
+	return (float)pcg_c((uint32_t)px + pcg_c((uint32_t)py + pcg_c(seed))) * (1.0f / 4294967296.0f);
+}
+static float mixf(float a, float b, float t) { return a * (1.0f - t) + b * t; }
+
+// The luminance factor the shader gives the pixel at column x of a horizontal line with the
+// identity lid (its start row times 64, plus the monitor column) and the phase offset vphase
+// (13 px per pixel of the GL row, or 0 when the lines are in step): the sum, over the drops above the pixel, of strength times
+// brightness factor, and at least the glow. cyc is the fraction of the cycle and cycn the whole
+// cycles. *drops gets the number of drops over the pixel and *best the strongest single one.
+static double rain_factor(int x, float cyc, int cycn, float len, float gap, float lo, float hi, int lid, float vphase, int *drops, double *best) {
+	float pos = (float)x + 0.5f + vphase;
+	double total = 0;
+	int nd = 0;
+	double top = 0;
+	for (int l = 0; l < 3; l++) {
+		float f = l == 0 ? 1.0f : (l == 1 ? 1.5f : 2.0f);
+		float ln = len * (l == 0 ? 1.0f : (l == 1 ? 0.8f : 0.6f));
+		float per = (ln + gap) * f;
+		float q = pos - cyc * per;
+		float cell = floorf(q / per);
+		int id = (int)((uint32_t)(int)cell - (uint32_t)cycn + (uint32_t)lid * 7919u);
+		if (hash_c(id, l, 17u) < 0.7f) {
+			float d = ln + hash_c(id, l + 3, 29u) * (per - ln) - (q - cell * per);
+			if (d >= 0.0f && d < ln) {
+				float t = 1.0f - d / ln;
+				float flick = mixf(0.6f, 1.0f, hash_c(id * 7 + (int)floorf(d / 6.0f), l, 41u));
+				float v = (0.1f + 0.9f * t * t) * (d < 3.0f ? 1.0f : flick);
+				float lfi = mixf(lo, hi, hash_c(id, l + 9, 67u));
+				total += (double)v * lfi;
+				nd++;
+				if (v * lfi > top) top = v * lfi;
+			}
+		}
+	}
+	float lline = mixf(lo, hi, hash_c(lid, 5, 53u));
+	double glow = 0.1 * lline;
+	if (drops) *drops = nd;
+	if (best) *best = top;
+	return total > glow ? total : glow;
+}
+
+// Compares the rain on row y with the model over columns x0 to x1 for the render just made at
+// time t (cycle 0 at t0). Returns the number of pixels where drops overlap, and counts a
+// failure when more than 1 percent of the pixels differ. Needs a line of gray 100.
+static int check_rain_model(const struct sq_cfg *c, int y, int start, double t0, double t, int x0, int x1, const char *what) {
+	double L0 = lum((uint8_t[]){100, 100, 100});
+	double cy = (t - t0) * c->v[SQ_RGB_SPEED];
+	float cyc = (float)(cy - floor(cy));
+	int cycn = (int)fmod(floor(cy), 1048576.0);
+	int bad = 0, overlap = 0, over_bad = 0;
+	float vphase = c->v[SQ_RGB_SYNC] != 0 ? 0.0f : 13.0f * ((float)(H - 1 - y) + 0.5f);
+	for (int x = x0; x < x1; x++) {
+		int nd;
+		double best;
+		double f = rain_factor(x, cyc, cycn, (float)c->v[SQ_RGB_LENGTH_PX], (float)c->v[SQ_RGB_GAP_PX], (float)fmin(c->v[SQ_RGB_LUMA_MIN], c->v[SQ_RGB_LUMA_MAX]),
+		                       (float)fmax(c->v[SQ_RGB_LUMA_MIN], c->v[SQ_RGB_LUMA_MAX]), start * 64, vphase, &nd, &best);
+		double want = fmin(1.0, L0 * f), got = lum(at(x, y));
+		bool off = fabs(got - want) > 0.012;
+		bad += off;
+		if (nd >= 2 && best > 0.1 && f > best + 0.05) {
+			overlap++;
+			over_bad += off;
+		}
+	}
+	CHECK(bad <= (x1 - x0) / 100, "%s: the rain matches the model: %d of %d pixels differ", what, bad, x1 - x0);
+	CHECK(over_bad == 0, "%s: %d pixels where drops overlap differ from the sum of the drops", what, over_bad);
+	return overlap;
+}
+
+// 1 if the snake on the horizontal line at row y runs forward, 0 if backward, -1 if neither
+// pattern is there. At cycle 0 with a length of 100 and a gap of 100, forward is lit at x = 150
+// and not at x = 50, and backward is the other way round.
+static int snake_dir(int y) {
+	bool a = chroma(150, y) > 40, b = chroma(50, y) > 40;
+	return a && !b ? 1 : (!a && b ? 0 : -1);
+}
+
+// rgb_alt_pitch_px: the direction is the parity of the slot, floor(start / pitch), that the row
+// or column where a line starts falls into.
+static void test_rgb_pitch(void) {
+	printf("rgb alternate pitch\n");
+	struct sq_cfg c = rgb_cfg();
+	c.v[SQ_RGB_EFFECT] = 3;
+	c.v[SQ_RGB_LENGTH_PX] = 100;
+	c.v[SQ_RGB_GAP_PX] = 100;
+	c.v[SQ_RGB_DIRECTION] = 2;
+	c.v[SQ_RGB_LINE_THICK_PX] = 1;
+	struct pl_mon m1[] = {{0, 0, 240, 200}};
+	struct {
+		int pitch, n, rows[10];
+		int want[10];  // 1 forward, 0 backward
+		const char *what;
+	} cases[] = {
+	    {20, 5, {5, 25, 45, 65, 85}, {1, 0, 1, 0, 1}, "pitch 20, lines 20 apart, from row 5"},
+	    {20, 4, {19, 39, 59, 79}, {1, 0, 1, 0}, "pitch 20, lines 20 apart, from row 19"},
+	    {21, 5, {10, 31, 52, 73, 94}, {1, 0, 1, 0, 1}, "pitch 21, lines 21 apart"},
+	    {20, 4, {22, 32, 55, 75}, {0, 0, 1, 0}, "pitch 20: two lines in one slot share a direction, rows 22 and 32"},
+	    {1, 4, {10, 25, 40, 61}, {1, 0, 1, 0}, "pitch 1 is the parity of the row"},
+	    {4, 5, {2, 6, 10, 14, 18}, {1, 0, 1, 0, 1}, "pitch 4, lines 4 apart"},
+	};
+	for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+		c.v[SQ_RGB_ALT_PITCH_PX] = cases[k].pitch;
+		setup(240, 200, m1, 1);
+		put((struct pl_rect){0, 0, 240, 200}, 255, 255, 255);
+		for (int i = 0; i < cases[k].n; i++) put((struct pl_rect){10, cases[k].rows[i], 230, cases[k].rows[i] + 1}, 100, 100, 100);
+		capture_full(0);
+		render(&c, 101.0);
+		for (int i = 0; i < cases[k].n; i++)
+			CHECK(snake_dir(cases[k].rows[i]) == cases[k].want[i], "%s: row %d should run %s", cases[k].what, cases[k].rows[i], cases[k].want[i] ? "forward" : "backward");
+		teardown();
+	}
+
+	// Evenly spaced lines no longer share a direction just because the spacing is even.
+	c.v[SQ_RGB_ALT_PITCH_PX] = 20;
+	setup(240, 200, m1, 1);
+	put((struct pl_rect){0, 0, 240, 200}, 255, 255, 255);
+	for (int y = 10; y <= 190; y += 20) put((struct pl_rect){10, y, 230, y + 1}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	int fwd = 0, bwd = 0;
+	for (int y = 10; y <= 190; y += 20) {
+		if (snake_dir(y) == 1) fwd++;
+		else bwd++;
+	}
+	CHECK(fwd == 5 && bwd == 5, "ten lines 20 px apart at pitch 20 alternate: %d forward and %d backward", fwd, bwd);
+	teardown();
+
+	// Pitch 0: a hash of the start. Stable when lines are added, and mixed for even spacing.
+	c.v[SQ_RGB_ALT_PITCH_PX] = 0;
+	setup(240, 200, m1, 1);
+	put((struct pl_rect){0, 0, 240, 200}, 255, 255, 255);
+	for (int y = 10; y <= 190; y += 20) put((struct pl_rect){10, y, 230, y + 1}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	int dir0[10], valid = 1;
+	fwd = bwd = 0;
+	for (int i = 0; i < 10; i++) {
+		dir0[i] = snake_dir(10 + 20 * i);
+		valid &= dir0[i] >= 0;
+		if (dir0[i] == 1) fwd++;
+		else bwd++;
+	}
+	CHECK(valid && fwd >= 3 && bwd >= 3, "pitch 0 mixes the directions of evenly spaced lines: %d forward, %d backward", fwd, bwd);
+	put((struct pl_rect){10, 3, 230, 4}, 100, 100, 100);
+	put((struct pl_rect){10, 33, 230, 34}, 100, 100, 100);
+	pl_capture(&pl, (struct pl_rect[]){{10, 3, 230, 4}, {10, 33, 230, 34}}, 2, false, 0.1);
+	render(&c, 101.0);
+	int same = 1;
+	for (int i = 0; i < 10; i++) same &= snake_dir(10 + 20 * i) == dir0[i];
+	CHECK(same, "pitch 0: adding lines changes no other line's direction");
+	teardown();
+
+	// Columns count from the left of their monitor. The second monitor starts at column 121:
+	// its columns 130 and 150 are its columns 9 and 29, so slots 0 and 1 of 20, forward then
+	// backward. Forward, nothing is lit above y = 100 on a vertical line, and backward, all of it.
+	c.v[SQ_RGB_ALT_PITCH_PX] = 20;
+	struct pl_mon mo[] = {{0, 0, 121, 100}, {121, 0, 119, 100}};
+	setup(240, 100, mo, 2);
+	put((struct pl_rect){0, 0, 240, 100}, 255, 255, 255);
+	put((struct pl_rect){130, 5, 131, 96}, 100, 100, 100);
+	put((struct pl_rect){150, 5, 151, 96}, 100, 100, 100);
+	put((struct pl_rect){10, 5, 11, 96}, 100, 100, 100);
+	put((struct pl_rect){30, 5, 31, 96}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 101.0);
+	expect_lit("column 130, column 9 of the second monitor, slot 0: forward", 130, 50, false);
+	expect_lit("column 150, column 29 of the second monitor, slot 1: backward", 150, 50, true);
+	expect_lit("column 10 of the first monitor, slot 0: forward", 10, 50, false);
+	expect_lit("column 30 of the first monitor, slot 1: backward", 30, 50, true);
 	teardown();
 }
 
@@ -2478,50 +2725,35 @@ static void test_rgb_luma_range(void) {
 	struct sq_cfg c = rgb_cfg();
 	struct pl_mon mw[] = {{0, 0, 1200, 40}};
 
-	// Rain: the pale head pixels show each drop's multiplier.
+	// Rain: every drop has its own multiplier, and overlapping drops add their luminosity. A CPU
+	// copy of the shader says what each pixel should be.
 	setup(1200, 40, mw, 1);
 	put((struct pl_rect){0, 0, 1200, 40}, 255, 255, 255);
 	put((struct pl_rect){10, 20, 1190, 21}, 100, 100, 100);
 	capture_full(0);
 	c.v[SQ_RGB_EFFECT] = 5;
-	c.v[SQ_RGB_LENGTH_PX] = 40;
-	c.v[SQ_RGB_GAP_PX] = 40;
-	double spread[2];
-	double lo_seen = 1, hi_seen = 0;
+	c.v[SQ_RGB_LENGTH_PX] = 60;
+	c.v[SQ_RGB_GAP_PX] = 20;
+	render(&c, 104.0);  // sets cycle 0 at t = 104
+	int overlaps = 0;
 	for (int pass = 0; pass < 2; pass++) {
 		c.v[SQ_RGB_LUMA_MIN] = pass == 0 ? 1.0 : 0.3;
 		c.v[SQ_RGB_LUMA_MAX] = 1.0;
-		render(&c, 104.0);
-		double mn = 1, mx = 0;
-		int heads = 0;
-		for (int x = 12; x < 1188; x++) {
-			const uint8_t *p = at(x, 20);
-			if (p[1] > 20 && p[0] > 0.4 * p[1]) {
-				double l = lum(p);
-				mn = fmin(mn, l);
-				mx = fmax(mx, l);
-				heads++;
-			}
+		for (int step = 0; step < 6; step++) {  // several moments, so there are many drops
+			render(&c, 104.3 + 0.1 * step);
+			overlaps += check_rain_model(&c, 20, 20, 104.0, 104.3 + 0.1 * step, 12, 1188, pass == 0 ? "equal limits" : "0.3 to 1");
 		}
-		spread[pass] = (mx - mn) / L0;
-		if (pass == 1) {
-			lo_seen = mn;
-			hi_seen = mx;
-		}
-		CHECK(heads > 40, "enough drop heads to measure: %d", heads);
 	}
-	CHECK(spread[0] < 0.3, "equal limits: heads differ only by where in the head they sit (spread %.2f)", spread[0]);
-	CHECK(spread[1] > 0.55, "0.3 to 1: heads differ a lot (spread %.2f)", spread[1]);
-	CHECK(hi_seen <= L0 + 0.01 && lo_seen >= 0.2 * L0, "every head is between the limits: %.4f to %.4f of %.4f", lo_seen, hi_seen, L0);
+	CHECK(overlaps > 100, "enough overlapping drops to see the sum: %d pixels", overlaps);
 	// The limits may be given in either order.
 	c.v[SQ_RGB_LUMA_MIN] = 0.3;
 	c.v[SQ_RGB_LUMA_MAX] = 1.0;
-	render(&c, 104.0);
+	render(&c, 104.5);
 	uint8_t first[1200 * 4];
 	memcpy(first, out + (size_t)20 * W * 4, sizeof first);
 	c.v[SQ_RGB_LUMA_MIN] = 1.0;
 	c.v[SQ_RGB_LUMA_MAX] = 0.3;
-	render(&c, 104.0);
+	render(&c, 104.5);
 	CHECK(memcmp(first, out + (size_t)20 * W * 4, sizeof first) == 0, "swapped limits give the same picture");
 
 	// Snake: one multiplier per segment, constant along it.
@@ -2607,6 +2839,318 @@ static void test_rgb_luma_range(void) {
 	CHECK(fabs(lum(at(30, 20)) - lum(at(210, 20))) < 0.004 && fabs(lum(at(200, 100)) - lum(at(200, 140))) < 0.004, "a line has one brightness along its length");
 	render(&c, 100.0);  // the same again, from the same line numbers
 	CHECK(fabs(lum(at(100, 20)) - h1) < 0.001, "the multiplier of a line is stable");
+	teardown();
+}
+
+// Every line has a rain pattern of its own: lines of the same length and the same settings
+// do not show the same drops, whether the lines are in step or not.
+static void test_rain_lines(void) {
+	printf("rain: a pattern for each line\n");
+	struct pl_mon mw[] = {{0, 0, 1200, 60}};
+	setup(1200, 60, mw, 1);
+	put((struct pl_rect){0, 0, 1200, 60}, 255, 255, 255);
+	int rows[3] = {10, 30, 52};
+	for (int k = 0; k < 3; k++) put((struct pl_rect){10, rows[k], 1190, rows[k] + 1}, 100, 100, 100);
+	capture_full(0);
+	struct sq_cfg c = rgb_cfg();
+	c.v[SQ_RGB_EFFECT] = 5;
+	c.v[SQ_RGB_LENGTH_PX] = 60;
+	c.v[SQ_RGB_GAP_PX] = 40;
+	render(&c, 100.0);
+	for (int sync = 1; sync >= 0; sync--) {
+		c.v[SQ_RGB_SYNC] = sync;
+		for (int step = 0; step < 3; step++) {
+			double t = 100.4 + 0.3 * step;
+			render(&c, t);
+			char what[64];
+			double rowlum[3][1200];
+			for (int k = 0; k < 3; k++) {
+				snprintf(what, sizeof what, "%s, row %d", sync ? "in step" : "out of step", rows[k]);
+				check_rain_model(&c, rows[k], rows[k], 100.0, t, 12, 1188, what);
+				for (int x = 0; x < 1200; x++) rowlum[k][x] = lum(at(x, rows[k]));
+			}
+			for (int a = 0; a < 3; a++)
+				for (int b = a + 1; b < 3; b++) {
+					int differ = 0, lit = 0;
+					for (int x = 12; x < 1188; x++) {
+						differ += fabs(rowlum[a][x] - rowlum[b][x]) > 0.01;
+						lit += rowlum[a][x] > 0.14 || rowlum[b][x] > 0.14;
+					}
+					CHECK(differ > 150, "%s: rows %d and %d show different drops: %d pixels differ (%d lit)", sync ? "in step" : "out of step", rows[a], rows[b], differ, lit);
+				}
+		}
+	}
+	teardown();
+
+	// Vertical lines at the same column of two monitors cover the same rows, and still differ.
+	struct pl_mon mv[] = {{0, 0, 120, 600}, {120, 0, 120, 600}};
+	setup(240, 600, mv, 2);
+	put((struct pl_rect){0, 0, 240, 600}, 255, 255, 255);
+	put((struct pl_rect){10, 10, 11, 590}, 100, 100, 100);
+	put((struct pl_rect){130, 10, 131, 590}, 100, 100, 100);
+	capture_full(0);
+	struct sq_cfg cv = rgb_cfg();
+	cv.v[SQ_RGB_EFFECT] = 5;
+	cv.v[SQ_RGB_LENGTH_PX] = 60;
+	cv.v[SQ_RGB_GAP_PX] = 40;
+	render(&cv, 100.0);
+	render(&cv, 100.6);
+	int differ = 0;
+	for (int y = 20; y < 580; y++) differ += fabs(lum(at(10, y)) - lum(at(130, y))) > 0.01;
+	CHECK(differ > 80, "the same column on two monitors shows different drops: %d of 560 pixels differ", differ);
+	teardown();
+}
+
+// True when the series rises (up to the tolerance) to one peak and then only falls.
+static bool unimodal(const double *v, int n) {
+	int peak = 0;
+	for (int i = 1; i < n; i++)
+		if (v[i] > v[peak]) peak = i;
+	for (int i = 1; i <= peak; i++)
+		if (v[i] < v[i - 1] - 0.06) return false;
+	for (int i = peak + 1; i < n; i++)
+		if (v[i] > v[i - 1] + 0.06) return false;
+	return true;
+}
+
+// Rain flashes: each pixel of a drop head flashes at random, at a low chance per 1/60 s, jumps
+// to 2.5 times its brightness, and fades back to where it started.
+static void test_rain_flash(void) {
+	printf("rain flashes\n");
+	struct pl_mon mw[] = {{0, 0, 1200, 40}};
+	setup(1200, 40, mw, 1);
+	put((struct pl_rect){0, 0, 1200, 40}, 255, 255, 255);
+	put((struct pl_rect){10, 10, 1190, 11}, 100, 100, 100);
+	put((struct pl_rect){10, 30, 1190, 31}, 100, 100, 100);
+	capture_full(0);
+	struct sq_cfg ca = rgb_cfg();
+	ca.v[SQ_RGB_EFFECT] = 5;
+	ca.v[SQ_RGB_LENGTH_PX] = 40;
+	ca.v[SQ_RGB_GAP_PX] = 40;
+	ca.v[SQ_RGB_SPEED] = 0.2;  // slow, so a drop moves under one pixel a frame
+	ca.v[SQ_RGB_RAIN_FLASH_MS] = 120;
+	ca.v[SQ_RGB_RAIN_FLASH_SPEED] = 120;  // 2 px a frame, slow enough to see the front move
+	struct sq_cfg cb = ca;
+	cb.v[SQ_RGB_RAIN_FLASH] = 0.5;  // percent per frame
+	render(&ca, 100.0);
+	enum { N = 900 };
+	static float ratio[2][N][1200];
+	static uint8_t head[2][N][1200];
+	int rows[2] = {10, 30};
+	for (int n = 0; n < N; n++) {
+		double t = 110.0 + (n + 0.5) / 60.0;  // half way through a frame of the 60 Hz clock
+		render(&ca, t);
+		double base[2][1200];
+		for (int k = 0; k < 2; k++)
+			for (int x = 0; x < 1200; x++) {
+				const uint8_t *p = at(x, rows[k]);
+				base[k][x] = lum(p);
+				head[k][n][x] = p[1] > 20 && p[0] > 0.4 * p[1];
+			}
+		render(&cb, t);
+		for (int k = 0; k < 2; k++)
+			for (int x = 0; x < 1200; x++) ratio[k][n][x] = base[k][x] > 1e-4 ? (float)(lum(at(x, rows[k])) / base[k][x]) : 1.0f;
+	}
+	// Where flashes show up, and how often.
+	long heads = 0, boosted = 0, off_head = 0;
+	int mixed = 0, differ = 0;
+	for (int n = 0; n < N; n++) {
+		for (int k = 0; k < 2; k++)
+			for (int x = 12; x < 1188; x++) {
+				bool up = ratio[k][n][x] > 1.05f;
+				if (head[k][n][x]) {
+					heads++;
+					boosted += up;
+				} else if (up) {
+					bool behind_head = false;  // the trail runs backward from a head, up to 40 px
+					for (int dx = 1; dx <= 42 && x + dx < 1200 && !behind_head; dx++) behind_head = head[k][n][x + dx];
+					off_head += !behind_head;
+				}
+			}
+		// Mixed: a head with some pixels flashing and others not.
+		for (int x = 12; x < 1186; x++) {
+			if (head[0][n][x] && head[0][n][x + 1] && head[0][n][x + 2]) {
+				int ups = (ratio[0][n][x] > 1.3f) + (ratio[0][n][x + 1] > 1.3f) + (ratio[0][n][x + 2] > 1.3f);
+				int calm = (ratio[0][n][x] < 1.05f) + (ratio[0][n][x + 1] < 1.05f) + (ratio[0][n][x + 2] < 1.05f);
+				if (ups > 0 && calm > 0) mixed++;
+			}
+		}
+		// Different lines: the same drops, but not the same flashes.
+		int same = 1, any = 0;
+		for (int x = 12; x < 1188; x++) {
+			bool a = ratio[0][n][x] > 1.3f, b = ratio[1][n][x] > 1.3f;
+			any |= a | b;
+			if (a != b) same = 0;
+		}
+		if (any && !same) differ++;
+	}
+	double frac = (double)boosted / (double)heads;
+	CHECK(off_head == 0, "only drops flash, the head and the trail behind it: %ld boosted pixels are neither", off_head);
+	CHECK(frac > 0.05 && frac < 0.25, "at 0.5 percent per frame about a tenth of the head pixels are up at any time: %.3f", frac);
+	CHECK(mixed > 1500, "the pixels of one head flash independently: %d frames-and-heads are mixed", mixed);
+	CHECK(differ > 50, "two lines with the same drops do not flash together: %d frames differ", differ);
+
+	// A flash decays gradually: follow the first clean flash and compare with 1 + 1.5 exp(-age / 0.12).
+	int found = 0, on_n = 0, on_off = 0;
+	double got[40], want[40], tail6[40], tail18[40];
+	int track[40];  // the front of the head, the pixel nearest the head position, in each frame
+	for (int n = 3; n < N - 40 && !found; n++) {
+		for (int x = 60; x < 1150 && !found; x++) {
+			if (!head[0][n][x] || ratio[0][n][x] < 2.2f) continue;
+			bool fresh = true;  // no flash anywhere on this drop a frame ago
+			for (int dx = -45; dx <= 3; dx++) fresh &= ratio[0][n - 1][x + dx] < 1.1f;
+			if (!fresh) continue;
+			int front = x;
+			while (head[0][n][front + 1]) front++;
+			int off = front - x;  // which of the 3 head pixels flashed: 0 is the front one
+			bool clean = true;
+			double last = ratio[0][n][x];
+			for (int j = 0; j < 40 && clean; j++) {
+				int best = -1;  // follow the head: the nearest front within 3 px of the last one
+				for (int dx = -3; dx <= 3; dx++) {
+					int f = front + dx;
+					if (head[0][n + j][f] && !head[0][n + j][f + 1] && (best < 0 || abs(dx) < abs(best - front))) best = f;
+				}
+				if (best < 0) {
+					clean = false;
+					break;
+				}
+				front = best;
+				track[j] = front;
+				double r = ratio[0][n + j][front - off];
+				if (r > last + 0.06) clean = false;  // another flash joined in
+				last = r < last ? r : last;
+				got[j] = r;
+				tail6[j] = ratio[0][n + j][front - 6];
+				tail18[j] = ratio[0][n + j][front - 18];
+				want[j] = 1 + 1.5 * exp(-(j + 0.5) / 60.0 / 0.12);
+			}
+			// Where drops overlap their brightness adds, which hides the flash ratio: skip those.
+			for (int j = 0; j < 40 && clean; j++) clean = fabs(got[j] - want[j]) < 0.1;
+			if (clean) clean = unimodal(tail6, 40) && unimodal(tail18, 40);
+			if (clean) {
+				found = 1;
+				on_n = n;
+				on_off = off;
+			}
+		}
+	}
+	CHECK(found, "found a flash with nothing else around it to follow");
+	if (found) {
+		CHECK(got[0] > 2.2 && got[0] < 2.6, "it jumps to about 2.4 times: %.2f", got[0]);
+		CHECK(fabs(got[3] - want[3]) < 0.04 && fabs(got[6] - want[6]) < 0.04 && fabs(got[12] - want[12]) < 0.04, "it fades gradually: %.2f %.2f %.2f after 3, 6, and 12 frames, expected %.2f %.2f %.2f", got[3], got[6], got[12], want[3], want[6], want[12]);
+		CHECK(got[30] < 1.1 && got[39] < 1.05, "and returns to where it started: %.2f after 30 frames, %.2f after 39", got[30], got[39]);
+		int mono = 1;
+		for (int j = 1; j < 40; j++) mono &= got[j] <= got[j - 1] + 0.06;
+		CHECK(mono, "it never brightens again while fading");
+		// The flash travels down the trail. 6 and 18 px behind the head it arrives later the
+		// further back it is, 120 px a second being 2 px a frame, and it then fades like the head.
+		int p6 = 0, p18 = 0, a6 = -1, a18 = -1;
+		for (int k = 0; k < 40; k++) {
+			if (tail6[k] > tail6[p6]) p6 = k;
+			if (tail18[k] > tail18[p18]) p18 = k;
+			if (a6 < 0 && tail6[k] > 1.1) a6 = k;
+			if (a18 < 0 && tail18[k] > 1.1) a18 = k;
+		}
+		CHECK(tail6[0] < 1.1 && tail18[0] < 1.1, "at the start the trail has not been reached yet: %.2f and %.2f", tail6[0], tail18[0]);
+		CHECK(a6 >= 2 && a6 <= 5 && a18 >= 7 && a18 <= 12 && a18 - a6 >= 4 && a18 - a6 <= 9, "the flash arrives 6 px back after about 3 frames and 18 px back after about 9: %d and %d", a6, a18);
+		CHECK(tail6[p6] > 1.5 && tail6[p6] < 2.5, "it is bright 6 px back: %.2f", tail6[p6]);
+		CHECK(tail18[p18] > 1.15 && tail18[p18] < tail6[p6] - 0.1, "and weaker 18 px back, following the gradient: %.2f then %.2f", tail6[p6], tail18[p18]);
+		double k6 = (tail6[p6 + 6] - 1) / (tail6[p6] - 1);
+		double k18 = (tail18[p18 + 6] - 1) / (tail18[p18] - 1);
+		double kw = exp(-6.0 / 60.0 / 0.12);
+		CHECK(fabs(k6 - kw) < 0.1 && fabs(k18 - kw) < 0.12, "after its peak each part fades at the head's rate: %.2f and %.2f left after 6 frames, expected %.2f", k6, k18, kw);
+		// The speed is a setting: at twice the speed the flash has reached 18 px back after 7 frames.
+		{
+			double t7 = 110.0 + (on_n + 7 + 0.5) / 60.0;
+			struct sq_cfg cf = cb;
+			cf.v[SQ_RGB_RAIN_FLASH_SPEED] = 240;
+			render(&ca, t7);
+			double base7 = lum(at(track[7] - 18, 10));
+			render(&cf, t7);
+			double fast7 = lum(at(track[7] - 18, 10)) / base7;
+			CHECK(tail18[7] < 1.15 && fast7 > 1.3, "at 240 px a second it is already 18 px back after 7 frames (%.2f), at 120 it is not (%.2f)", fast7, tail18[7]);
+		}
+		// The gain and the fade time are settings.
+		double t_on = 110.0 + (on_n + 0.5) / 60.0;
+		render(&ca, t_on);
+		int on_x = track[0] - on_off;
+		double base = lum(at(on_x, 10));
+		struct sq_cfg cg = cb;
+		cg.v[SQ_RGB_RAIN_FLASH_GAIN] = 4.0;
+		render(&cg, t_on);
+		double peak4 = lum(at(on_x, 10)) / base;
+		CHECK(fabs((peak4 - 1) / (got[0] - 1) - 2.0) < 0.1, "gain 4 doubles the extra brightness of gain 2.5 at the same pixel: %.2f against %.2f", peak4, got[0]);
+		struct sq_cfg cs = cb;
+		cs.v[SQ_RGB_RAIN_FLASH_MS] = 480;
+		render(&cs, 110.0 + (on_n + 6.5) / 60.0);
+		render(&ca, 110.0 + (on_n + 6.5) / 60.0);
+		int x6 = track[6] - on_off;
+		double base6 = lum(at(x6, 10));
+		render(&cs, 110.0 + (on_n + 6.5) / 60.0);
+		double slow6 = lum(at(x6, 10)) / base6;
+		CHECK(slow6 > got[6] + 0.1, "a longer fade time keeps the flash brighter after 6 frames: %.2f against %.2f", slow6, got[6]);
+		CHECK(tail6[39] < 1.1 && tail18[39] < 1.1, "and returns to its original brightness: %.2f and %.2f after 39 frames", tail6[39], tail18[39]);
+	}
+	// A given moment looks the same however it is reached.
+	render(&cb, 120.25);
+	uint8_t pic[1200 * 4];
+	memcpy(pic, out + (size_t)10 * W * 4, sizeof pic);
+	render(&cb, 133.0);
+	render(&cb, 120.25);
+	CHECK(memcmp(pic, out + (size_t)10 * W * 4, sizeof pic) == 0, "a flash is a function of time");
+	teardown();
+}
+
+// The plugin redraws on its own at the rate of the animations that are on.
+static void test_refresh_rate(void) {
+	printf("animation refresh rate\n");
+	struct sq_cfg c;
+	sq_defaults(&c);
+	CHECK(sq_anim_hz(&c) == 60 && fabs(sq_tick(&c) - 1.0 / 60) < 1e-12, "no animation: 60 Hz");
+	CHECK(sq_params[SQ_STATIC_HZ].max == 120 && sq_params[SQ_RGB_HZ].max == 120, "both rates go up to 120");
+	CHECK(sq_set(&c, "static_hz", "200") && c.v[SQ_STATIC_HZ] == 120, "static_hz is clamped to 120");
+	CHECK(sq_set(&c, "rgb_hz", "500") && c.v[SQ_RGB_HZ] == 120, "rgb_hz is clamped to 120");
+	CHECK(sq_set(&c, "rgb_hz", "1") && c.v[SQ_RGB_HZ] == 10, "rgb_hz has a floor of 10");
+	c.v[SQ_STATIC] = 1;
+	c.v[SQ_STATIC_AMOUNT] = 4;
+	c.v[SQ_STATIC_HZ] = 120;
+	CHECK(sq_anim_hz(&c) == 120 && fabs(sq_tick(&c) - 1.0 / 120) < 1e-12, "static at 120 Hz: the timer ticks at 120 Hz");
+	c.v[SQ_STATIC_HZ] = 30;
+	CHECK(sq_anim_hz(&c) == 30 && fabs(sq_tick(&c) - 1.0 / 60) < 1e-12, "static at 30 Hz: the timer stays at 60 ticks and skips alternate ticks");
+	c.v[SQ_STATIC_AMOUNT] = 0;
+	CHECK(sq_anim_hz(&c) == 60, "static with amount 0 is not an animation");
+	c.v[SQ_STATIC_AMOUNT] = 4;
+	c.v[SQ_RGB] = 1;
+	c.v[SQ_RGB_EFFECT] = 0;
+	c.v[SQ_RGB_HZ] = 120;
+	CHECK(sq_anim_hz(&c) == 30, "solid RGB does not animate");
+	c.v[SQ_RGB_EFFECT] = 5;
+	c.v[SQ_RGB_HZ] = 100;
+	CHECK(sq_anim_hz(&c) == 100 && fabs(sq_tick(&c) - 0.01) < 1e-12, "the faster of static and RGB sets the rate");
+	c.v[SQ_RGB_HZ] = 20;
+	CHECK(sq_anim_hz(&c) == 30, "static is faster here");
+	c.v[SQ_ENABLED] = 0;
+	CHECK(sq_anim_hz(&c) == 60, "nothing animates while enabled is off");
+	c.v[SQ_ENABLED] = 1;
+	c.v[SQ_RGB] = 0;
+	c.v[SQ_STATIC] = 0;
+	CHECK(sq_anim_hz(&c) == 60, "back to 60 with both off");
+	// The effects use the time, not the frame count, so a faster rate only draws more often.
+	struct pl_mon m1[] = {{0, 0, 240, 160}};
+	setup(240, 160, m1, 1);
+	draw_lines_scene();
+	capture_full(0);
+	struct sq_cfg r = rgb_cfg();
+	r.v[SQ_RGB_EFFECT] = 2;
+	r.v[SQ_RGB_HZ] = 120;
+	render(&r, 100.0);
+	render(&r, 100.37);
+	uint8_t a[240 * 4];
+	memcpy(a, out + (size_t)20 * W * 4, sizeof a);
+	r.v[SQ_RGB_HZ] = 30;
+	render(&r, 100.37);
+	CHECK(memcmp(a, out + (size_t)20 * W * 4, sizeof a) == 0, "rgb_hz does not change what a given moment looks like");
 	teardown();
 }
 
@@ -2697,7 +3241,11 @@ int main(void) {
 	test_rgb_lines();
 	test_rgb_effects();
 	test_rgb_alternate();
+	test_rgb_pitch();
 	test_rgb_luma_range();
+	test_rain_lines();
+	test_rain_flash();
+	test_refresh_rate();
 	printf("\n%d checks, %d failed\n", checks, failures);
 	return failures ? 1 : 0;
 }

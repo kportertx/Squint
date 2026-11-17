@@ -387,7 +387,12 @@ static void hk_cb(struct ev_loop *loop, ev_io *w, int revents) {
 	(void)w;
 	(void)revents;
 	int acts[HK_MAX];
+	long seen = st.hk.seen;
 	int n = hk_poll(&st.hk, now_s(), acts, HK_MAX);
+	if (st.hk.seen != seen && n == 0) {
+		say("shortcut: key press (keycode %u, modifiers 0x%x) did not trigger anything: wrong modifiers or a repeat within 0.3 s",
+		    st.hk.last_code, st.hk.last_state);
+	}
 	for (int i = 0; i < n; i++) {
 		flip_setting(acts[i]);
 	}
@@ -452,6 +457,20 @@ static void apply_hotkeys(struct ev_loop *loop) {
 	}
 }
 
+// Sets the timer period for the animation rate in the config: 1/60 s, or the frame period
+// of static or the RGB effects when that is shorter. Restarts the timer only when it changes.
+static void retime(struct ev_loop *loop) {
+	if (!st.timer_on) {
+		return;
+	}
+	double want = sq_tick(&st.cfg);
+	if (fabs(st.timer.repeat - want) > 1e-9) {
+		st.timer.repeat = want;
+		ev_timer_again(loop, &st.timer);
+		say("timer: %.1f ticks a second", 1.0 / want);
+	}
+}
+
 // libev calls this when the config file is replaced, changed, or created. squintctl
 // writes by rename, which libev reports as a new inode. No GL work happens here. The next
 // present or timer tick picks the new values up, with the context known to be current.
@@ -462,6 +481,7 @@ static void conf_cb(struct ev_loop *loop, ev_stat *w, int revents) {
 	st.cfg_dirty = true;
 	log_cfg("config reloaded");
 	apply_hotkeys(loop);
+	retime(loop);
 }
 
 // Presents on its own while a smoothing transition may still be running and picom has
@@ -479,8 +499,10 @@ static void timer_cb(struct ev_loop *loop, ev_timer *w, int revents) {
 		pl_touch(&st.pl, now);
 		st.cfg_dirty = false;
 	}
-	bool stat = st.cfg.v[SQ_ENABLED] != 0 && st.cfg.v[SQ_STATIC] != 0 && st.cfg.v[SQ_STATIC_AMOUNT] > 0;
-	double min_gap = stat ? 1.0 / st.cfg.v[SQ_STATIC_HZ] : 0.015;
+	// A tick draws a frame when a frame period has passed since the last one. Ticks come at a
+	// fixed period and each one is measured from its own start, so a frame period that equals
+	// the tick period must still pass: the 0.8 absorbs the jitter of the timer.
+	double min_gap = 0.8 / sq_anim_hz(&st.cfg);
 	if (!pl_active(&st.pl, &st.cfg, now) || now - st.last_present < min_gap) {
 		return;
 	}
@@ -498,7 +520,7 @@ static void timer_cb(struct ev_loop *loop, ev_timer *w, int revents) {
 	pixman_region32_fini(&none);
 	run_pipeline();
 	st.orig_present(st.b);
-	st.last_present = now_s();
+	st.last_present = now;
 	st.n_timer_present++;
 	if (st.n_timer_present % STATS_EVERY == 0) {
 		log_stats("timer");
@@ -535,7 +557,7 @@ static void entry(struct backend_base *b, void *user_data) {
 	st.conf_watch_on = true;
 	apply_hotkeys(b->loop);
 
-	ev_timer_init(&st.timer, timer_cb, 0.0, 1.0 / 60.0);
+	ev_timer_init(&st.timer, timer_cb, 0.0, sq_tick(&st.cfg));
 	ev_timer_start(b->loop, &st.timer);
 	st.timer_on = true;
 	say("wrapped");

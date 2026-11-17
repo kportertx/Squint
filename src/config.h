@@ -55,6 +55,7 @@ enum {
 	SQ_RGB,
 	SQ_RGB_EFFECT,
 	SQ_RGB_SPEED,
+	SQ_RGB_HZ,
 	SQ_RGB_LUMA_MIN,
 	SQ_RGB_LUMA_MAX,
 	SQ_RGB_FLOOR_LUMA,
@@ -65,7 +66,12 @@ enum {
 	SQ_RGB_GAP_PX,
 	SQ_RGB_TAIL,
 	SQ_RGB_RAIN_LINE,
+	SQ_RGB_RAIN_FLASH,
+	SQ_RGB_RAIN_FLASH_GAIN,
+	SQ_RGB_RAIN_FLASH_MS,
+	SQ_RGB_RAIN_FLASH_SPEED,
 	SQ_RGB_DIRECTION,
+	SQ_RGB_ALT_PITCH_PX,
 	SQ_RGB_SYNC,
 	SQ_RGB_LINE_MIN_PX,
 	SQ_RGB_LINE_THICK_PX,
@@ -185,8 +191,8 @@ static const struct sq_param sq_params[SQ_N] = {
                             "Size of one speckle in pixels. The description of the video says 1 to 3."},
     [SQ_STATIC_COLOR] = {"static_color", SQ_FLOAT, 0.50, 0.0, 1.0, 0.05,
                          "0 is gray static, 1 is independent noise per color channel."},
-    [SQ_STATIC_HZ] = {"static_hz", SQ_INT, 60, 1, 60, 1,
-                      "How many times a second the static changes. Each change costs a frame of GPU work."},
+    [SQ_STATIC_HZ] = {"static_hz", SQ_INT, 60, 1, 120, 1,
+                      "How many times a second the static changes, up to 120. Each change costs a frame of GPU work."},
     [SQ_STATIC_LEVEL] = {"static_level", SQ_FLOAT, 0.50, 0.0, 1.0, 0.01,
                          "Average brightness of the static, in encoded 0 to 1 values. 0.5 is middle gray."},
     [SQ_STATIC_CONTRAST] = {"static_contrast", SQ_FLOAT, 0.10, 0.0, 0.5, 0.01,
@@ -206,6 +212,8 @@ static const struct sq_param sq_params[SQ_N] = {
                        NULL, "solid,breathe,rainbow,snake,wave,rain"},
     [SQ_RGB_SPEED] = {"rgb_speed", SQ_FLOAT, 0.5, 0.1, 5.0, 0.1,
                       "Cycles per second for breathe, and for how fast rainbow, snake, and wave travel."},
+    [SQ_RGB_HZ] = {"rgb_hz", SQ_INT, 60, 10, 120, 5,
+                   "How many times a second the RGB effects redraw, up to 120. Each redraw costs a frame of GPU work. Solid never redraws."},
     [SQ_RGB_LUMA_MIN] = {"rgb_luma_min", SQ_FLOAT, 0.5, 0.1, 4.0, 0.05,
                          "Lowest brightness multiplier. Each rain drop, snake, rainbow cycle, or line gets a multiplier between this and rgb_luma_max, picked at random. Equal limits give every one the same."},
     [SQ_RGB_LUMA_MAX] = {"rgb_luma_max", SQ_FLOAT, 1.0, 0.1, 4.0, 0.05,
@@ -226,9 +234,19 @@ static const struct sq_param sq_params[SQ_N] = {
                      "How softly a snake fades toward its tail. 0 is a hard block, 1 fades evenly."},
     [SQ_RGB_RAIN_LINE] = {"rgb_rain_line", SQ_FLOAT, 0.4, 0.0, 1.0, 0.05,
                           "How much of the original line shows through rain. 0 hides it, 1 shows it everywhere except under the drop heads."},
+    [SQ_RGB_RAIN_FLASH] = {"rgb_rain_flash", SQ_FLOAT, 0.3, 0.0, 10.0, 0.1,
+                           "Chance, in percent per 1/60 s, that each pixel of a rain drop head flashes. The flash starts at the head, travels down the trail, and fades back to the original brightness. 0 turns flashes off."},
+    [SQ_RGB_RAIN_FLASH_GAIN] = {"rgb_rain_flash_gain", SQ_FLOAT, 2.5, 1.0, 5.0, 0.1,
+                                "How bright a flash makes the drop at its peak, as a multiple of the brightness before it. It is weaker further down the trail, by the trail gradient."},
+    [SQ_RGB_RAIN_FLASH_MS] = {"rgb_rain_flash_ms", SQ_INT, 250, 50, 1000, 25,
+                              "Time constant of a flash fading back to the original brightness, in milliseconds. It is back within about five times this."},
+    [SQ_RGB_RAIN_FLASH_SPEED] = {"rgb_rain_flash_speed", SQ_INT, 300, 20, 3000, 10,
+                                 "How fast a flash travels down the trail behind the head, in pixels per second."},
     [SQ_RGB_DIRECTION] = {"rgb_direction", SQ_ENUM, 0, 0, 2, 1,
-                          "Which way motion runs along a line. alternate reverses it on every other line: horizontal lines count from the top and vertical lines from the left, separately, and each screen starts again.",
+                          "Which way motion runs along a line. alternate uses the pixel row where a horizontal line starts, or the pixel column where a vertical one starts, counted from the top or left of its monitor. See rgb_alt_pitch_px.",
                           NULL, "forward,backward,alternate"},
+    [SQ_RGB_ALT_PITCH_PX] = {"rgb_alt_pitch_px", SQ_INT, 20, 0, 200, 1,
+                             "For alternate: the screen is cut into slots this many pixels tall (wide for vertical lines) from the top (or left) of the monitor, and a line runs forward in an even slot and backward in an odd one. Set it to the spacing of your lines and they alternate. 1 uses odd and even pixel rows. 0 picks at random, but always the same way for a given line."},
     [SQ_RGB_SYNC] = {"rgb_sync", SQ_BOOL, 0, 0, 1, 1,
                      "On: every line moves in step. Off: each line has its own phase."},
     [SQ_RGB_LINE_MIN_PX] = {"rgb_line_min_px", SQ_INT, 48, 8, 256, 4,
@@ -282,6 +300,30 @@ static inline void sq_defaults(struct sq_cfg *c) {
 			snprintf(c->s[i], SQ_STRLEN, "%s", sq_params[i].sdef);
 		}
 	}
+}
+
+// How many times a second the plugin should redraw on its own: the faster of the animations
+// that are on, static and the moving RGB effects, or 60 when none is on (smoothing transitions
+// use that). Always between 10 and 120.
+static inline double sq_anim_hz(const struct sq_cfg *c) {
+	double hz = 0;
+	if (c->v[SQ_ENABLED] != 0) {
+		if (c->v[SQ_STATIC] != 0 && c->v[SQ_STATIC_AMOUNT] > 0 && c->v[SQ_STATIC_HZ] > hz) {
+			hz = c->v[SQ_STATIC_HZ];
+		}
+		if (c->v[SQ_RGB] != 0 && c->v[SQ_RGB_EFFECT] != 0 && c->v[SQ_RGB_HZ] > hz) {
+			hz = c->v[SQ_RGB_HZ];
+		}
+	}
+	return hz > 0 ? (hz < 10 ? 10 : hz) : 60;
+}
+
+// Period of the plugin's timer in seconds. Faster than 60 Hz it equals the frame period, so
+// every tick draws a frame. At 60 Hz or less it stays at 1/60 and a frame is drawn on the
+// tick that first falls at or after the frame period.
+static inline double sq_tick(const struct sq_cfg *c) {
+	double hz = sq_anim_hz(c);
+	return 1.0 / (hz > 60 ? hz : 60);
 }
 
 // The path must be the same in the plugin (running inside picom) and in the tool, so it
