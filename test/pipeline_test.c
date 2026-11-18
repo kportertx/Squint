@@ -2717,6 +2717,102 @@ static void test_rgb_pitch(void) {
 	teardown();
 }
 
+// Searching only where S changed: after a small change the lines are the same as a full search
+// would find, also far from the change (a line gets cut, a short line is extended, lines
+// cross), and only a small part of the screen is searched.
+static void test_lines_partial(void) {
+	printf("line search limited to the damage\n");
+	struct sq_cfg c = rgb_cfg();
+	c.v[SQ_RGB_LINE_MIN_PX] = 24;
+	struct pl_mon m1[] = {{0, 0, 320, 200}};
+	setup(320, 200, m1, 1);
+	put((struct pl_rect){0, 0, 320, 200}, 255, 255, 255);
+	put((struct pl_rect){10, 30, 300, 31}, 100, 100, 100);   // long horizontal line
+	put((struct pl_rect){10, 80, 45, 81}, 100, 100, 100);    // 35 px, will be cut
+	put((struct pl_rect){10, 120, 30, 121}, 100, 100, 100);  // 20 px, will be extended
+	put((struct pl_rect){250, 40, 251, 190}, 100, 100, 100); // long vertical line
+	capture_full(0);
+	render(&c, 0);
+	compare_lines("full search first", &c);
+	long full_px = pl.last_lines_px;
+	CHECK(full_px == 2L * 320 * 200, "a full search covers both directions of the whole screen: %ld", full_px);
+	double now = 0.1;
+	struct {
+		const char *what;
+		struct pl_rect r;
+		int rr, gg, bb;
+	} edits[] = {
+	    {"cutting a line in two pieces too short to count", {26, 80, 29, 81}, 255, 255, 255},
+	    {"extending a 20 px line to 60 px", {30, 120, 70, 121}, 100, 100, 100},
+	    {"a vertical line crossing a horizontal one", {150, 10, 151, 60}, 100, 100, 100},
+	    {"a short vertical line on the left edge", {0, 140, 1, 180}, 100, 100, 100},
+	    {"erasing a piece of the long vertical line", {245, 100, 256, 104}, 255, 255, 255},
+	    {"a thick band next to a line", {100, 150, 200, 153}, 100, 100, 100},
+	};
+	for (unsigned k = 0; k < sizeof edits / sizeof edits[0]; k++) {
+		put(edits[k].r, edits[k].rr, edits[k].gg, edits[k].bb);
+		capture(edits[k].r, now);
+		render(&c, now);
+		now += 0.1;
+		compare_lines(edits[k].what, &c);
+		CHECK(pl.last_lines_px < 2L * 320 * 200 * 45 / 100, "%s: only part of the screen is searched: %ld of %ld pixels", edits[k].what, pl.last_lines_px, full_px);
+	}
+	// Two changes far apart in one frame: one search over their bounding box.
+	put((struct pl_rect){100, 30, 110, 31}, 255, 255, 255);
+	put((struct pl_rect){200, 170, 280, 171}, 100, 100, 100);
+	pl_capture(&pl, (struct pl_rect[]){{100, 30, 110, 31}, {200, 170, 280, 171}}, 2, false, now);
+	render(&c, now);
+	now += 0.1;
+	compare_lines("two changes far apart", &c);
+	// A change of the settings searches everything again.
+	struct sq_cfg d = c;
+	d.v[SQ_RGB_LINE_CONTRAST] = 0.05;
+	put((struct pl_rect){40, 190, 41, 191}, 100, 100, 100);
+	capture((struct pl_rect){40, 190, 41, 191}, now);
+	render(&d, now);
+	now += 0.1;
+	compare_lines("settings changed with a change on screen", &d);
+	CHECK(pl.last_lines_px == full_px, "new settings search the whole screen: %ld", pl.last_lines_px);
+	// While rgb is off the screen can change unseen; turning it on searches everything.
+	struct sq_cfg off = d;
+	off.v[SQ_RGB] = 0;
+	render(&off, now);
+	now += 0.1;
+	put((struct pl_rect){60, 60, 200, 61}, 100, 100, 100);
+	capture((struct pl_rect){60, 60, 200, 61}, now);
+	render(&off, now);
+	now += 0.1;
+	put((struct pl_rect){60, 100, 62, 140}, 100, 100, 100);
+	capture((struct pl_rect){60, 100, 62, 140}, now);
+	render(&d, now);
+	compare_lines("rgb turned on after changes it did not see", &d);
+	CHECK(pl.last_lines_px == full_px, "and it searches the whole screen: %ld", pl.last_lines_px);
+	// A full capture (a new picom frame over everything) searches everything.
+	capture_full(now + 0.1);
+	render(&d, now + 0.1);
+	CHECK(pl.last_lines_px == full_px, "a full capture searches the whole screen: %ld", pl.last_lines_px);
+	teardown();
+
+	// Two monitors: a change near the seam.
+	struct pl_mon m2[] = {{0, 0, 160, 200}, {160, 0, 160, 200}};
+	setup(320, 200, m2, 2);
+	put((struct pl_rect){0, 0, 320, 200}, 255, 255, 255);
+	put((struct pl_rect){10, 50, 150, 51}, 100, 100, 100);
+	put((struct pl_rect){170, 50, 310, 51}, 100, 100, 100);
+	capture_full(0);
+	render(&c, 0);
+	compare_lines("two monitors, full search", &c);
+	put((struct pl_rect){150, 90, 175, 91}, 100, 100, 100);
+	capture((struct pl_rect){150, 90, 175, 91}, 0.1);
+	render(&c, 0.1);
+	compare_lines("two monitors, a short line across the seam", &c);
+	put((struct pl_rect){100, 50, 105, 51}, 255, 255, 255);
+	capture((struct pl_rect){100, 50, 105, 51}, 0.2);
+	render(&c, 0.2);
+	compare_lines("two monitors, a gap in a line on the first", &c);
+	teardown();
+}
+
 // rgb_luma_min and rgb_luma_max: every rain drop, snake segment, or line gets a brightness
 // multiplier between them. Equal limits give all of them the same one.
 static void test_rgb_luma_range(void) {
@@ -3240,6 +3336,7 @@ int main(void) {
 	test_rgb_config();
 	test_rgb_lines();
 	test_rgb_effects();
+	test_lines_partial();
 	test_rgb_alternate();
 	test_rgb_pitch();
 	test_rgb_luma_range();

@@ -44,6 +44,7 @@
 #define PL_MAXMON 8
 #define PL_LR 4  // the size field is computed at 1/PL_LR resolution
 #define PL_NPROG 15
+#define PL_FLASH_BLOCK 8  // frames per block of the flash search, FB in the shader
 
 struct pl_rect {
 	int x1, y1, x2, y2;  // half open
@@ -83,6 +84,9 @@ struct pl {
 	bool s_valid, st_valid, rs_valid, dirty, prev_valid, means_valid;
 	bool ldirty, line_valid, lidx_valid;  // line_tex must be recomputed; it holds the current lines; lidx holds their numbers
 	double used_lmin, used_lthick, used_lcontrast, used_lh, used_lv;
+	struct pl_rect ldmg;  // what captures changed since the lines were last searched (X coordinates)
+	bool lfull;           // the whole screen must be searched, not just ldmg
+	long last_lines_px;   // pixels the last search covered, counting both directions
 
 	struct pl_mon mon[PL_MAXMON];
 	float tint[3];  // whole-screen color multipliers, 1 = unchanged
@@ -505,8 +509,10 @@ static const char *pl_fs_lstep =
 // the drops, 0 off a drop and 1 at a head, and keep is rgb_rain_line.
 //
 // Flashes: each head pixel of each drop (the drop, the pixel's distance from the head, the
-// line, and the frame of a 60 Hz clock all go into a hash) flashes with probability rgb_flash
-// per frame. A flash adds (gain - 1) times the brightness of the pixel at once, and the extra
+// line, and a block of 8 frames of a 60 Hz clock go into a hash) flashes with probability
+// rgb_flash per frame. The shader tests one hash per block of 8 frames, which holds a flash
+// with the chance that at least one of its 8 frames has one, and a second hash picks the frame
+// of the block. That is an eighth of the hashes of a test per frame. A flash adds (gain - 1) times the brightness of the pixel at once, and the extra
 // fades with exp(-age / tau). The shader looks back five time constants for flashes and takes
 // the strongest, so the flashes of different pixels, drops, and lines are independent, and the
 // same time always gives the same picture. A flash travels down the trail: it reaches a trail
@@ -530,7 +536,7 @@ static const char *pl_fs_final =
     "uniform ivec2 mon_col;\n"
     "uniform float enabled, min_gain, gamma_dim, use_ramp, use_dim;\n"
     "uniform float rgb_on, rgb_cyc, rgb_lmin, rgb_lmax, rgb_floor, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_keep, rgb_flash, rgb_ffrac, rgb_fgain, rgb_ftau, rgb_fspeed, rgb_pitch, rgb_sync, scr_h;\n"
-    "uniform int rgb_fx, rgb_dir, rgb_cycn, rgb_frame, rgb_fn;\n"
+    "uniform int rgb_fx, rgb_dir, rgb_cycn, rgb_frame, rgb_nb;\n"
     "uniform vec3 dim_gain, tint;\n"
     "uniform vec2 lr_size;\n"
     "uniform vec4 lr_box;\n"
@@ -577,16 +583,22 @@ static const char *pl_fs_final =
     "  vec3 k = clamp(abs(fract(vec3(h) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);\n"
     "  return mix(vec3(1.0), k, s);\n"
     "}\n"
+    "const int FB = 8;\n"  // frames per flash block, PL_FLASH_BLOCK
     "float flash_excess(int id, int l, int j, int salt, float dist) {\n"
     "  float ex = 0.0;\n"
     "  if (rgb_flash <= 0.0) return ex;\n"
     "  float delay = dist / rgb_fspeed;\n"
-    "  int k0 = max(0, int(ceil(delay * 60.0 - rgb_ffrac)));\n"
-    "  for (int m = 0; m < rgb_fn; m++) {\n"
-    "    int k = k0 + m;\n"
-    "    if (hash2(ivec2(id * 8 + j + salt * 4099, (rgb_frame - k) * 4 + l), 47u) < rgb_flash) {\n"
-    "      float age = (float(k) + rgb_ffrac) / 60.0 - delay;\n"
-    "      ex = max(ex, rgb_fgain * exp(-age / rgb_ftau));\n"
+    "  int fnew = rgb_frame - max(0, int(ceil(delay * 60.0 - rgb_ffrac)));\n"
+    "  int b0 = (fnew - (fnew < 0 ? FB - 1 : 0)) / FB;\n"
+    "  for (int m = 0; m < rgb_nb; m++) {\n"
+    "    int blk = b0 - m;\n"
+    "    ivec2 hk = ivec2(id * 8 + j + salt * 4099, blk * 4 + l);\n"
+    "    if (hash2(hk, 47u) < rgb_flash) {\n"
+    "      int f = blk * FB + int(hash2(hk, 53u) * float(FB));\n"
+    "      if (f <= fnew) {\n"
+    "        float age = (float(rgb_frame - f) + rgb_ffrac) / 60.0 - delay;\n"
+    "        ex = max(ex, rgb_fgain * exp(-age / rgb_ftau));\n"
+    "      }\n"
     "    }\n"
     "  }\n"
     "  return ex;\n"
@@ -902,6 +914,7 @@ static inline bool pl_ensure_screen(struct pl *p, int W, int H) {
 	p->rs[1] = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
 	p->rlr_p = pl_tex(GL_RG16F, GL_RG, p->lrW, p->lrH);
 	p->line_tex = pl_tex(GL_RG8, GL_RG, W, H);
+	p->lfull = true;
 	p->lhas = pl_tex(GL_R32F, GL_RED, 2 * PL_MAXMON, W > H ? W : H);
 	p->lidx = pl_tex(GL_R32F, GL_RED, 2 * PL_MAXMON, W > H ? W : H);
 	p->lidx_valid = false;
@@ -931,6 +944,7 @@ static inline bool pl_set_monitors(struct pl *p, const struct pl_mon *mons, int 
 	p->nmon = nmon;
 	p->dirty = true;
 	p->ldirty = true;
+	p->lfull = true;
 	p->st_valid = p->rs_valid = p->prev_valid = p->means_valid = false;
 	return true;
 }
@@ -989,12 +1003,23 @@ static inline void pl_capture(struct pl *p, const struct pl_rect *r, int n, bool
 	}
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, p->target_fbo);
 	glReadBuffer(p->read_buf);
+	if (full) {
+		p->lfull = true;
+	}
 	glBindTexture(GL_TEXTURE_2D, p->s_tex);
 	for (int i = 0; i < n; i++) {
 		int x1 = r[i].x1 < 0 ? 0 : r[i].x1, x2 = r[i].x2 > p->W ? p->W : r[i].x2;
 		int y1 = r[i].y1 < 0 ? 0 : r[i].y1, y2 = r[i].y2 > p->H ? p->H : r[i].y2;
 		if (x2 <= x1 || y2 <= y1) {
 			continue;
+		}
+		if (p->ldmg.x2 <= p->ldmg.x1 || p->ldmg.y2 <= p->ldmg.y1) {
+			p->ldmg = (struct pl_rect){x1, y1, x2, y2};
+		} else {
+			p->ldmg.x1 = x1 < p->ldmg.x1 ? x1 : p->ldmg.x1;
+			p->ldmg.y1 = y1 < p->ldmg.y1 ? y1 : p->ldmg.y1;
+			p->ldmg.x2 = x2 > p->ldmg.x2 ? x2 : p->ldmg.x2;
+			p->ldmg.y2 = y2 > p->ldmg.y2 ? y2 : p->ldmg.y2;
 		}
 		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x1, p->H - y2, x1, p->H - y2, x2 - x1, y2 - y1);
 	}
@@ -1335,7 +1360,32 @@ static inline void pl_ramp_state(struct pl *p, const struct sq_cfg *cfg, double 
 	p->have_ramp_time = true;
 }
 
-static inline void pl_lclose(struct pl *p, GLuint src, GLuint dst, int dx, int dy, int radius, int mode) {
+// A rectangle in GL coordinates (rows from the bottom), for one monitor.
+struct pl_glr {
+	int x, y, w, h;
+};
+
+// Sets the scissor to monitor i's part of reg, or the whole monitor when reg is NULL. Returns
+// false when there is nothing to draw.
+static inline bool pl_scissor_reg(const struct pl *p, const struct pl_glr *reg, int i) {
+	if (!reg) {
+		pl_scissor_mon(p, &p->mon[i]);
+		return true;
+	}
+	if (reg[i].w <= 0 || reg[i].h <= 0) {
+		return false;
+	}
+	glScissor(reg[i].x, reg[i].y, reg[i].w, reg[i].h);
+	return true;
+}
+
+static inline void pl_lbox(const struct pl *p, GLuint pr, int i) {
+	const struct pl_mon *m = &p->mon[i];
+	glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
+}
+
+static inline void pl_lclose(struct pl *p, GLuint src, GLuint dst, int dx, int dy, int radius, int mode,
+                             const struct pl_glr *reg) {
 	GLuint pr = p->prog[PL_LCLOSE];
 	glUseProgram(pr);
 	glUniform1i(PL_U(pr, "src"), 0);
@@ -1345,10 +1395,10 @@ static inline void pl_lclose(struct pl *p, GLuint src, GLuint dst, int dx, int d
 	pl_fbo_attach(p, dst);
 	pl_bind(0, src, p->samp_nearest);
 	for (int i = 0; i < p->nmon; i++) {
-		const struct pl_mon *m = &p->mon[i];
-		glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
-		pl_scissor_mon(p, m);
-		pl_draw();
+		if (pl_scissor_reg(p, reg, i)) {
+			pl_lbox(p, pr, i);
+			pl_draw();
+		}
 	}
 }
 
@@ -1360,11 +1410,11 @@ static inline int pl_floor_log2(int n) {
 	return k;
 }
 
-// One step of the line search: reads src, writes dst, per monitor. off is the tap distance
-// along the line, mode 0 is min and 1 is max. With blend, the result is merged into dst by
-// taking the larger value in each channel, and mask picks the channel.
+// One step of the line search: reads src, writes dst, over reg (the monitors when NULL). off is
+// the tap distance along the line, mode 0 is min and 1 is max. With blend, the result is merged
+// into dst by taking the larger value in each channel, and mask picks the channel.
 static inline void pl_lstep(struct pl *p, GLuint src, GLuint dst, int dx, int dy, int off, int mode,
-                            float mx, float my, bool blend) {
+                            float mx, float my, bool blend, const struct pl_glr *reg) {
 	GLuint pr = p->prog[PL_LSTEP];
 	glUseProgram(pr);
 	glUniform1i(PL_U(pr, "src"), 0);
@@ -1380,10 +1430,10 @@ static inline void pl_lstep(struct pl *p, GLuint src, GLuint dst, int dx, int dy
 		glBlendFunc(GL_ONE, GL_ONE);
 	}
 	for (int i = 0; i < p->nmon; i++) {
-		const struct pl_mon *m = &p->mon[i];
-		glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
-		pl_scissor_mon(p, m);
-		pl_draw();
+		if (pl_scissor_reg(p, reg, i)) {
+			pl_lbox(p, pr, i);
+			pl_draw();
+		}
 	}
 	if (blend) {
 		glDisable(GL_BLEND);
@@ -1391,46 +1441,110 @@ static inline void pl_lstep(struct pl *p, GLuint src, GLuint dst, int dx, int dy
 	}
 }
 
+// The damage rectangle grown by ex pixels along x and ey along y, as one GL rectangle per
+// monitor clipped to the monitor. Returns the number of pixels covered.
+static inline long pl_grow_damage(const struct pl *p, int ex, int ey, struct pl_glr *out) {
+	long px = 0;
+	for (int i = 0; i < p->nmon; i++) {
+		const struct pl_mon *m = &p->mon[i];
+		int bx0 = m->x, by0 = p->H - (m->y + m->h), bx1 = m->x + m->w, by1 = p->H - m->y;
+		int x0 = p->ldmg.x1 - ex, x1 = p->ldmg.x2 + ex;
+		int y0 = p->H - p->ldmg.y2 - ey, y1 = p->H - p->ldmg.y1 + ey;
+		x0 = x0 < bx0 ? bx0 : x0;
+		y0 = y0 < by0 ? by0 : y0;
+		x1 = x1 > bx1 ? bx1 : x1;
+		y1 = y1 > by1 ? by1 : y1;
+		out[i] = (struct pl_glr){x0, y0, x1 - x0, y1 - y0};
+		if (out[i].w > 0 && out[i].h > 0) {
+			px += (long)out[i].w * out[i].h;
+		} else {
+			out[i].w = out[i].h = 0;
+		}
+	}
+	return px;
+}
+
 // Finds the lines in S and writes them to line_tex. For each direction: candidates (thin
-// enough, enough contrast), a closing across crossings, links between neighboring candidates of one color, then a window
-// test on the links. A pixel is on a line when some run of min_px consecutive pixels that
-// includes it is linked all the way. That is a sliding minimum over min_px - 1 links
-// followed by a sliding maximum over min_px start positions, each built from power of two
-// windows: F_k covers 2^k links, and a window of any length is two overlapping F_k taps.
+// enough, enough contrast), a closing across crossings, links between neighboring candidates
+// of one color, then a window test on the links. A pixel is on a line when some run of
+// min_px consecutive pixels that includes it is linked all the way. That is a sliding minimum
+// over min_px - 1 links followed by a sliding maximum over min_px start positions, each built
+// from power of two windows: F_k covers 2^k links, and a window of any length is two
+// overlapping F_k taps.
+//
+// When only part of S changed since the last search (ldmg) and the settings did not, only the
+// pixels that can change are searched again. The mask at a pixel depends on S within
+// Da = 2 * radius + 2 * min_px + 2 pixels along the direction (closing, link, and the two
+// windows) and within Dc = thick + 2 pixels across it (the thickness test). So the mask can
+// change within the damage grown by (Da, Dc), the rectangle F, and only there is it cleared
+// and written again. Each stage reads the one before it up to Da or Dc away, so the stages
+// run over F grown once more by (Da, Dc), the rectangle E: a stage is right everywhere but
+// along the edge of E, and that edge is farther from F than any later stage reaches.
 static inline void pl_lines(struct pl *p, const struct sq_cfg *cfg) {
 	int X = (int)cfg->v[SQ_RGB_LINE_MIN_PX];
 	int N = X - 1;
 	int k = pl_floor_log2(N), j = pl_floor_log2(X);
+	int thick = (int)cfg->v[SQ_RGB_LINE_THICK_PX];
+	int radius = (thick + 1) / 2;
+	int Da = 2 * radius + 2 * X + 2, Dc = thick + 2;
+	bool same_settings = p->used_lmin == cfg->v[SQ_RGB_LINE_MIN_PX] && p->used_lthick == cfg->v[SQ_RGB_LINE_THICK_PX] &&
+	                     p->used_lcontrast == cfg->v[SQ_RGB_LINE_CONTRAST] && p->used_lh == cfg->v[SQ_RGB_HORIZONTAL] &&
+	                     p->used_lv == cfg->v[SQ_RGB_VERTICAL];
+	bool partial = p->line_valid && !p->lfull && same_settings && p->ldmg.x2 > p->ldmg.x1 && p->ldmg.y2 > p->ldmg.y1;
 	pl_base_state();
 	glBindVertexArray(p->vao);
 	glViewport(0, 0, p->W, p->H);
 	pl_fbo_attach(p, p->line_tex);
 	glDisable(GL_SCISSOR_TEST);
 	glClearColor(0, 0, 0, 0);
-	glClear(GL_COLOR_BUFFER_BIT);
+	if (!partial) {
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
 	glEnable(GL_SCISSOR_TEST);
+	p->last_lines_px = 0;
 	for (int dir = 0; dir < 2; dir++) {
 		if (cfg->v[dir == 0 ? SQ_RGB_HORIZONTAL : SQ_RGB_VERTICAL] == 0) {
 			continue;
 		}
 		int dx = dir == 0 ? 1 : 0, dy = dir == 0 ? 0 : 1;
+		struct pl_glr E[PL_MAXMON], F[PL_MAXMON];
+		const struct pl_glr *e = NULL, *f = NULL;  // NULL: whole monitors
+		if (partial) {
+			int fx = dir == 0 ? Da : Dc, fy = dir == 0 ? Dc : Da;
+			pl_grow_damage(p, fx, fy, F);
+			p->last_lines_px += pl_grow_damage(p, 2 * fx, 2 * fy, E);
+			e = E;
+			f = F;
+			// Clear this direction's channel where it is searched again.
+			glColorMask(dir == 0, dir == 1, GL_FALSE, GL_FALSE);
+			pl_fbo_attach(p, p->line_tex);
+			for (int i = 0; i < p->nmon; i++) {
+				if (pl_scissor_reg(p, f, i)) {
+					glClear(GL_COLOR_BUFFER_BIT);
+				}
+			}
+			glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		} else {
+			for (int i = 0; i < p->nmon; i++) {
+				p->last_lines_px += (long)p->mon[i].w * p->mon[i].h;
+			}
+		}
 		GLuint pr = p->prog[PL_LINEC];
 		glUseProgram(pr);
 		glUniform1i(PL_U(pr, "S"), 0);
 		glUniform2i(PL_U(pr, "along"), dx, dy);
-		glUniform1i(PL_U(pr, "thick"), (int)cfg->v[SQ_RGB_LINE_THICK_PX]);
+		glUniform1i(PL_U(pr, "thick"), thick);
 		glUniform1f(PL_U(pr, "contrast"), (float)cfg->v[SQ_RGB_LINE_CONTRAST]);
 		pl_fbo_attach(p, p->tex_a);
 		pl_bind(0, p->s_tex, p->samp_nearest);
 		for (int i = 0; i < p->nmon; i++) {
-			const struct pl_mon *m = &p->mon[i];
-			glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
-			pl_scissor_mon(p, m);
-			pl_draw();
+			if (pl_scissor_reg(p, e, i)) {
+				pl_lbox(p, pr, i);
+				pl_draw();
+			}
 		}
-		int radius = ((int)cfg->v[SQ_RGB_LINE_THICK_PX] + 1) / 2;
-		pl_lclose(p, p->tex_a, p->tex_b, dx, dy, radius, 1);
-		pl_lclose(p, p->tex_b, p->tex_a, dx, dy, radius, 0);
+		pl_lclose(p, p->tex_a, p->tex_b, dx, dy, radius, 1, e);
+		pl_lclose(p, p->tex_b, p->tex_a, dx, dy, radius, 0, e);
 		pr = p->prog[PL_LINER];
 		glUseProgram(pr);
 		glUniform1i(PL_U(pr, "S"), 0);
@@ -1440,24 +1554,24 @@ static inline void pl_lines(struct pl *p, const struct sq_cfg *cfg) {
 		pl_bind(0, p->s_tex, p->samp_nearest);
 		pl_bind(1, p->tex_a, p->samp_nearest);
 		for (int i = 0; i < p->nmon; i++) {
-			const struct pl_mon *m = &p->mon[i];
-			glUniform4i(PL_U(pr, "box"), m->x, p->H - (m->y + m->h), m->x + m->w, p->H - m->y);
-			pl_scissor_mon(p, m);
-			pl_draw();
+			if (pl_scissor_reg(p, e, i)) {
+				pl_lbox(p, pr, i);
+				pl_draw();
+			}
 		}
 		GLuint cur = p->tex_b, oth = p->tex_a, t;
 		for (int i = 0; i < k; i++) {
-			pl_lstep(p, cur, oth, dx, dy, 1 << i, 0, 1, 0, false);
+			pl_lstep(p, cur, oth, dx, dy, 1 << i, 0, 1, 0, false, e);
 			t = cur, cur = oth, oth = t;
 		}
-		pl_lstep(p, cur, oth, dx, dy, N - (1 << k), 0, 1, 0, false);
+		pl_lstep(p, cur, oth, dx, dy, N - (1 << k), 0, 1, 0, false, e);
 		t = cur, cur = oth, oth = t;
 		for (int i = 0; i < j; i++) {
-			pl_lstep(p, cur, oth, dx, dy, -(1 << i), 1, 1, 0, false);
+			pl_lstep(p, cur, oth, dx, dy, -(1 << i), 1, 1, 0, false, e);
 			t = cur, cur = oth, oth = t;
 		}
 		pl_lstep(p, cur, p->line_tex, dx, dy, -(X - (1 << j)), 1, dir == 0 ? 1.0f : 0.0f,
-		         dir == 0 ? 0.0f : 1.0f, true);
+		         dir == 0 ? 0.0f : 1.0f, true, f);
 	}
 	glDisable(GL_SCISSOR_TEST);
 	p->used_lmin = cfg->v[SQ_RGB_LINE_MIN_PX];
@@ -1466,6 +1580,8 @@ static inline void pl_lines(struct pl *p, const struct sq_cfg *cfg) {
 	p->used_lh = cfg->v[SQ_RGB_HORIZONTAL];
 	p->used_lv = cfg->v[SQ_RGB_VERTICAL];
 	p->ldirty = false;
+	p->lfull = false;
+	p->ldmg = (struct pl_rect){0, 0, 0, 0};
 	p->line_valid = true;
 	p->lidx_valid = false;
 }
@@ -1558,7 +1674,9 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	// Flashes are drawn per 1/60 s frame of the clock, whatever the refresh rate: the chance is
 	// per frame of that clock, and the frame number and its fraction go to the shader.
 	double ft = pl_trel(p, now) * 60.0;
-	glUniform1f(PL_U(pr, "rgb_flash"), (float)(cfg->v[SQ_RGB_RAIN_FLASH] / 100.0));
+	// The chance that a block of PL_FLASH_BLOCK frames holds a flash: one or more of the
+	// per-frame chances. A block holds at most one, at a random frame of the block.
+	glUniform1f(PL_U(pr, "rgb_flash"), (float)(1.0 - pow(1.0 - cfg->v[SQ_RGB_RAIN_FLASH] / 100.0, PL_FLASH_BLOCK)));
 	glUniform1i(PL_U(pr, "rgb_frame"), (int)fmod(floor(ft), 1048576.0));
 	glUniform1f(PL_U(pr, "rgb_ffrac"), (float)(ft - floor(ft)));
 	// A flash is gain times the brightness on top of the pixel, fading by exp(-age / tau). Frames
@@ -1569,7 +1687,7 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	glUniform1f(PL_U(pr, "rgb_ftau"), (float)tau);
 	glUniform1f(PL_U(pr, "rgb_fspeed"), (float)cfg->v[SQ_RGB_RAIN_FLASH_SPEED]);
 	glUniform1f(PL_U(pr, "rgb_pitch"), (float)cfg->v[SQ_RGB_ALT_PITCH_PX]);
-	glUniform1i(PL_U(pr, "rgb_fn"), nback < 1 ? 1 : nback);
+	glUniform1i(PL_U(pr, "rgb_nb"), (nback < 1 ? 1 : nback) / PL_FLASH_BLOCK + 2);
 	glUniform1f(PL_U(pr, "rgb_sync"), (float)cfg->v[SQ_RGB_SYNC]);
 	glUniform1f(PL_U(pr, "scr_h"), (float)p->H);
 	glUniform1ui(PL_U(pr, "frame"), (GLuint)(unsigned long long)floor(pl_trel(p, now) * hz));
@@ -1666,6 +1784,7 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 		}
 	} else {
 		p->ldirty = true;  // S may change while the lines are not being followed
+		p->lfull = true;
 	}
 	pl_final(p, cfg, dtex, bright && ramp, bright, now);
 }
