@@ -45,6 +45,7 @@
 #define PL_LR 4  // the size field is computed at 1/PL_LR resolution
 #define PL_NPROG 15
 #define PL_FLASH_BLOCK 8  // frames per block of the flash search, FB in the shader
+#define PL_SEND_SLOT 30   // frames per send slot of the cluster, AB in the shader
 
 struct pl_rect {
 	int x1, y1, x2, y2;  // half open
@@ -535,8 +536,8 @@ static const char *pl_fs_final =
     "uniform sampler2D S, D, RM, RS, LN, LI;\n"
     "uniform ivec2 mon_col;\n"
     "uniform float enabled, min_gain, gamma_dim, use_ramp, use_dim;\n"
-    "uniform float rgb_on, rgb_cyc, rgb_lmin, rgb_lmax, rgb_floor, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_keep, rgb_flash, rgb_ffrac, rgb_fgain, rgb_ftau, rgb_fspeed, rgb_pitch, rgb_sync, scr_h;\n"
-    "uniform int rgb_fx, rgb_dir, rgb_cycn, rgb_frame, rgb_nb;\n"
+    "uniform float rgb_on, rgb_cyc, rgb_lmin, rgb_lmax, rgb_floor, rgb_hue, rgb_span, rgb_sat, rgb_len, rgb_gap, rgb_tail, rgb_keep, rgb_flash, rgb_ffrac, rgb_fgain, rgb_ftau, rgb_fspeed, rgb_pitch, rgb_lsp, rgb_lsize, rgb_lwire, rgb_apulse, rgb_atau, rgb_anodes, rgb_anode, rgb_apk, rgb_asend, rgb_apspeed, rgb_sync, scr_h;\n"
+    "uniform int rgb_fx, rgb_dir, rgb_cycn, rgb_frame, rgb_nb, rgb_lpal, rgb_lpat, rgb_apat, rgb_apn, rgb_ahops, rgb_acn;\n"
     "uniform vec3 dim_gain, tint;\n"
     "uniform vec2 lr_size;\n"
     "uniform vec4 lr_box;\n"
@@ -584,6 +585,10 @@ static const char *pl_fs_final =
     "  return mix(vec3(1.0), k, s);\n"
     "}\n"
     "const int FB = 8;\n"  // frames per flash block, PL_FLASH_BLOCK
+    "const int AB = 30;\n"  // frames per cluster send slot, PL_SEND_SLOT
+    "float hash_ex(ivec2 p, uint seed) {\n"  // one hash fewer than hash2, for the test that most calls fail
+    "  return float(pcg(uint(p.x) * 747796405u + pcg(uint(p.y) ^ seed))) * (1.0 / 4294967296.0);\n"
+    "}\n"
     "float flash_excess(int id, int l, int j, int salt, float dist) {\n"
     "  float ex = 0.0;\n"
     "  if (rgb_flash <= 0.0) return ex;\n"
@@ -603,6 +608,36 @@ static const char *pl_fs_final =
     "  }\n"
     "  return ex;\n"
     "}\n"
+    "vec3 aero_ramp(float t) {\n"  // yellow, sky blue, steel blue: the colors of aerospike.com
+    "  vec3 y = to_lin(vec3(248.0, 244.0, 19.0) / 255.0);\n"
+    "  vec3 s = to_lin(vec3(47.0, 178.0, 229.0) / 255.0);\n"
+    "  vec3 b = to_lin(vec3(51.0, 83.0, 114.0) / 255.0);\n"
+    "  return t < 0.4 ? mix(y, s, t / 0.4) : mix(s, b, clamp((t - 0.4) / 0.6, 0.0, 1.0));\n"
+    "}\n"
+    "vec3 aero_packet_ramp(float t) {\n"  // white-hot head, sky blue, then steel blue
+    "  vec3 w = to_lin(vec3(255.0, 252.0, 215.0) / 255.0);\n"
+    "  vec3 s = to_lin(vec3(47.0, 178.0, 229.0) / 255.0);\n"
+    "  vec3 b = to_lin(vec3(51.0, 83.0, 114.0) / 255.0);\n"
+    "  return t < 0.3 ? mix(w, s, t / 0.3) : mix(s, b, clamp((t - 0.3) / 0.7, 0.0, 1.0));\n"
+    "}\n"
+    "vec2 lights_color(int pal, int i) {\n"
+    "  if (pal == 0) {\n"
+    "    return i == 0 ? vec2(0.0, 1.0) : (i == 1 ? vec2(125.0, 1.0) : (i == 2 ? vec2(225.0, 1.0) : (i == 3 ? vec2(48.0, 1.0) : vec2(0.0, 0.0))));\n"
+    "  } else if (pal == 1) {\n"
+    "    return i == 0 ? vec2(38.0, 0.5) : (i == 1 ? vec2(30.0, 0.7) : vec2(44.0, 0.4));\n"
+    "  } else if (pal == 2) {\n"
+    "    return i == 0 ? vec2(210.0, 0.25) : (i == 1 ? vec2(195.0, 0.4) : vec2(225.0, 0.15));\n"
+    "  }\n"
+    "  return i == 0 ? vec2(0.0, 1.0) : vec2(0.0, 0.0);\n"
+    "}\n"
+    "bool line_at(float P, bool horiz, vec2 fc, float sgn, float phase) {\n"  // is the point P of the line on a line pixel
+    "  float u = sgn * P - phase;\n"
+    "  ivec2 q = horiz ? ivec2(int(floor(u)), int(fc.y)) : ivec2(int(fc.x), int(floor(scr_h - u)));\n"
+    "  ivec2 sz = textureSize(LN, 0);\n"
+    "  if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y) return false;\n"
+    "  vec2 mm = texelFetch(LN, q, 0).rg;\n"
+    "  return (horiz ? mm.x : mm.y) > 0.5;\n"
+    "}\n"
     "vec3 rgb_apply(vec3 enc, vec2 m, vec2 fc) {\n"
     "  bool horiz = m.x > 0.5;\n"
     "  float u = horiz ? fc.x : scr_h - fc.y, v = horiz ? fc.y : fc.x;\n"
@@ -617,7 +652,9 @@ static const char *pl_fs_final =
     "  }\n"
     "  float pos = sgn * (u + (rgb_sync > 0.5 ? 0.0 : 13.0 * v));\n"
     "  float hue = rgb_hue / 360.0, span = rgb_span / 360.0;\n"
-    "  float mult = 1.0, w = 1.0, sat_scale = 1.0, fac = -1.0;\n"
+    "  float mult = 1.0, w = 1.0, sat_scale = 1.0, fac = -1.0, dimw = 1.0;\n"
+    "  bool keep_sat = false, use_col = false;\n"
+    "  vec3 ccol = vec3(1.0);\n"
     "  if (rgb_fx == 1) {\n"
     "    mult = mix(0.1, 1.0, 0.5 + 0.5 * sin(6.2831853 * rgb_cyc));\n"
     "  } else if (rgb_fx == 2) {\n"
@@ -663,17 +700,148 @@ static const char *pl_fs_final =
     "    fac = max(total, 0.1 * mix(lo, hi, r));\n"
     "    w = 1.0 - rgb_keep * (1.0 - clamp((sumv - 0.1) / 0.9, 0.0, 1.0));\n"
     "    if (headv > 0.0) sat_scale = mix(0.35, 0.15, clamp((headboost - 1.0) / max(rgb_fgain, 0.1), 0.0, 1.0));\n"
+    "  } else if (rgb_fx == 6) {\n"
+    "    float lo = min(rgb_lmin, rgb_lmax), hi = max(rgb_lmin, rgb_lmax);\n"
+    "    float cell = floor(pos / rgb_lsp);\n"
+    "    int ci = int(cell);\n"
+    "    int id = ci + lid * 7919;\n"
+    "    float half_len = max(min(rgb_lsize, rgb_lsp), 1.0) * 0.5;\n"
+    "    float dd = abs(pos - cell * rgb_lsp - 0.5 * rgb_lsp);\n"
+    "    float shape = dd < half_len ? 1.0 - (dd / half_len) * (dd / half_len) : 0.0;\n"
+    "    int par = ((ci % 2) + 2) % 2;\n"
+    "    float on = 1.0;\n"
+    "    if (rgb_lpat == 1) {\n"
+    "      int f = 1 + int(hash2(ivec2(id, 8), 89u) * 3.0);\n"
+    "      float sn = 0.5 + 0.5 * sin(6.2831853 * (rgb_cyc * float(f) + hash2(ivec2(id, 7), 83u)));\n"
+    "      on = 0.1 + 0.9 * sn * sn;\n"
+    "    } else if (rgb_lpat == 2) {\n"
+    "      on = fract(float(((ci % 6) + 6) % 6) / 6.0 - rgb_cyc) < 0.5 ? 1.0 : 0.12;\n"
+    "    } else if (rgb_lpat == 3) {\n"
+    "      on = rgb_cyc < 0.5 ? 1.0 : 0.1;\n"
+    "    } else if (rgb_lpat == 4) {\n"
+    "      on = ((par == 0) == (rgb_cyc < 0.5)) ? 1.0 : 0.1;\n"
+    "    }\n"
+    "    int n = rgb_lpal == 0 ? 5 : (rgb_lpal == 3 ? 2 : 3);\n"
+    "    int pi = (((ci + int(hash2(ivec2(lid, 6), 97u) * float(n))) % n) + n) % n;\n"
+    "    vec2 hs = lights_color(rgb_lpal, pi);\n"
+    "    hue = hs.x / 360.0;\n"
+    "    sat_scale = hs.y;\n"
+    "    fac = mix(lo, hi, hash2(ivec2(id, 9), 101u));\n"
+    "    w = shape * on;\n"
+    "    dimw = rgb_lwire;\n"
+    "    keep_sat = true;\n"
+    "  } else if (rgb_fx == 7) {\n"
+    "    float lo = min(rgb_lmin, rgb_lmax), hi = max(rgb_lmin, rgb_lmax);\n"
+    "    float base = 0.12, inten = base, rr = r;\n"
+    "    vec3 cc = aero_ramp(1.0);\n"
+    "    float per = rgb_len + rgb_gap;\n"
+    "    float off = hash2(ivec2(lid, 11), 103u) * per;\n"
+    "    if (rgb_apat == 0) {\n"
+    "      float q = rgb_cyc * per - (pos + off);\n"
+    "      float d = mod(q, per);\n"
+    "      if (d < rgb_len) {\n"
+    "        float t = d / rgb_len;\n"
+    "        inten = max(base, d < 1.5 ? 1.0 : exp(-3.0 * t));\n"
+    "        cc = aero_ramp(t);\n"
+    "        rr = hash2(ivec2(int(floor(q / per)) + rgb_cycn + lid * 7919, 12), 107u);\n"
+    "      }\n"
+    "    }\n"
+    "    if (rgb_apat == 1) {\n"
+    "      float cell = floor(pos / 64.0);\n"
+    "      int fnow = rgb_frame;\n"
+    "      int b0 = (fnow - (fnow < 0 ? FB - 1 : 0)) / FB;\n"
+    "      for (int nb = -1; nb <= 1; nb++) {\n"
+    "        int cj = int(cell) + nb;\n"
+    "        for (int m = 0; m < rgb_apn; m++) {\n"
+    "          int blk = b0 - m;\n"
+    "          ivec2 hk = ivec2(cj + lid * 7919, blk);\n"
+    "          if (hash2(hk, 111u) < rgb_apulse) {\n"
+    "            int f = blk * FB + int(hash2(hk, 113u) * float(FB));\n"
+    "            if (f <= fnow) {\n"
+    "              float age = (float(fnow - f) + rgb_ffrac) / 60.0;\n"
+    "              float x0 = float(cj) * 64.0 + 10.0 + hash2(hk, 117u) * 44.0;\n"
+    "              float e = exp(-age / rgb_atau) * exp(-abs(pos - x0) / 4.0);\n"
+    "              if (e > inten) { inten = e; cc = aero_ramp(clamp(age / (3.0 * rgb_atau), 0.0, 1.0)); rr = hash2(hk, 119u); }\n"
+    "            }\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    if (rgb_apat == 2) {\n"
+    "      float S = rgb_anodes, L = rgb_apk;\n"
+    "      float phase = rgb_sync > 0.5 ? 0.0 : 13.0 * v;\n"
+    "      int c0 = int(floor(pos / S));\n"
+    "      float dn = abs(pos - (float(c0) + 0.5) * S);\n"
+    "      float half_n = max(rgb_anode, 1.0) * 0.5;\n"
+    "      float nodefl = 0.0;\n"
+    "      int fnow = rgb_frame;\n"
+    "      int b0 = (fnow - (fnow < 0 ? AB - 1 : 0)) / AB;\n"
+    "      for (int dj = -rgb_ahops; dj <= rgb_ahops; dj++) {\n"
+    "        int j = c0 + dj;\n"
+    "        for (int mb = 0; mb < rgb_acn; mb++) {\n"
+    "          int blk = b0 - mb;\n"
+    "          ivec2 hk = ivec2(j + lid * 7919, blk);\n"
+    "          if (hash_ex(hk, 131u) >= rgb_asend) continue;\n"
+    "          int f = blk * AB + int(hash2(hk, 137u) * float(AB));\n"
+    "          if (f > fnow) continue;\n"
+    "          int k = int(hash2(hk, 139u) * float(2 * rgb_ahops));\n"
+    "          int off = k < rgb_ahops ? k - rgb_ahops : k - rgb_ahops + 1;\n"
+    "          float xs = (float(j) + 0.5) * S, xd = (float(j + off) + 0.5) * S;\n"
+    "          float dist = abs(xd - xs), sg = off > 0 ? 1.0 : -1.0;\n"
+    "          float age = (float(fnow - f) + rgb_ffrac) / 60.0;\n"
+    "          float av = age * rgb_apspeed, s = (pos - xs) * sg;\n"
+    "          bool inpath = s >= 0.0 && s <= dist;\n"
+    "          bool req = inpath && av - s < L;\n"
+    "          bool rep = inpath && av >= dist && av - 2.0 * dist + s < L;\n"
+    "          bool nodeev = dn < half_n && (j == c0 || j + off == c0);\n"
+    "          if (!(req || rep || nodeev)) continue;\n"
+    "          if (!line_at(xs, horiz, fc, sgn, phase) || !line_at(xd, horiz, fc, sgn, phase)) continue;\n"
+    "          if (req) {\n"
+    "            float dd = av - s;\n"
+    "            if (dd >= 0.0 && dd < L) {\n"
+    "              float t = dd / L, ii = max(base, exp(-2.0 * t));\n"
+    "              if (ii > inten) { inten = ii; cc = aero_packet_ramp(t); rr = hash2(hk, 141u); }\n"
+    "            }\n"
+    "          }\n"
+    "          if (rep) {\n"
+    "            float dd = av - 2.0 * dist + s;\n"
+    "            if (dd >= 0.0 && dd < L) {\n"
+    "              float t = dd / L, ii = max(base, exp(-2.0 * t));\n"
+    "              if (ii > inten) { inten = ii; cc = aero_packet_ramp(t); rr = hash2(hk, 143u); }\n"
+    "            }\n"
+    "          }\n"
+    "          if (nodeev) {\n"
+    "            float arrived = age - dist / rgb_apspeed;\n"
+    "            if (j + off == c0 && arrived >= 0.0) nodefl = max(nodefl, exp(-arrived / rgb_atau));\n"
+    "            float back = age - 2.0 * dist / rgb_apspeed;\n"
+    "            if (j == c0 && back >= 0.0) nodefl = max(nodefl, exp(-back / rgb_atau));\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "      if (dn < half_n) {\n"
+    "        float ni = (1.0 - 0.35 * (dn / half_n) * (dn / half_n)) * (0.55 + 0.95 * nodefl);\n"
+    "        if (ni > inten) {\n"
+    "          inten = ni;\n"
+    "          cc = mix(aero_ramp(0.0), to_lin(vec3(255.0, 251.0, 150.0) / 255.0), nodefl);\n"
+    "          rr = hash2(ivec2(c0 + lid * 7919, 13), 109u);\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    use_col = true;\n"
+    "    ccol = cc;\n"
+    "    fac = mix(lo, hi, rr) * inten;\n"
+    "    keep_sat = true;\n"
     "  }\n"
     "  vec3 lin = to_lin(enc);\n"
     "  float lf = mix(min(rgb_lmin, rgb_lmax), max(rgb_lmin, rgb_lmax), r);\n"
     "  float lt = clamp(max(dot(lin, W709), rgb_floor) * (fac >= 0.0 ? fac : lf * mult), 0.0, 1.0);\n"
-    "  vec3 col = to_lin(hue_rgb(hue, rgb_sat * sat_scale));\n"
+    "  vec3 col = use_col ? ccol : to_lin(hue_rgb(hue, rgb_sat * sat_scale));\n"
     "  col *= lt / dot(col, W709);\n"
     "  float a = 0.0;\n"
     "  for (int i = 0; i < 3; i++)\n"
     "    if (col[i] > 1.0) a = max(a, (col[i] - 1.0) / (col[i] - lt));\n"
-    "  col = mix(col, vec3(lt), a);\n"
-    "  return to_enc(mix(lin, col, w));\n"
+    "  col = keep_sat ? min(col, vec3(1.0)) : mix(col, vec3(lt), a);\n"
+    "  return to_enc(mix(lin * dimw, col, w));\n"
     "}\n"
     "vec4 shade() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
@@ -971,7 +1139,9 @@ static inline bool pl_active(const struct pl *p, const struct sq_cfg *cfg, doubl
 	    cfg->v[SQ_STATIC_AMOUNT] > 0) {
 		return true;  // static changes every 1 / static_hz seconds for as long as it is on
 	}
-	if (p->s_valid && cfg->v[SQ_ENABLED] != 0 && cfg->v[SQ_RGB] != 0 && cfg->v[SQ_RGB_EFFECT] != 0) {
+	// Every effect but solid moves, and so do lights unless the pattern is steady.
+	if (p->s_valid && cfg->v[SQ_ENABLED] != 0 && cfg->v[SQ_RGB] != 0 && cfg->v[SQ_RGB_EFFECT] != 0 &&
+	    !(cfg->v[SQ_RGB_EFFECT] == 6 && cfg->v[SQ_RGB_LIGHTS_PATTERN] == 0)) {
 		return true;  // every effect except solid moves for as long as it is on
 	}
 	double slow = cfg->v[SQ_DARKENING_MS] > cfg->v[SQ_BRIGHTENING_MS] ? cfg->v[SQ_DARKENING_MS] : cfg->v[SQ_BRIGHTENING_MS];
@@ -1687,6 +1857,34 @@ static inline void pl_final(struct pl *p, const struct sq_cfg *cfg, GLuint dtex,
 	glUniform1f(PL_U(pr, "rgb_ftau"), (float)tau);
 	glUniform1f(PL_U(pr, "rgb_fspeed"), (float)cfg->v[SQ_RGB_RAIN_FLASH_SPEED]);
 	glUniform1f(PL_U(pr, "rgb_pitch"), (float)cfg->v[SQ_RGB_ALT_PITCH_PX]);
+	glUniform1f(PL_U(pr, "rgb_lsp"), (float)cfg->v[SQ_RGB_LIGHTS_SPACING_PX]);
+	glUniform1f(PL_U(pr, "rgb_lsize"), (float)cfg->v[SQ_RGB_LIGHTS_SIZE_PX]);
+	glUniform1f(PL_U(pr, "rgb_lwire"), (float)cfg->v[SQ_RGB_LIGHTS_WIRE]);
+	glUniform1i(PL_U(pr, "rgb_lpal"), (int)cfg->v[SQ_RGB_LIGHTS_PALETTE]);
+	glUniform1i(PL_U(pr, "rgb_lpat"), (int)cfg->v[SQ_RGB_LIGHTS_PATTERN]);
+	// Aerospike pulses: cells of 64 px, each firing at rgb_aero_rate per 100 px. A block of
+	// PL_FLASH_BLOCK frames of the 60 Hz clock holds a pulse with the chance that at least one
+	// fires in it. The shader looks back five time constants.
+	double atau = cfg->v[SQ_RGB_AERO_FADE_MS] / 1000.0;
+	glUniform1i(PL_U(pr, "rgb_apat"), (int)cfg->v[SQ_RGB_AERO_PATTERN]);
+	glUniform1f(PL_U(pr, "rgb_apulse"), (float)(1.0 - exp(-cfg->v[SQ_RGB_AERO_RATE] * 0.64 * PL_FLASH_BLOCK / 60.0)));
+	glUniform1f(PL_U(pr, "rgb_atau"), (float)atau);
+	glUniform1f(PL_U(pr, "rgb_anodes"), (float)cfg->v[SQ_RGB_AERO_NODE_SPACING_PX]);
+	glUniform1f(PL_U(pr, "rgb_anode"), (float)cfg->v[SQ_RGB_AERO_NODE_SIZE_PX]);
+	glUniform1f(PL_U(pr, "rgb_apk"), (float)cfg->v[SQ_RGB_AERO_PACKET_PX]);
+	// Cluster: each node sends a request with the chance that at least one is sent in a slot of
+	// PL_SEND_SLOT frames, at most one per slot. The shader looks back as long as a request and its
+	// reply take to cross the longest hop, plus five time constants for the flash of a node, up
+	// to 60 slots (30 s).
+	double hop_px = cfg->v[SQ_RGB_AERO_MAX_HOPS] * cfg->v[SQ_RGB_AERO_NODE_SPACING_PX] + cfg->v[SQ_RGB_AERO_PACKET_PX];
+	// A request crosses a hop and the reply crosses it again, then the node flash fades.
+	double window = (hop_px + cfg->v[SQ_RGB_AERO_MAX_HOPS] * cfg->v[SQ_RGB_AERO_NODE_SPACING_PX]) / cfg->v[SQ_RGB_AERO_PACKET_SPEED] + 5.0 * atau;
+	int acn = (int)ceil(window * 60.0 / PL_SEND_SLOT) + 2;
+	glUniform1f(PL_U(pr, "rgb_asend"), (float)(1.0 - exp(-cfg->v[SQ_RGB_AERO_SEND_RATE] * PL_SEND_SLOT / 60.0)));
+	glUniform1f(PL_U(pr, "rgb_apspeed"), (float)cfg->v[SQ_RGB_AERO_PACKET_SPEED]);
+	glUniform1i(PL_U(pr, "rgb_ahops"), (int)cfg->v[SQ_RGB_AERO_MAX_HOPS]);
+	glUniform1i(PL_U(pr, "rgb_acn"), acn > 60 ? 60 : acn);
+	glUniform1i(PL_U(pr, "rgb_apn"), (int)ceil(5.0 * atau * 60.0 / PL_FLASH_BLOCK) + 2);
 	glUniform1i(PL_U(pr, "rgb_nb"), (nback < 1 ? 1 : nback) / PL_FLASH_BLOCK + 2);
 	glUniform1f(PL_U(pr, "rgb_sync"), (float)cfg->v[SQ_RGB_SYNC]);
 	glUniform1f(PL_U(pr, "scr_h"), (float)p->H);
@@ -1778,7 +1976,7 @@ static inline void pl_render(struct pl *p, const struct sq_cfg *cfg, double now)
 			pl_lines(p, cfg);
 		}
 		bool numbered = cfg->v[SQ_RGB_DIRECTION] == 2 || cfg->v[SQ_RGB_LUMA_MIN] != cfg->v[SQ_RGB_LUMA_MAX] ||
-		                cfg->v[SQ_RGB_EFFECT] == 5;  // rain hashes every drop with the identity of its line
+		                cfg->v[SQ_RGB_EFFECT] >= 5;  // rain, lights, and aerospike hash with the line
 		if (numbered && p->line_valid && !p->lidx_valid) {
 			pl_line_index(p);
 		}

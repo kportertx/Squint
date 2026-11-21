@@ -1886,6 +1886,11 @@ static struct sq_cfg rgb_cfg(void) {
 	c.v[SQ_RGB_HZ] = 60;
 	c.v[SQ_RGB_DIRECTION] = 0;
 	c.v[SQ_RGB_ALT_PITCH_PX] = 20;
+	c.v[SQ_RGB_AERO_NODE_SIZE_PX] = 6;
+	c.v[SQ_RGB_AERO_PACKET_PX] = 30;
+	c.v[SQ_RGB_AERO_SEND_RATE] = 0.5;
+	c.v[SQ_RGB_AERO_MAX_HOPS] = 4;
+	c.v[SQ_RGB_AERO_PACKET_SPEED] = 300;
 	c.v[SQ_RGB_SYNC] = 1;
 	c.v[SQ_RGB_LINE_MIN_PX] = 48;
 	c.v[SQ_RGB_LINE_THICK_PX] = 3;
@@ -2548,6 +2553,10 @@ static float hash_c(int px, int py, uint32_t seed) {
 	return (float)pcg_c((uint32_t)px + pcg_c((uint32_t)py + pcg_c(seed))) * (1.0f / 4294967296.0f);
 }
 static float mixf(float a, float b, float t) { return a * (1.0f - t) + b * t; }
+// The cheaper hash the cluster uses for its existence test: one pcg fewer than hash_c.
+static float hash_ex_c(int px, int py, uint32_t seed) {
+	return (float)pcg_c((uint32_t)px * 747796405u + pcg_c((uint32_t)py ^ seed)) * (1.0f / 4294967296.0f);
+}
 
 // The luminance factor the shader gives the pixel at column x of a horizontal line with the
 // identity lid (its start row times 64, plus the monitor column) and the phase offset vphase
@@ -2612,6 +2621,718 @@ static int check_rain_model(const struct sq_cfg *c, int y, int start, double t0,
 	CHECK(bad <= (x1 - x0) / 100, "%s: the rain matches the model: %d of %d pixels differ", what, bad, x1 - x0);
 	CHECK(over_bad == 0, "%s: %d pixels where drops overlap differ from the sum of the drops", what, over_bad);
 	return overlap;
+}
+
+// ---- christmas lights ---------------------------------------------------------------------
+
+static void lights_hs(int pal, int i, float *hue, float *sat) {
+	static const float classic[5][2] = {{0, 1}, {125, 1}, {225, 1}, {48, 1}, {0, 0}};
+	static const float warm[3][2] = {{38, 0.5f}, {30, 0.7f}, {44, 0.4f}};
+	static const float cool[3][2] = {{210, 0.25f}, {195, 0.4f}, {225, 0.15f}};
+	static const float candy[2][2] = {{0, 1}, {0, 0}};
+	const float *e = pal == 0 ? classic[i] : (pal == 1 ? warm[i] : (pal == 2 ? cool[i] : candy[i]));
+	*hue = e[0];
+	*sat = e[1];
+}
+static int lights_n(int pal) { return pal == 0 ? 5 : (pal == 3 ? 2 : 3); }
+static int imod(int a, int b) { return ((a % b) + b) % b; }
+
+// The linear luminance of the color of a bulb of palette pal, index pi, at target luminance lt
+// with each channel clamped at 1 (saturation is kept, luminance gives way).
+static double lights_bulb_lum(int pal, int pi, double lt) {
+	float hue, sat;
+	lights_hs(pal, pi, &hue, &sat);
+	float h = hue / 360.0f, off[3] = {1.0f, 2.0f / 3.0f, 1.0f / 3.0f};
+	double col[3], L = 0, w709[3] = {0.2126, 0.7152, 0.0722};
+	for (int i = 0; i < 3; i++) {
+		float v = h + off[i];
+		v -= floorf(v);
+		float t = fabsf(v * 6.0f - 3.0f) - 1.0f;
+		t = t < 0 ? 0 : (t > 1 ? 1 : t);
+		col[i] = dec(1.0f * (1.0f - sat) + t * sat);
+		L += col[i] * w709[i];
+	}
+	double out = 0;
+	for (int i = 0; i < 3; i++) out += fmin(col[i] * lt / L, 1.0) * w709[i];
+	return out;
+}
+
+// The luminance the shader gives the pixel at column x of a horizontal line of linear luminance
+// L0 with the identity lid, for the lights effect at cycle fraction cyc, with cycle count cycn.
+static double lights_lum(const struct sq_cfg *c, int x, float cyc, double L0, int lid, int *bulb_pixel) {
+	float pos = (float)x + 0.5f, S = (float)c->v[SQ_RGB_LIGHTS_SPACING_PX];
+	float lo = (float)fmin(c->v[SQ_RGB_LUMA_MIN], c->v[SQ_RGB_LUMA_MAX]), hi = (float)fmax(c->v[SQ_RGB_LUMA_MIN], c->v[SQ_RGB_LUMA_MAX]);
+	float cell = floorf(pos / S);
+	int ci = (int)cell;
+	int id = (int)((uint32_t)ci + (uint32_t)lid * 7919u);
+	float size = (float)c->v[SQ_RGB_LIGHTS_SIZE_PX];
+	float half = fmaxf(fminf(size, S), 1.0f) * 0.5f;
+	float dd = fabsf(pos - cell * S - 0.5f * S);
+	float shape = dd < half ? 1.0f - (dd / half) * (dd / half) : 0.0f;
+	int par = imod(ci, 2), pat = (int)c->v[SQ_RGB_LIGHTS_PATTERN], pal = (int)c->v[SQ_RGB_LIGHTS_PALETTE];
+	float on = 1.0f;
+	if (pat == 1) {
+		int f = 1 + (int)(hash_c(id, 8, 89u) * 3.0f);
+		float sn = 0.5f + 0.5f * sinf(6.2831853f * (cyc * (float)f + hash_c(id, 7, 83u)));
+		on = 0.1f + 0.9f * sn * sn;
+	} else if (pat == 2) {
+		float u = (float)imod(ci, 6) / 6.0f - cyc;
+		u -= floorf(u);
+		on = u < 0.5f ? 1.0f : 0.12f;
+	} else if (pat == 3) {
+		on = cyc < 0.5f ? 1.0f : 0.1f;
+	} else if (pat == 4) {
+		on = ((par == 0) == (cyc < 0.5f)) ? 1.0f : 0.1f;
+	}
+	int n = lights_n(pal);
+	int pi = imod(ci + (int)(hash_c(lid, 6, 97u) * (float)n), n);
+	double fac = mixf(lo, hi, hash_c(id, 9, 101u));
+	double w = (double)shape * on;
+	double lt = fmin(L0 * fac, 1.0);
+	if (bulb_pixel) *bulb_pixel = shape > 0.0f;
+	return (1.0 - w) * L0 * c->v[SQ_RGB_LIGHTS_WIRE] + w * lights_bulb_lum(pal, pi, lt);
+}
+
+// Compares the lights on row y (a line of gray 200 that starts on row `start`) over columns x0
+// to x1 with the model for the render just made at t (cycle 0 at t0). More than 1 percent of
+// the pixels differing counts as a failure.
+static void check_lights_model(const struct sq_cfg *c, int y, int start, double t0, double t, int x0, int x1, const char *what) {
+	double L0 = lum((uint8_t[]){200, 200, 200});
+	double cy = (t - t0) * c->v[SQ_RGB_SPEED];
+	float cyc = (float)(cy - floor(cy));
+	int bad = 0, bulbs = 0;
+	for (int x = x0; x < x1; x++) {
+		int bp;
+		double want = lights_lum(c, x, cyc, L0, start * 64, &bp), got = lum(at(x, y));
+		bulbs += bp;
+		bad += fabs(got - want) > 0.015;
+	}
+	CHECK(bad <= (x1 - x0) / 100, "%s: the lights match the model: %d of %d pixels differ", what, bad, x1 - x0);
+	CHECK(bulbs > (x1 - x0) / 5, "%s: there are bulbs on the line: %d bulb pixels", what, bulbs);
+}
+
+// Classifies the color of a pixel: 0 red, 1 green, 2 blue, 3 yellow, 4 white or gray.
+static int color_class(const uint8_t *p) {
+	int hi = p[0] > p[1] ? p[0] : p[1];
+	hi = hi > p[2] ? hi : p[2];
+	int lo = p[0] < p[1] ? p[0] : p[1];
+	lo = lo < p[2] ? lo : p[2];
+	if (hi - lo < 0.25 * hi) return 4;
+	if (p[0] >= p[1] && p[0] >= p[2]) return p[1] > 0.6 * p[0] ? 3 : 0;
+	if (p[1] >= p[0] && p[1] >= p[2]) return p[0] > 0.8 * p[1] ? 3 : 1;
+	return 2;
+}
+
+static void test_lights(void) {
+	printf("christmas lights\n");
+	struct pl_mon m1[] = {{0, 0, 600, 100}};
+	setup(600, 100, m1, 1);
+	put((struct pl_rect){0, 0, 600, 100}, 20, 20, 24);
+	int rows[3] = {20, 45, 70};
+	for (int k = 0; k < 3; k++) put((struct pl_rect){10, rows[k], 590, rows[k] + 2}, 200, 200, 200);
+	capture_full(0);
+	struct sq_cfg c = rgb_cfg();
+	c.v[SQ_RGB_EFFECT] = 6;
+	c.v[SQ_RGB_LINE_THICK_PX] = 3;
+	c.v[SQ_RGB_LIGHTS_SPACING_PX] = 14;
+	c.v[SQ_RGB_LIGHTS_SIZE_PX] = 5;
+	c.v[SQ_RGB_LIGHTS_WIRE] = 0.6;
+	set_luma(&c, 1.0);
+	render(&c, 100.0);  // cycle 0 at t = 100
+	static const char *pats[5] = {"steady", "twinkle", "chase", "blink", "alternate"};
+	static const char *pals[4] = {"classic", "warm", "cool", "candy"};
+	for (int pat = 0; pat < 5; pat++)
+		for (int pal = 0; pal < 4; pal++) {
+			c.v[SQ_RGB_LIGHTS_PATTERN] = pat;
+			c.v[SQ_RGB_LIGHTS_PALETTE] = pal;
+			for (int step = 0; step < 3; step++) {
+				double t = 100.13 + 0.37 * step;
+				render(&c, t);
+				char what[64];
+				snprintf(what, sizeof what, "%s, %s, t %.2f", pats[pat], pals[pal], t);
+				check_lights_model(&c, rows[0], rows[0], 100.0, t, 12, 588, what);
+			}
+		}
+	// A luma range and other wires and sizes and spacings.
+	c.v[SQ_RGB_LIGHTS_PATTERN] = 1;
+	c.v[SQ_RGB_LIGHTS_PALETTE] = 0;
+	c.v[SQ_RGB_LUMA_MIN] = 0.5;
+	c.v[SQ_RGB_LUMA_MAX] = 1.5;
+	for (int v = 0; v < 4; v++) {
+		c.v[SQ_RGB_LIGHTS_WIRE] = v == 1 ? 0.0 : (v == 2 ? 1.0 : 0.6);
+		c.v[SQ_RGB_LIGHTS_SPACING_PX] = v == 3 ? 30 : 14;
+		c.v[SQ_RGB_LIGHTS_SIZE_PX] = v == 3 ? 9 : 5;
+		c.v[SQ_RGB_SPEED] = v == 2 ? 1.5 : 0.5;
+		render(&c, 101.0 + v);
+		char what[64];
+		snprintf(what, sizeof what, "luma 0.5 to 1.5, variant %d", v);
+		check_lights_model(&c, rows[0], rows[0], 100.0, 101.0 + v, 12, 588, what);
+		check_lights_model(&c, rows[2], rows[2], 100.0, 101.0 + v, 12, 588, what);
+	}
+	c.v[SQ_RGB_SPEED] = 0.5;
+	set_luma(&c, 1.0);
+	c.v[SQ_RGB_LIGHTS_WIRE] = 0.6;
+	c.v[SQ_RGB_LIGHTS_SPACING_PX] = 14;
+	c.v[SQ_RGB_LIGHTS_SIZE_PX] = 5;
+
+	// Palettes: the colors of the bulbs in turn. A bulb center is at 7 + 14 k.
+	c.v[SQ_RGB_LIGHTS_PATTERN] = 0;
+	for (int pal = 0; pal < 4; pal++) {
+		c.v[SQ_RGB_LIGHTS_PALETTE] = pal;
+		render(&c, 102.0);
+		int cls[40], nb = 0;
+		for (int k = 1; k < 40; k++) cls[nb++] = color_class(at(7 + 14 * k, rows[0]));
+		int n = lights_n(pal), ok = 1, distinct_seen[5] = {0};
+		for (int i = 0; i + n < nb; i++) ok &= cls[i] == cls[i + n];  // the sequence repeats every n bulbs
+		for (int i = 0; i < nb; i++) distinct_seen[cls[i]] = 1;
+		int distinct = distinct_seen[0] + distinct_seen[1] + distinct_seen[2] + distinct_seen[3] + distinct_seen[4];
+		CHECK(ok, "palette %s repeats every %d bulbs", pals[pal], n);
+		if (pal == 0) CHECK(distinct == 5, "classic has red, green, blue, yellow, and white: %d of 5 classes seen", distinct);
+		if (pal == 3) CHECK(distinct_seen[0] && distinct_seen[4] && distinct == 2, "candy is red and white");
+		if (pal == 1 || pal == 2) {
+			int warm_ok = 1, cool_ok = 1;
+			for (int k = 1; k < 40; k++) {
+				const uint8_t *p = at(7 + 14 * k, rows[0]);
+				warm_ok &= p[0] >= p[1] && p[1] >= p[2] && p[0] > p[2];
+				cool_ok &= p[2] >= p[1] && p[1] >= p[0] && p[2] > p[0];
+			}
+			CHECK(pal == 1 ? warm_ok : cool_ok, "%s whites lean %s", pals[pal], pal == 1 ? "warm (more red)" : "cool (more blue)");
+		}
+	}
+	// Each line has its own start in the palette.
+	c.v[SQ_RGB_LIGHTS_PALETTE] = 0;
+	render(&c, 102.0);
+	int first[3];
+	for (int k = 0; k < 3; k++) first[k] = color_class(at(7 + 14, rows[k]));
+	CHECK(first[0] != first[1] || first[1] != first[2], "lines start the string with different colors: %d %d %d", first[0], first[1], first[2]);
+
+	// Steady does not move, and the others do.
+	c.v[SQ_RGB_LIGHTS_PATTERN] = 0;
+	render(&c, 103.0);
+	uint8_t s0[600 * 4];
+	memcpy(s0, out + (size_t)rows[0] * W * 4, sizeof s0);
+	render(&c, 103.4);
+	CHECK(memcmp(s0, out + (size_t)rows[0] * W * 4, sizeof s0) == 0, "steady lights do not change with time");
+	CHECK(!pl_active(&pl, &c, 500.0), "steady lights need no timer ticks");
+	for (int pat = 1; pat < 5; pat++) {
+		c.v[SQ_RGB_LIGHTS_PATTERN] = pat;
+		render(&c, 102.0);  // cycle fraction 0
+		memcpy(s0, out + (size_t)rows[0] * W * 4, sizeof s0);
+		render(&c, 103.0);  // cycle fraction 0.5
+		int moved = 0;
+		for (int x = 12; x < 588; x++) moved += abs(at(x, rows[0])[0] - s0[x * 4]) + abs(at(x, rows[0])[1] - s0[x * 4 + 1]) > 20;
+		CHECK(moved > 20, "%s lights change with time: %d pixels", pats[pat], moved);
+		CHECK(pl_active(&pl, &c, 500.0), "%s lights need timer ticks", pats[pat]);
+	}
+	// A chase moves one bulb in a sixth of a cycle, forward and backward.
+	c.v[SQ_RGB_LIGHTS_PATTERN] = 2;
+	c.v[SQ_RGB_SPEED] = 1.0;
+	render(&c, 104.0);
+	render(&c, 104.0);
+	int lit0[40], lit1[40], litb[40];
+	for (int k = 0; k < 40; k++) lit0[k] = color_class(at(7 + 14 * k, rows[0])) != 4 || lum(at(7 + 14 * k, rows[0])) > 0.3;
+	render(&c, 104.0 + 1.0 / 6.0);
+	for (int k = 0; k < 40; k++) lit1[k] = color_class(at(7 + 14 * k, rows[0])) != 4 || lum(at(7 + 14 * k, rows[0])) > 0.3;
+	c.v[SQ_RGB_DIRECTION] = 1;
+	render(&c, 104.0 + 1.0 / 6.0);
+	for (int k = 0; k < 40; k++) litb[k] = color_class(at(7 + 14 * k, rows[0])) != 4 || lum(at(7 + 14 * k, rows[0])) > 0.3;
+	c.v[SQ_RGB_DIRECTION] = 0;
+	int fwd_shift = 0, back_shift = 0;
+	for (int k = 2; k < 38; k++) {
+		fwd_shift += lit1[k + 1] == lit0[k];
+		back_shift += litb[k - 1] == lit0[k];
+	}
+	CHECK(fwd_shift >= 34, "forward the lit bulbs move one bulb up the line: %d of 36", fwd_shift);
+	CHECK(back_shift >= 34, "backward they move one bulb back: %d of 36", back_shift);
+	c.v[SQ_RGB_SPEED] = 0.5;
+
+	// Every pattern repeats exactly each cycle: the same fraction of the next cycle is the same
+	// picture, so nothing jumps where the cycle count rolls over.
+	for (int pat = 0; pat < 5; pat++) {
+		c.v[SQ_RGB_LIGHTS_PATTERN] = pat;
+		render(&c, 103.1);
+		memcpy(s0, out + (size_t)rows[0] * W * 4, sizeof s0);
+		render(&c, 105.1);
+		CHECK(memcmp(s0, out + (size_t)rows[0] * W * 4, sizeof s0) == 0, "%s: a cycle later the picture is the same", pats[pat]);
+	}
+	// And the smooth patterns have no jump across the roll-over itself.
+	for (int pat = 0; pat <= 1; pat++) {
+		c.v[SQ_RGB_LIGHTS_PATTERN] = pat;
+		render(&c, 109.9999);
+		memcpy(s0, out + (size_t)rows[0] * W * 4, sizeof s0);
+		render(&c, 110.0001);
+		int jumped = 0;
+		for (int x = 12; x < 588; x++) jumped += abs(at(x, rows[0])[1] - s0[x * 4 + 1]) > 10;
+		CHECK(jumped <= 2, "%s: no jump at the end of an animation cycle: %d pixels", pats[pat], jumped);
+	}
+	teardown();
+}
+
+// ---- aerospike -----------------------------------------------------------------------------
+
+// The linear color of the ramp from yellow through sky blue to steel blue at t from 0 to 1.
+static void aero_ramp_c(float t, double *rgb) {
+	static const double y[3] = {248, 244, 19}, sk[3] = {47, 178, 229}, st[3] = {51, 83, 114};
+	for (int i = 0; i < 3; i++) {
+		double a = dec(y[i] / 255.0), b = dec(sk[i] / 255.0), c2 = dec(st[i] / 255.0);
+		rgb[i] = t < 0.4f ? a + (b - a) * (t / 0.4f) : b + (c2 - b) * fminf(fmaxf((t - 0.4f) / 0.6f, 0.0f), 1.0f);
+	}
+}
+
+// The columns where the line under test starts and ends, for the cluster model: a packet is only
+// sent between two nodes that are both on the line.
+static int g_line_x0 = 10, g_line_x1 = 690;
+
+// The packet ramp of the cluster: a white-hot head, sky blue, then steel blue.
+static void aero_packet_ramp_c(float t, double *rgb) {
+	static const double w[3] = {255, 252, 215}, sk[3] = {47, 178, 229}, st[3] = {51, 83, 114};
+	for (int i = 0; i < 3; i++) {
+		double a = dec(w[i] / 255.0), b = dec(sk[i] / 255.0), c2 = dec(st[i] / 255.0);
+		rgb[i] = t < 0.3f ? a + (b - a) * (t / 0.3f) : b + (c2 - b) * fminf(fmaxf((t - 0.3f) / 0.7f, 0.0f), 1.0f);
+	}
+}
+
+// What the shader gives the pixel at column x of a horizontal line of linear luminance L0 with the
+// identity lid: the luminance of the color of the ramp at the place of the pixel, with each
+// channel clamped at 1 after scaling it to the target luminance. frame and ffrac are the 60 Hz
+// clock. *color gets the linear color and *lit the intensity.
+static double aero_lum(const struct sq_cfg *c, int x, float cyc, int cycn, int frame, float ffrac, double L0, int lid, double *color, float *lit) {
+	float lo = (float)fmin(c->v[SQ_RGB_LUMA_MIN], c->v[SQ_RGB_LUMA_MAX]), hi = (float)fmax(c->v[SQ_RGB_LUMA_MIN], c->v[SQ_RGB_LUMA_MAX]);
+	float sgn = c->v[SQ_RGB_DIRECTION] == 1 ? -1.0f : 1.0f;
+	float pos = sgn * ((float)x + 0.5f);
+	float len = (float)c->v[SQ_RGB_LENGTH_PX], gap = (float)c->v[SQ_RGB_GAP_PX], per = len + gap;
+	float off = hash_c(lid, 11, 103u) * per;
+	int pat = (int)c->v[SQ_RGB_AERO_PATTERN];
+	float tau = (float)c->v[SQ_RGB_AERO_FADE_MS] / 1000.0f;
+	float base = 0.12f, inten = base, rr = hash_c(lid, 5, 53u);
+	double cc[3];
+	aero_ramp_c(1.0f, cc);
+	if (pat == 0) {
+		float q = cyc * per - (pos + off);
+		float d = q - per * floorf(q / per);
+		if (d < len) {
+			float t = d / len;
+			inten = fmaxf(base, d < 1.5f ? 1.0f : expf(-3.0f * t));
+			aero_ramp_c(t, cc);
+			rr = hash_c((int)((uint32_t)(int)floorf(q / per) + (uint32_t)cycn + (uint32_t)lid * 7919u), 12, 107u);
+		}
+	}
+	if (pat == 1) {
+		float cell = floorf(pos / 64.0f);
+		int b0 = (frame - (frame < 0 ? 7 : 0)) / 8;
+		float pulse = (float)(1.0 - exp(-c->v[SQ_RGB_AERO_RATE] * 0.64 * 8.0 / 60.0));
+		int apn = (int)ceil(5.0 * tau * 60.0 / 8.0) + 2;
+		for (int nb = -1; nb <= 1; nb++) {
+			int cj = (int)cell + nb;
+			for (int m = 0; m < apn; m++) {
+				int blk = b0 - m;
+				int hx = (int)((uint32_t)cj + (uint32_t)lid * 7919u);
+				if (hash_c(hx, blk, 111u) < pulse) {
+					int f = blk * 8 + (int)(hash_c(hx, blk, 113u) * 8.0f);
+					if (f <= frame) {
+						float age = ((float)(frame - f) + ffrac) / 60.0f;
+						float x0 = (float)cj * 64.0f + 10.0f + hash_c(hx, blk, 117u) * 44.0f;
+						float e = expf(-age / tau) * expf(-fabsf(pos - x0) / 4.0f);
+						if (e > inten) {
+							inten = e;
+							aero_ramp_c(fminf(fmaxf(age / (3.0f * tau), 0.0f), 1.0f), cc);
+							rr = hash_c(hx, blk, 119u);
+						}
+					}
+				}
+			}
+		}
+	}
+	if (pat == 2) {
+		float S = (float)c->v[SQ_RGB_AERO_NODE_SPACING_PX], L = (float)c->v[SQ_RGB_AERO_PACKET_PX];
+		float speed = (float)c->v[SQ_RGB_AERO_PACKET_SPEED], half_n = fmaxf((float)c->v[SQ_RGB_AERO_NODE_SIZE_PX], 1.0f) * 0.5f;
+		int hops = (int)c->v[SQ_RGB_AERO_MAX_HOPS];
+		float asend = (float)(1.0 - exp(-c->v[SQ_RGB_AERO_SEND_RATE] * 30.0 / 60.0));
+		double hop_px = hops * c->v[SQ_RGB_AERO_NODE_SPACING_PX] + c->v[SQ_RGB_AERO_PACKET_PX];
+		double window = (hop_px + hops * c->v[SQ_RGB_AERO_NODE_SPACING_PX]) / c->v[SQ_RGB_AERO_PACKET_SPEED] + 5.0 * c->v[SQ_RGB_AERO_FADE_MS] / 1000.0;
+		int acn = (int)ceil(window * 60.0 / 30.0) + 2;
+		acn = acn > 60 ? 60 : acn;
+		int c0 = (int)floorf(pos / S);
+		float dn = fabsf(pos - ((float)c0 + 0.5f) * S), nodefl = 0.0f;
+		int b0 = (frame - (frame < 0 ? 29 : 0)) / 30;
+		for (int dj = -hops; dj <= hops; dj++) {
+			int j = c0 + dj;
+			for (int mb = 0; mb < acn; mb++) {
+				int blk = b0 - mb;
+				int hx = (int)((uint32_t)j + (uint32_t)lid * 7919u);
+				if (hash_ex_c(hx, blk, 131u) >= asend) continue;
+				int f = blk * 30 + (int)(hash_c(hx, blk, 137u) * 30.0f);
+				if (f > frame) continue;
+				int k = (int)(hash_c(hx, blk, 139u) * (float)(2 * hops));
+				int off = k < hops ? k - hops : k - hops + 1;
+				float xs = ((float)j + 0.5f) * S, xd = ((float)(j + off) + 0.5f) * S;
+				float dist = fabsf(xd - xs), sg = off > 0 ? 1.0f : -1.0f;
+				float age = ((float)(frame - f) + ffrac) / 60.0f;
+				float av = age * speed, s2 = (pos - xs) * sg;
+				bool inpath = s2 >= 0.0f && s2 <= dist;
+				bool req = inpath && av - s2 < L;
+				bool rep = inpath && av >= dist && av - 2.0f * dist + s2 < L;
+				bool nodeev = dn < half_n && (j == c0 || j + off == c0);
+				if (!(req || rep || nodeev)) continue;
+				int ux = (int)floorf(sgn * xs), vx = (int)floorf(sgn * xd);
+				if (ux < g_line_x0 || ux >= g_line_x1 || vx < g_line_x0 || vx >= g_line_x1) continue;
+				if (req) {
+					float dd = av - s2;
+					if (dd >= 0.0f && dd < L) {
+						float t = dd / L, ii = fmaxf(base, expf(-2.0f * t));
+						if (ii > inten) {
+							inten = ii;
+							aero_packet_ramp_c(t, cc);
+							rr = hash_c(hx, blk, 141u);
+						}
+					}
+				}
+				if (rep) {
+					float dd = av - 2.0f * dist + s2;
+					if (dd >= 0.0f && dd < L) {
+						float t = dd / L, ii = fmaxf(base, expf(-2.0f * t));
+						if (ii > inten) {
+							inten = ii;
+							aero_packet_ramp_c(t, cc);
+							rr = hash_c(hx, blk, 143u);
+						}
+					}
+				}
+				if (nodeev) {
+					float arrived = age - dist / speed;
+					if (j + off == c0 && arrived >= 0.0f) nodefl = fmaxf(nodefl, expf(-arrived / tau));
+					float back = age - 2.0f * dist / speed;
+					if (j == c0 && back >= 0.0f) nodefl = fmaxf(nodefl, expf(-back / tau));
+				}
+			}
+		}
+		if (dn < half_n) {
+			float ni = (1.0f - 0.35f * (dn / half_n) * (dn / half_n)) * (0.55f + 0.95f * nodefl);
+			if (ni > inten) {
+				inten = ni;
+				static const double yel[3] = {248, 244, 19}, hot[3] = {255, 251, 150};
+				for (int i = 0; i < 3; i++) {
+					double a = dec(yel[i] / 255.0), b = dec(hot[i] / 255.0);
+					cc[i] = a + (b - a) * nodefl;
+				}
+				rr = hash_c((int)((uint32_t)c0 + (uint32_t)lid * 7919u), 13, 109u);
+			}
+		}
+	}
+	double fac = mixf(lo, hi, rr) * inten, lt = fmin(L0 * fac, 1.0);
+	double w709[3] = {0.2126, 0.7152, 0.0722}, Lc = 0, out = 0;
+	for (int i = 0; i < 3; i++) Lc += cc[i] * w709[i];
+	for (int i = 0; i < 3; i++) {
+		double v = fmin(cc[i] * lt / Lc, 1.0);
+		out += v * w709[i];
+		if (color) color[i] = v;
+	}
+	if (lit) *lit = inten;
+	return out;
+}
+
+// Compares the aerospike lines on row y (starting on row `start`, linear luminance L0) over columns
+// x0 to x1 with the model for the render just made at t (cycle 0 at t0). Returns the number of
+// pixels brighter than the glow of the bare line.
+static int check_aero_model(const struct sq_cfg *c, int y, int start, double t0, double t, int x0, int x1, double L0, const char *what) {
+	double cy = (t - t0) * c->v[SQ_RGB_SPEED];
+	float cyc = (float)(cy - floor(cy));
+	int cycn = (int)fmod(floor(cy), 1048576.0);
+	double ft = (t - t0) * 60.0;
+	int frame = (int)fmod(floor(ft), 1048576.0);
+	float ffrac = (float)(ft - floor(ft));
+	int bad = 0, active = 0, bad_node = 0;
+	double nodes = c->v[SQ_RGB_AERO_NODE_SPACING_PX], half = fmax(c->v[SQ_RGB_AERO_NODE_SIZE_PX], 1.0) * 0.5;
+	for (int x = x0; x < x1; x++) {
+		float lit;
+		double want = aero_lum(c, x, cyc, cycn, frame, ffrac, L0, start * 64, NULL, &lit), got = lum(at(x, y));
+		bool off = fabs(got - want) > 0.015;
+		bad += off;
+		active += lit > 0.2f;
+		double pos = x + 0.5, sgn = c->v[SQ_RGB_DIRECTION] == 1 ? -1.0 : 1.0;
+		double dn = fabs(sgn * pos - (floor(sgn * pos / nodes) + 0.5) * nodes);
+		if (c->v[SQ_RGB_AERO_PATTERN] == 2 && dn < half) bad_node += off;  // the pixels of nodes are checked on their own
+	}
+	CHECK(bad <= (x1 - x0) / 100, "%s: the line matches the model: %d of %d pixels differ", what, bad, x1 - x0);
+	CHECK(bad_node <= 1, "%s: the nodes match the model: %d node pixels differ", what, bad_node);
+	return active;
+}
+
+static void test_aerospike(void) {
+	printf("aerospike\n");
+	double L0 = lum((uint8_t[]){120, 120, 130});
+	struct pl_mon m1[] = {{0, 0, 700, 100}};
+	setup(700, 100, m1, 1);
+	put((struct pl_rect){0, 0, 700, 100}, 13, 27, 50);
+	int rows[3] = {20, 45, 70};
+	for (int k = 0; k < 3; k++) put((struct pl_rect){10, rows[k], 690, rows[k] + 2}, 120, 120, 130);
+	capture_full(0);
+	struct sq_cfg c = rgb_cfg();
+	c.v[SQ_RGB_EFFECT] = 7;
+	c.v[SQ_RGB_LINE_THICK_PX] = 3;
+	c.v[SQ_RGB_LENGTH_PX] = 70;
+	c.v[SQ_RGB_GAP_PX] = 90;
+	c.v[SQ_RGB_AERO_RATE] = 3.0;
+	c.v[SQ_RGB_AERO_FADE_MS] = 350;
+	c.v[SQ_RGB_AERO_NODE_SPACING_PX] = 100;
+	set_luma(&c, 1.0);
+	render(&c, 100.0);  // cycle 0 at t = 100
+	static const char *pats[3] = {"spike", "pulse", "cluster"};
+	for (int pat = 0; pat < 3; pat++) {
+		c.v[SQ_RGB_AERO_PATTERN] = pat;
+		for (int variant = 0; variant < 5; variant++) {  // variant 4: bright enough that channels clamp at 1
+			c.v[SQ_RGB_LUMA_MIN] = variant == 1 ? 0.5 : (variant == 4 ? 3.0 : 1.0);
+			c.v[SQ_RGB_LUMA_MAX] = variant == 1 ? 2.0 : (variant == 4 ? 3.0 : 1.0);
+			c.v[SQ_RGB_SPEED] = variant == 2 ? 1.3 : 0.5;
+			c.v[SQ_RGB_DIRECTION] = variant == 3 ? 1 : 0;
+			c.v[SQ_RGB_AERO_FADE_MS] = variant == 2 ? 800 : 350;
+			c.v[SQ_RGB_AERO_NODE_SPACING_PX] = variant == 2 ? 60 : 100;
+			c.v[SQ_RGB_AERO_NODE_SIZE_PX] = variant == 3 ? 10 : 6;
+			c.v[SQ_RGB_AERO_PACKET_PX] = variant == 2 ? 50 : 30;
+			c.v[SQ_RGB_AERO_SEND_RATE] = variant == 2 ? 2.0 : 0.8;
+			c.v[SQ_RGB_AERO_MAX_HOPS] = variant == 3 ? 2 : 4;
+			c.v[SQ_RGB_AERO_PACKET_SPEED] = variant == 2 ? 150 : 300;
+			for (int step = 0; step < 4; step++) {
+				double t = 100.21 + 0.43 * step + variant * 3.0;
+				render(&c, t);
+				char what[80];
+				snprintf(what, sizeof what, "%s, variant %d, t %.2f", pats[pat], variant, t);
+				for (int k = 0; k < 3; k += 2) check_aero_model(&c, rows[k], rows[k], 100.0, t, 12, 688, L0, what);
+			}
+		}
+	}
+	set_luma(&c, 1.0);
+	c.v[SQ_RGB_SPEED] = 0.5;
+	c.v[SQ_RGB_DIRECTION] = 0;
+	c.v[SQ_RGB_AERO_FADE_MS] = 350;
+	c.v[SQ_RGB_AERO_NODE_SPACING_PX] = 100;
+
+	// Spike: a hard front, a yellow head, a trail that cools to blue, and a quiet navy-blue line.
+	c.v[SQ_RGB_AERO_PATTERN] = 0;
+	render(&c, 101.0);
+	int heads = 0, yellow_heads = 0, blue_trails = 0, hard = 0;
+	for (int x = 14; x < 686; x++) {
+		const uint8_t *p = at(x, rows[0]), *ahead = at(x + 1, rows[0]);
+		double lp = lum(p), la = lum(ahead);
+		if (lp > 2.5 * la && lp > 0.1) {  // a head: bright, with the dim line right ahead of it
+			heads++;
+			hard++;
+			yellow_heads += p[0] > 1.5 * p[2] && p[1] > 1.5 * p[2];
+			const uint8_t *tail = at(x - 40, rows[0]);
+			blue_trails += tail[2] > tail[0] + 20;
+		}
+	}
+	CHECK(heads >= 3, "spikes have heads: %d found", heads);
+	CHECK(yellow_heads == heads, "the heads are yellow: %d of %d", yellow_heads, heads);
+	CHECK(blue_trails >= heads - 1, "40 px behind a head the trail is blue: %d of %d", blue_trails, heads);
+	const uint8_t *bare = at(5 * 700 / 700 + 3, rows[0]);
+	CHECK(bare[2] >= bare[0], "the bare line is a quiet blue: %d,%d,%d", bare[0], bare[1], bare[2]);
+	// Each line has its own spikes.
+	int same = 0;
+	for (int x = 12; x < 688; x++) same += fabs(lum(at(x, rows[0])) - lum(at(x, rows[1]))) < 0.004;
+	CHECK(same < 600, "two lines do not show the same spikes: %d of 676 pixels match", same);
+
+	// Pulses: random, independent between lines, and more of them at a higher rate or a slower fade.
+	c.v[SQ_RGB_AERO_PATTERN] = 1;
+	long lit[3] = {0, 0, 0};
+	for (int variant = 0; variant < 3; variant++) {
+		c.v[SQ_RGB_AERO_RATE] = variant == 1 ? 6.0 : 1.5;
+		c.v[SQ_RGB_AERO_FADE_MS] = variant == 2 ? 900 : 350;
+		for (int step = 0; step < 40; step++) {
+			double t = 110.0 + 0.11 * step;
+			render(&c, t);
+			for (int x = 12; x < 688; x++) lit[variant] += lum(at(x, rows[0])) > 0.5 * L0 + 0.05;
+		}
+	}
+	CHECK(lit[1] > 1.5 * lit[0], "four times the rate shows more pulses: %ld against %ld lit pixel samples", lit[1], lit[0]);
+	CHECK(lit[2] > 1.5 * lit[0], "a slower fade keeps pulses lit longer: %ld against %ld", lit[2], lit[0]);
+	c.v[SQ_RGB_AERO_RATE] = 3.0;
+	c.v[SQ_RGB_AERO_FADE_MS] = 350;
+	render(&c, 120.0);
+	render(&c, 120.2);
+	int rows_differ = 0;
+	for (int x = 12; x < 688; x++) rows_differ += fabs(lum(at(x, rows[0])) - lum(at(x, rows[2]))) > 0.01;
+	CHECK(rows_differ > 8, "pulses on two lines are not the same: %d pixels differ", rows_differ);
+	// A pulse flashes at once and cools: at its peak yellow, later blue.
+	int yellow_peak = 0, blue_late = 0;
+	for (int step = 0; step < 60; step++) {
+		render(&c, 130.0 + 0.05 * step);
+		for (int x = 12; x < 688; x++) {
+			const uint8_t *p = at(x, rows[0]);
+			if (lum(p) > 0.9 * L0 && p[0] > 1.4 * p[2] && p[1] > 1.4 * p[2]) yellow_peak++;
+			if (lum(p) > 0.3 * L0 && p[2] > p[0] + 15) blue_late++;
+		}
+	}
+	CHECK(yellow_peak > 0 && blue_late > 0, "pulses are yellow at first and blue as they cool: %d and %d pixel samples", yellow_peak, blue_late);
+
+	// Cluster: bright yellow nodes sit on the line, 100 px apart (50, 150, ... 650, on a line from
+	// 10 to 690). A node sends a request to a random node on the line, the receiver flashes and
+	// replies, and the sender flashes when the reply arrives.
+	c.v[SQ_RGB_AERO_PATTERN] = 2;
+	c.v[SQ_RGB_AERO_NODE_SPACING_PX] = 100;
+	c.v[SQ_RGB_AERO_NODE_SIZE_PX] = 6;
+	c.v[SQ_RGB_AERO_PACKET_PX] = 30;
+	c.v[SQ_RGB_AERO_SEND_RATE] = 1.5;
+	c.v[SQ_RGB_AERO_MAX_HOPS] = 4;
+	c.v[SQ_RGB_AERO_PACKET_SPEED] = 300;
+	c.v[SQ_RGB_AERO_FADE_MS] = 350;
+	set_luma(&c, 2.0);
+	int node_yellow = 0, node_samples = 0, node_flash = 0, off_ends = 0, heads_total = 0, right = 0, left = 0;
+	static int prev_heads[64];
+	int nprev = 0;
+	for (int step = 0; step < 160; step++) {
+		render(&c, 140.0 + 0.05 * step);
+		for (int k = 0; k < 7; k++) {
+			const uint8_t *p = at(50 + 100 * k, rows[0]);
+			node_samples++;
+			if (p[0] > 1.4 * p[2] && p[1] > 1.4 * p[2] && lum(p) > 0.5 * L0) node_yellow++;  // a node is yellow
+			if (lum(p) > 2.2 * L0) node_flash++;                                              // a flash is a lot brighter than a resting node
+		}
+		// Heads: pale pixels away from the nodes. Match them with the heads of the frame before.
+		int heads[64], nh = 0;
+		for (int x = 14; x < 686; x++) {
+			int dx = ((x - 50) % 100 + 100) % 100;
+			int near_node = dx < 9 || dx > 91;
+			const uint8_t *p = at(x, rows[0]);
+			if (!near_node && p[2] > 0.7 * p[0] && p[0] > 100 && lum(p) > 0.8 * L0 && nh < 64 && (nh == 0 || x - heads[nh - 1] > 6)) heads[nh++] = x;
+			if ((x < 38 || x > 662) && lum(p) > 0.3 * L0) off_ends++;
+		}
+		heads_total += nh;
+		for (int a = 0; a < nh; a++) {
+			int best = 1000;
+			for (int b = 0; b < nprev; b++)
+				if (abs(heads[a] - prev_heads[b]) < abs(best)) best = heads[a] - prev_heads[b];
+			if (abs(best) >= 5 && abs(best) <= 40) {
+				if (best > 0) right++;
+				else left++;
+			}
+		}
+		memcpy(prev_heads, heads, sizeof(int) * (size_t)nh);
+		nprev = nh;
+	}
+	CHECK(node_yellow > node_samples / 3, "nodes are bright yellow most of the time: %d of %d samples", node_yellow, node_samples);
+	CHECK(node_flash > 5 && node_flash < node_samples / 2, "nodes flash a lot brighter when they receive, not all the time: %d samples", node_flash);
+	CHECK(heads_total > 40, "packets run along the line: %d head samples", heads_total);
+	CHECK(right > 5 && left > 5, "packets go both ways, to nodes on either side: %d to the right, %d to the left", right, left);
+	CHECK(off_ends == 0, "no packet goes past the first or last node: %d bright pixels beyond them", off_ends);
+
+	// One request on its own: find a request that is alone on the line for its whole life, and
+	// follow it. The sender is quiet when it sends, the packet runs out, the receiver flashes on
+	// arrival and sends a reply back, the sender flashes when the reply arrives, and then nothing
+	// more happens: the sender does not reply to the reply.
+	c.v[SQ_RGB_AERO_SEND_RATE] = 0.05;
+	c.v[SQ_RGB_AERO_MAX_HOPS] = 3;
+	c.v[SQ_RGB_AERO_PACKET_SPEED] = 150;
+	c.v[SQ_RGB_AERO_FADE_MS] = 250;
+	{
+		float asend = (float)(1.0 - exp(-c.v[SQ_RGB_AERO_SEND_RATE] * 30.0 / 60.0));
+		int lid = rows[0] * 64, hops = 3;
+		struct ev { int j, d, f; double dist; } evs[512];
+		int nev = 0;
+		for (int blk = 10; blk < 700 && nev < 512; blk++)
+			for (int j = 0; j < 7; j++) {
+				int hx = (int)((uint32_t)j + (uint32_t)lid * 7919u);
+				if (hash_ex_c(hx, blk, 131u) >= asend) continue;
+				int f = blk * 30 + (int)(hash_c(hx, blk, 137u) * 30.0f);
+				int k = (int)(hash_c(hx, blk, 139u) * (float)(2 * hops));
+				int off = k < hops ? k - hops : k - hops + 1;
+				if (j + off < 0 || j + off > 6) continue;  // the destination must be on the line
+				evs[nev++] = (struct ev){j, j + off, f, 100.0 * abs(off)};
+			}
+		int pick = -1;
+		for (int a = 0; a < nev && pick < 0; a++) {
+			if (evs[a].dist < 200) continue;
+			double a0 = evs[a].f / 60.0 - 0.5, a1 = evs[a].f / 60.0 + 2.0 * evs[a].dist / 150.0 + 2.5;
+			int alone = 1;
+			for (int b = 0; b < nev; b++) {
+				if (b == a) continue;
+				double b0 = evs[b].f / 60.0, b1 = evs[b].f / 60.0 + 2.0 * evs[b].dist / 150.0 + 2.5;
+				if (b0 < a1 && b1 > a0) alone = 0;
+			}
+			if (alone) pick = a;
+		}
+		CHECK(pick >= 0, "found a request that is alone on the line (%d requests searched)", nev);
+		if (pick >= 0) {
+			struct ev e = evs[pick];
+			double tl = 100.0 + e.f / 60.0, dist = e.dist, sg = e.d > e.j ? 1.0 : -1.0;
+			double tarr = tl + dist / 150.0, tback = tl + 2.0 * dist / 150.0;
+			int xs = 50 + 100 * e.j, xd = 50 + 100 * e.d;
+			double rest = 0;
+			render(&c, tl - 0.3);
+			rest = lum(at(xs, rows[0]));
+			CHECK(lum(at(xd, rows[0])) > 0.5 * L0 && fabs(lum(at(xd, rows[0])) - rest) < 0.01 * rest + 0.003, "before the request the nodes are at rest");
+			render(&c, tl + 0.04);
+			CHECK(lum(at(xs, rows[0])) < 1.15 * rest, "the sender does not flash when it sends: %.3f against %.3f at rest", lum(at(xs, rows[0])), rest);
+			// The request head, half way.
+			double th = tl + 0.5 * dist / 150.0;
+			render(&c, th);
+			int xh = (int)floor(xs + sg * 0.5 * dist - sg * 1.0);
+			const uint8_t *ph = at(xh, rows[0]);
+			CHECK(ph[2] > 0.7 * ph[0] && lum(ph) > 1.0 * L0, "the request is a pale head half way to the receiver: %d,%d,%d", ph[0], ph[1], ph[2]);
+			// Arrival: the receiver flashes yellow, a lot brighter than at rest.
+			render(&c, tarr + 0.03);
+			const uint8_t *pd = at(xd, rows[0]);
+			CHECK(lum(pd) > 1.8 * rest, "the receiver flashes when the request arrives: %.3f against %.3f at rest", lum(pd), rest);
+			CHECK(pd[0] > 1.2 * pd[2] && pd[1] > 1.2 * pd[2], "and the flash is yellow: %d,%d,%d", pd[0], pd[1], pd[2]);
+			// The reply head, half way back.
+			render(&c, tarr + 0.5 * dist / 150.0);
+			int xr = (int)floor(xd - sg * 0.5 * dist + sg * 1.0);
+			const uint8_t *pr = at(xr, rows[0]);
+			CHECK(pr[2] > 0.7 * pr[0] && lum(pr) > 1.0 * L0, "the receiver sends a reply: a pale head half way back to the sender: %d,%d,%d", pr[0], pr[1], pr[2]);
+			CHECK(lum(at(xd, rows[0])) < 1.2 * rest, "by then the receiver is back at rest: %.3f against %.3f", lum(at(xd, rows[0])), rest);
+			// The reply arrives: the sender flashes.
+			render(&c, tback + 0.03);
+			CHECK(lum(at(xs, rows[0])) > 1.8 * rest, "the sender flashes when the reply arrives: %.3f against %.3f at rest", lum(at(xs, rows[0])), rest);
+			// And nothing more: the sender does not reply. Every pixel is at rest afterwards.
+			int quiet = 1;
+			for (int step = 0; step < 12; step++) {
+				render(&c, tback + 1.8 + 0.05 * step);
+				for (int k = 0; k < 7; k++) quiet &= fabs(lum(at(50 + 100 * k, rows[0])) - rest) < 0.012 * rest + 0.003;
+				for (int x = 14; x < 686; x++) {
+					int dx = ((x - 50) % 100 + 100) % 100;
+					if (dx > 8 && dx < 92) quiet &= lum(at(x, rows[0])) < 0.5 * rest;
+				}
+			}
+			CHECK(quiet, "after the reply arrives the sender sends nothing back: the line is quiet and the nodes are at rest");
+		}
+	}
+	// A higher send rate sends more packets.
+	long counts[2] = {0, 0};
+	c.v[SQ_RGB_AERO_PACKET_SPEED] = 300;
+	c.v[SQ_RGB_AERO_MAX_HOPS] = 4;
+	for (int pass = 0; pass < 2; pass++) {
+		c.v[SQ_RGB_AERO_SEND_RATE] = pass == 0 ? 0.4 : 1.6;
+		for (int step = 0; step < 120; step++) {
+			render(&c, 170.0 + 0.07 * step);
+			for (int x = 14; x < 686; x++) {
+				int dx = ((x - 50) % 100 + 100) % 100;
+				if (dx < 9 || dx > 91) continue;  // not on a node
+				counts[pass] += lum(at(x, rows[0])) > 0.6 * L0 + 0.05;
+			}
+		}
+	}
+	CHECK(counts[1] > 2.0 * counts[0], "four times the send rate shows many more packets: %ld against %ld bright pixel samples", counts[1], counts[0]);
+	// Each node has its own packets: two lines do not send the same ones.
+	c.v[SQ_RGB_AERO_SEND_RATE] = 1.5;
+	render(&c, 190.0);
+	render(&c, 190.31);
+	int diff2 = 0;
+	for (int x = 12; x < 688; x++) diff2 += fabs(lum(at(x, rows[0])) - lum(at(x, rows[2]))) > 0.01;
+	CHECK(diff2 > 10, "two lines send different packets: %d pixels differ", diff2);
+	set_luma(&c, 1.0);
+
+	// Spike and cluster are continuous where the cycle count rolls over.
+	for (int pat = 0; pat <= 2; pat += 2) {
+		c.v[SQ_RGB_AERO_PATTERN] = pat;
+		render(&c, 149.9999);
+		uint8_t before[700 * 4];
+		memcpy(before, out + (size_t)rows[0] * W * 4, sizeof before);
+		render(&c, 150.0001);
+		int jumped = 0;
+		for (int x = 12; x < 688; x++) jumped += abs(at(x, rows[0])[1] - before[x * 4 + 1]) > 10;
+		CHECK(jumped <= 2, "%s: no jump at the end of an animation cycle: %d pixels", pats[pat], jumped);
+	}
+	teardown();
 }
 
 // 1 if the snake on the horizontal line at row y runs forward, 0 if backward, -1 if neither
@@ -2793,6 +3514,24 @@ static void test_lines_partial(void) {
 	CHECK(pl.last_lines_px == full_px, "a full capture searches the whole screen: %ld", pl.last_lines_px);
 	teardown();
 
+	// A thick band: a change up to thickness + 1 rows away decides whether it is a line.
+	struct sq_cfg tk = rgb_cfg();
+	tk.v[SQ_RGB_LINE_MIN_PX] = 24;
+	tk.v[SQ_RGB_LINE_THICK_PX] = 8;
+	struct pl_mon m3[] = {{0, 0, 320, 200}};
+	setup(320, 200, m3, 1);
+	put((struct pl_rect){0, 0, 320, 200}, 255, 255, 255);
+	put((struct pl_rect){10, 100, 300, 108}, 100, 100, 100);  // 8 rows, a line at limit 8
+	capture_full(0);
+	render(&tk, 0);
+	compare_lines("an 8 px band at limit 8, full search", &tk);
+	put((struct pl_rect){100, 108, 110, 111}, 100, 100, 100);  // 3 more rows in 10 columns: 11 thick there
+	capture((struct pl_rect){100, 108, 110, 111}, 0.1);
+	render(&tk, 0.1);
+	compare_lines("the band gets too thick in a few columns", &tk);
+	CHECK(pl.last_lines_px < 2L * 320 * 200 * 45 / 100, "and only part of the screen is searched: %ld", pl.last_lines_px);
+	teardown();
+
 	// Two monitors: a change near the seam.
 	struct pl_mon m2[] = {{0, 0, 160, 200}, {160, 0, 160, 200}};
 	setup(320, 200, m2, 2);
@@ -2810,6 +3549,67 @@ static void test_lines_partial(void) {
 	capture((struct pl_rect){100, 50, 105, 51}, 0.2);
 	render(&c, 0.2);
 	compare_lines("two monitors, a gap in a line on the first", &c);
+	teardown();
+}
+
+// Two pieces of a real screen, taken with squint off: a window frame as a 6 px vertical band of
+// gray 34 on a background of (46, 52, 54), and a horizontal pattern of a 3 px band, a 1 px
+// lighter line, a 22 px band, and a 1 px lighter line. Their contrast is about 0.07, below the
+// default of 0.15, and the vertical band is wider than the old limit of 5.
+static void test_rgb_real_lines(void) {
+	printf("rgb lines from a real screen\n");
+	// The vertical band.
+	struct pl_mon ma[] = {{0, 0, 86, 309}};
+	setup(86, 309, ma, 1);
+	put((struct pl_rect){0, 0, 86, 309}, 46, 52, 54);
+	put((struct pl_rect){42, 0, 48, 309}, 34, 34, 34);
+	capture_full(0);
+	struct sq_cfg c = rgb_cfg();
+	uint8_t *g = malloc((size_t)86 * 309 * 2);
+	for (int pass = 0; pass < 4; pass++) {
+		c.v[SQ_RGB_LINE_THICK_PX] = pass == 0 ? 5 : 6;
+		c.v[SQ_RGB_LINE_CONTRAST] = pass == 2 ? 0.15 : (pass == 3 ? 0.08 : 0.05);
+		pl.lfull = true;
+		pl.ldirty = true;
+		render(&c, 0.1 * pass);
+		compare_lines(pass == 0 ? "6 px band, limit 5" : (pass == 1 ? "6 px band, limit 6, contrast 0.05" : (pass == 2 ? "6 px band, contrast 0.15" : "6 px band, contrast 0.08")), &c);
+		read_lines(g);
+		bool found = g[((size_t)150 * 86 + 44) * 2 + 1] > 127 && g[((size_t)150 * 86 + 47) * 2 + 1] > 127;
+		CHECK(found == (pass == 1), "6 px band: %s with thickness limit %d and contrast %.2f", found ? "found" : "not found", (int)c.v[SQ_RGB_LINE_THICK_PX], c.v[SQ_RGB_LINE_CONTRAST]);
+	}
+	free(g);
+	teardown();
+
+	// The horizontal pattern.
+	struct pl_mon mb[] = {{0, 0, 424, 91}};
+	setup(424, 91, mb, 1);
+	put((struct pl_rect){0, 0, 424, 91}, 46, 52, 54);
+	put((struct pl_rect){0, 30, 424, 33}, 34, 34, 34);
+	put((struct pl_rect){0, 33, 424, 34}, 51, 51, 51);
+	put((struct pl_rect){0, 34, 424, 56}, 34, 34, 34);
+	put((struct pl_rect){0, 56, 424, 57}, 51, 51, 51);
+	capture_full(0);
+	struct sq_cfg d = rgb_cfg();
+	g = malloc((size_t)424 * 91 * 2);
+	for (int pass = 0; pass < 2; pass++) {
+		d.v[SQ_RGB_LINE_CONTRAST] = pass == 0 ? 0.15 : 0.05;
+		pl.lfull = true;
+		pl.ldirty = true;
+		render(&d, 0.1 * pass);
+		compare_lines(pass == 0 ? "horizontal pattern, contrast 0.15" : "horizontal pattern, contrast 0.05", &d);
+		read_lines(g);
+		#define HM(y) (g[((size_t)(y) * 424 + 200) * 2] > 127)
+		if (pass == 0) {
+			CHECK(!HM(30) && !HM(31) && !HM(32) && !HM(33), "at 0.15 none of the lines is found");
+		} else {
+			CHECK(HM(30) && HM(31) && HM(32), "at 0.05 the 3 px band is a line");
+			CHECK(HM(33), "at 0.05 the 1 px lighter line is a line");
+			CHECK(!HM(40) && !HM(34), "the 22 px band is not a line");
+			CHECK(!HM(56) && !HM(57), "the last 1 px line is within the tolerance of the background, so it is not a line");
+		}
+		#undef HM
+	}
+	free(g);
 	teardown();
 }
 
@@ -3262,8 +4062,10 @@ static void test_rgb_config(void) {
 	CHECK(sq_set(&c, "rgb_effect", "snake") && c.v[SQ_RGB_EFFECT] == 3, "an effect is set by name");
 	CHECK(sq_set(&c, "rgb_effect", "WAVE") && c.v[SQ_RGB_EFFECT] == 4, "names match in any case");
 	CHECK(sq_set(&c, "rgb_effect", "1") && c.v[SQ_RGB_EFFECT] == 1, "an index works too");
-	CHECK(sq_set(&c, "rgb_effect", "9") && c.v[SQ_RGB_EFFECT] == 5, "an index past the end is clamped");
-	CHECK(sq_set(&c, "rgb_effect", "rain") && c.v[SQ_RGB_EFFECT] == 5, "rain is the last effect");
+	CHECK(sq_set(&c, "rgb_effect", "9") && c.v[SQ_RGB_EFFECT] == 7, "an index past the end is clamped");
+	CHECK(sq_set(&c, "rgb_effect", "aerospike") && c.v[SQ_RGB_EFFECT] == 7, "aerospike is the last effect");
+	CHECK(sq_set(&c, "rgb_effect", "lights") && c.v[SQ_RGB_EFFECT] == 6, "lights is the one before");
+	CHECK(sq_set(&c, "rgb_effect", "rain") && c.v[SQ_RGB_EFFECT] == 5, "rain is the one before");
 	CHECK(sq_set(&c, "rgb_effect", "wave") && c.v[SQ_RGB_EFFECT] == 4, "back to wave");
 	CHECK(!sq_set(&c, "rgb_effect", "disco") && c.v[SQ_RGB_EFFECT] == 4, "an unknown name is rejected");
 	char v[SQ_STRLEN];
@@ -3285,10 +4087,17 @@ static void test_rgb_config(void) {
 		unlink(old);
 	}
 	CHECK(sq_params[SQ_RGB_LUMA_MIN].def == 0.5 && sq_params[SQ_RGB_LUMA_MAX].def == 1.0, "the luma range defaults to 0.5 to 1");
+	CHECK(sq_set(&c, "rgb_lights_palette", "candy") && c.v[SQ_RGB_LIGHTS_PALETTE] == 3 && sq_set(&c, "rgb_lights_pattern", "CHASE") &&
+	          c.v[SQ_RGB_LIGHTS_PATTERN] == 2 && !sq_set(&c, "rgb_lights_pattern", "strobe"),
+	      "the lights palette and pattern are set by name");
+	CHECK(sq_params[SQ_RGB_AERO_FADE_MS].def == 450, "aerospike flashes fade with a time constant of 450 ms: a node flash lasts 100 ms longer than at 350");
+	CHECK(sq_params[SQ_RGB_LIGHTS_SPACING_PX].def == 14 && sq_params[SQ_RGB_LIGHTS_SIZE_PX].def == 4 && sq_params[SQ_RGB_LIGHTS_PALETTE].def == 0 &&
+	          sq_params[SQ_RGB_LIGHTS_PATTERN].def == 1 && sq_params[SQ_RGB_LIGHTS_WIRE].def == 0.6 && sq_group(SQ_RGB_LIGHTS_WIRE) == SQ_RGB,
+	      "the lights defaults: 14 px apart, 4 px bulbs, classic, twinkle, wire 0.6");
 	CHECK(sq_params[SQ_RGB_RAIN_LINE].def == 0.4 && sq_group(SQ_RGB_RAIN_LINE) == SQ_RGB, "rgb_rain_line defaults to 0.4, inside the rgb group");
-	CHECK(sq_set(&c, "rgb", "true") && sq_set(&c, "rgb_direction", "alternate") && sq_set(&c, "rgb_line_thick_px", "9") &&
-	          c.v[SQ_RGB_LINE_THICK_PX] == 5,
-	      "thickness is limited to 5");
+	CHECK(sq_set(&c, "rgb", "true") && sq_set(&c, "rgb_direction", "alternate") && sq_set(&c, "rgb_line_thick_px", "99") &&
+	          c.v[SQ_RGB_LINE_THICK_PX] == 16,
+	      "thickness is limited to 16");
 	const char *path = "/tmp/squint-rgb-test.conf";
 	CHECK(sq_save(path, &c) == 0, "save");
 	FILE *f = fopen(path, "r");
@@ -3337,8 +4146,11 @@ int main(void) {
 	test_rgb_lines();
 	test_rgb_effects();
 	test_lines_partial();
+	test_rgb_real_lines();
 	test_rgb_alternate();
 	test_rgb_pitch();
+	test_lights();
+	test_aerospike();
 	test_rgb_luma_range();
 	test_rain_lines();
 	test_rain_flash();

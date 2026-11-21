@@ -109,12 +109,92 @@ static void print_wrapped(const char *s, int width, int nlines) {
 	}
 }
 
-#define FOOTER_LINES 11  // blank, 3 help, blank, 3 keys, blank, status
+#define FOOTER_LINES 12  // blank, 4 help, blank, 3 keys, blank, status
 
-// The first setting shown. It moves only as far as needed to keep the selected row in view.
+// What the screen lists, in order: a heading for each run of settings that share a prefix, and
+// the settings themselves with the prefix and the group's own name taken off. The real key
+// names are in the help line and in the file.
+struct drow {
+	int idx;  // the setting, or -1 for a heading
+	int group_of;  // the setting a heading stands in front of, to grey it with its group
+	int indent;
+	char label[40];
+};
+static struct drow drows[SQ_N * 2];
+static int ndrows, label_w, rowof[SQ_N];
+
+// The key of setting i without the name of its group and the underscore after it.
+static const char *short_name(int i) {
+	int g = sq_group(i);
+	const char *k = sq_params[i].key;
+	if (g >= 0) {
+		size_t n = strlen(sq_params[g].key);
+		if (!strncmp(k, sq_params[g].key, n) && k[n] == '_') {
+			return k + n + 1;
+		}
+	}
+	return k;
+}
+
+// Length of the part of n before its first underscore, or 0 when there is none.
+static size_t prefix_len(const char *n) {
+	const char *u = strchr(n, '_');
+	return u ? (size_t)(u - n) : 0;
+}
+
+static void build_rows(void) {
+	if (ndrows) {
+		return;
+	}
+	int i = 0;
+	while (i < SQ_N) {
+		int g = sq_group(i);
+		int base = g >= 0 ? 2 : 0;
+		const char *a = short_name(i);
+		size_t pl = prefix_len(a);
+		int j = i + 1;
+		while (pl && j < SQ_N && sq_group(j) == g) {
+			const char *b = short_name(j);
+			if (prefix_len(b) != pl || strncmp(a, b, pl) != 0) {
+				break;
+			}
+			j++;
+		}
+		if (pl && j - i >= 2) {
+			struct drow *h = &drows[ndrows++];
+			h->idx = -1;
+			h->group_of = i;
+			h->indent = base;
+			snprintf(h->label, sizeof h->label, "%.*s", (int)pl, a);
+			for (int k = i; k < j; k++) {
+				struct drow *r = &drows[ndrows];
+				rowof[k] = ndrows++;
+				r->idx = k;
+				r->indent = base + 2;
+				snprintf(r->label, sizeof r->label, "%s", short_name(k) + pl + 1);
+			}
+			i = j;
+		} else {
+			struct drow *r = &drows[ndrows];
+			rowof[i] = ndrows++;
+			r->idx = i;
+			r->indent = base;
+			snprintf(r->label, sizeof r->label, "%s", a);
+			i++;
+		}
+	}
+	label_w = 12;
+	for (int k = 0; k < ndrows; k++) {
+		int w = drows[k].indent + (int)strlen(drows[k].label);
+		label_w = w > label_w ? w : label_w;
+	}
+}
+
+// The first row shown. It moves only as far as needed to keep the selected setting in view.
 static int view_top;
 
 static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct sq_cfg *start, int sel, const char *path, const char *status) {
+	build_rows();
 	struct winsize ws;
 	int rows = 24, cols = 80;
 	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
@@ -125,17 +205,21 @@ static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct 
 	if (avail < 5) {
 		avail = 5;
 	}
-	if (avail > SQ_N) {
-		avail = SQ_N;
+	if (avail > ndrows) {
+		avail = ndrows;
 	}
-	if (sel < view_top) {
-		view_top = sel;
+	int want = rowof[sel];
+	if (want > 0 && drows[want - 1].idx < 0) {
+		want--;  // keep the heading of the selected setting in view
 	}
-	if (sel >= view_top + avail) {
-		view_top = sel - avail + 1;
+	if (want < view_top) {
+		view_top = want;
 	}
-	if (view_top > SQ_N - avail) {
-		view_top = SQ_N - avail;
+	if (rowof[sel] >= view_top + avail) {
+		view_top = rowof[sel] - avail + 1;
+	}
+	if (view_top > ndrows - avail) {
+		view_top = ndrows - avail;
 	}
 	if (view_top < 0) {
 		view_top = 0;
@@ -143,12 +227,24 @@ static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct 
 	printf("\x1b[2J\x1b[H");
 	printf("squint tuning\r\n config: %.*s\r\n\r\n", cols - 10 > 0 ? cols - 10 : 1, path);
 	char pos[40] = "";
-	if (avail < SQ_N) {
-		snprintf(pos, sizeof pos, "%d-%d of %d%s%s", view_top + 1, view_top + avail, SQ_N, view_top > 0 ? "  \xe2\x86\x91" : "",
-		         view_top + avail < SQ_N ? "  \xe2\x86\x93" : "");
+	if (avail < ndrows) {
+		snprintf(pos, sizeof pos, "%d-%d of %d%s%s", view_top + 1, view_top + avail, ndrows, view_top > 0 ? "  \xe2\x86\x91" : "",
+		         view_top + avail < ndrows ? "  \xe2\x86\x93" : "");
 	}
-	printf(" %-22s %-14s %-14s %s\r\n", "", "value", "default", *pos ? pos : "range");
-	for (int i = view_top; i < view_top + avail; i++) {
+	printf("   %-*s %-14s %-14s %s\r\n", label_w, "", "value", "default", *pos ? pos : "range");
+	for (int r = view_top; r < view_top + avail; r++) {
+		const struct drow *d = &drows[r];
+		int i = d->idx >= 0 ? d->idx : d->group_of;
+		int g = sq_group(i);
+		// Greyed out when its group toggle is off, or when the master switch is off. The
+		// shortcuts stay lit when the master switch is off, because key_enabled must keep
+		// working to turn squint back on.
+		bool master_off = i != SQ_ENABLED && c->v[SQ_ENABLED] == 0 && i != SQ_SHORTCUTS && g != SQ_SHORTCUTS;
+		bool inactive = (g >= 0 && c->v[g] == 0) || master_off;
+		if (d->idx < 0) {
+			printf("\x1b[%sm   %*s%s\x1b[0m\r\n", inactive ? "2" : "1;4", d->indent, "", d->label);
+			continue;
+		}
 		char v[SQ_STRLEN + 8], dv[SQ_STRLEN + 8], lo[32], hi[32];
 		sq_format_cfg(c, i, v, sizeof v);
 		sq_format_cfg(def, i, dv, sizeof dv);
@@ -157,25 +253,18 @@ static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct 
 			sq_format_value(i, sq_params[i].min, lo, sizeof lo);
 			sq_format_value(i, sq_params[i].max, hi, sizeof hi);
 		}
-		int g = sq_group(i);
-		// Greyed out when its group toggle is off, or when the master switch is off. The
-		// shortcuts stay lit when the master switch is off, because key_enabled must keep
-		// working to turn squint back on.
-		bool master_off = i != SQ_ENABLED && c->v[SQ_ENABLED] == 0 && i != SQ_SHORTCUTS && g != SQ_SHORTCUTS;
-		bool inactive = (g >= 0 && c->v[g] == 0) || master_off;
 		bool changed = is_str ? strcmp(c->s[i], start->s[i]) != 0 : c->v[i] != start->v[i];
-		char label[40];
-		snprintf(label, sizeof label, "%s%s", g >= 0 ? "  " : "", sq_params[i].key);
 		if (inactive) {
 			printf("\x1b[2m");
 		}
 		if (i == sel) {
 			printf("\x1b[7m");
 		}
+		printf("%c%c %*s%-*s ", changed ? '*' : ' ', i == sel ? '>' : ' ', d->indent, "", label_w - d->indent, d->label);
 		if (is_str) {
-			printf("%c%c %-19s %-14s %-14s", changed ? '*' : ' ', i == sel ? '>' : ' ', label, *v ? v : "(none)", *dv ? dv : "(none)");
+			printf("%-14s %-14s", *v ? v : "(none)", *dv ? dv : "(none)");
 		} else {
-			printf("%c%c %-19s %-14s %-14s %6s to %-6s", changed ? '*' : ' ', i == sel ? '>' : ' ', label, v, dv, lo, hi);
+			printf("%-14s %-14s %6s to %-6s", v, dv, lo, hi);
 		}
 		if (i == sel || inactive) {
 			printf("\x1b[0m");
@@ -183,9 +272,11 @@ static void draw(const struct sq_cfg *c, const struct sq_cfg *def, const struct 
 		printf("\r\n");
 	}
 	printf("\r\n");
-	print_wrapped(sq_params[sel].help, cols - 2, 3);
+	char help[700];
+	snprintf(help, sizeof help, "%s: %s", sq_params[sel].key, sq_params[sel].help);
+	print_wrapped(help, cols - 2, 4);
 	printf("\r\n");
-	print_wrapped("up/down select   left/right adjust   PgUp/PgDn adjust x10   space toggle   q quit", cols - 2, 1);
+	print_wrapped("up/down select  left/right adjust  PgUp/PgDn x10  space toggle  q quit", cols - 2, 1);
 	print_wrapped("r reset to start   d reset to default   R/D all   * changed since start", cols - 2, 1);
 	print_wrapped("Enter record a shortcut by pressing it   e type it", cols - 2, 1);
 	printf("\r\n %.*s", cols - 2 > 0 ? cols - 2 : 1, status);
